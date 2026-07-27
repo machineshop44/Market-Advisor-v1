@@ -1,0 +1,6 @@
+PyQt5
+yfinance
+pandas
+robin_stocks
+coinbase-advanced-py
+finvizfinance

@@ -1,0 +1,28 @@
+# Secrets & local runtime state — never commit
+Src/settings.json
+Src/trade_journal.jsonl
+Src/scoring_state.json
+Src/activity_log.txt
+Src/_combo_arrow_*.png
+wants and needs.txt
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local backups (keep on disk only)
+Backups/
+data/

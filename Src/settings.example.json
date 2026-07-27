@@ -1,0 +1,23 @@
+{
+    "dark_mode": false,
+    "paper_mode": true,
+    "discord_webhook": "",
+    "discord_alert_level": "Important Only (Critical Alerts & Hourly Heartbeat)",
+    "allocation_pct": 5.0,
+    "allocation_pct_crypto": 5.0,
+    "allocation_pct_stock": 5.0,
+    "min_trade_dollars": 5.0,
+    "limit_offset_pct": 0.1,
+    "daily_profit_target": 0.0,
+    "daily_loss_limit": 5.0,
+    "max_open_positions": 8,
+    "max_buys_per_cycle": 2,
+    "interval_crypto": 60,
+    "interval_penny": 60,
+    "interval_core": 300,
+    "interval_portfolio": 60,
+    "rh_email": "",
+    "rh_password": "",
+    "cb_api_key": "",
+    "cb_api_secret": ""
+}
