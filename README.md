@@ -16,6 +16,10 @@ Multi-broker quantitative trading desktop app (Robinhood + Coinbase Advanced) bu
    py main.py
    ```
 
+## Web monitor (read-only)
+
+While the desktop app is running, open `http://127.0.0.1:8791/` for live balances, auto-trader status, recent trades, and the activity log. Toggle/port/optional Basic Auth are under Settings. Port **8791** is chosen to avoid Arrs-Hub defaults (Readarr uses 8787). The monitor has no trade controls.
+
 ## Safety
 
 - Keep this repo **private**

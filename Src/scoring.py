@@ -279,10 +279,13 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     Trailing take-profit / hard stop / time-stop.
     Fee thresholds change by broker so CB doesn't take thin RH-style exits.
     """
-    if avg_cost <= 0: return "HOLD (Invalid Cost)"
-
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "HOLD (Awaiting Price)"
+
+    # Coinbase (and some RH crypto) often has no avg cost — seed at live price so
+    # TTP/time-stop can still manage the position from "now" instead of never selling.
+    if avg_cost <= 0:
+        avg_cost = current_price
 
     fees = _resolve_fee_profile(broker_id, ticker, asset_type)
     now = time.time()

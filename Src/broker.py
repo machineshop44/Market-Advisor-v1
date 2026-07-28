@@ -31,6 +31,15 @@ class BaseBroker:
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours): raise NotImplementedError
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
         return False, "unsupported"
+    def position_is_dust(self, ticker, shares, price, asset_type=""):
+        """Return (is_dust, reason). Default: under $1 notional."""
+        try:
+            notional = float(shares) * float(price)
+            if notional < 1.0:
+                return True, f"below $1 notional (${notional:.4f})"
+        except Exception:
+            return True, "invalid size/price"
+        return False, ""
 
 
 class RobinhoodAdapter(BaseBroker):
@@ -127,9 +136,71 @@ class RobinhoodAdapter(BaseBroker):
             return 1.0
         try:
             p = r.stocks.get_latest_price(clean)
-            if p and len(p) > 0: return float(p[0])
-        except Exception: pass
-        return 1.0
+            if p and len(p) > 0 and p[0] is not None:
+                price = float(p[0])
+                if price > 0:
+                    return price
+        except Exception:
+            pass
+        return 0.0
+
+    def _get_crypto_order_limits(self, ticker):
+        """Return (qty_increment, min_order_qty) for Robinhood crypto."""
+        if not hasattr(self, '_crypto_limits_cache'):
+            self._crypto_limits_cache = {}
+        if ticker in self._crypto_limits_cache:
+            return self._crypto_limits_cache[ticker]
+        inc = self._get_crypto_qty_increment(ticker)
+        min_qty = inc
+        try:
+            info = r.crypto.get_crypto_info(ticker) or {}
+            for key in ('min_order_size', 'crypto_min_order_size', 'min_order_quantity', 'min_order_quantity_increment'):
+                raw = info.get(key)
+                if raw is None:
+                    continue
+                val = float(raw)
+                if key.endswith('increment'):
+                    if val > 0:
+                        inc = val
+                elif val > 0:
+                    min_qty = max(min_qty, val)
+            # Some RH pairs expose min only via increment that is already the practical floor
+            if min_qty < inc:
+                min_qty = inc
+        except Exception:
+            pass
+        self._crypto_limits_cache[ticker] = (inc, min_qty)
+        return inc, min_qty
+
+    def position_is_dust(self, ticker, shares, price, asset_type=""):
+        """True when RH cannot sell this size (crypto min qty or stock <$1 fractional)."""
+        try:
+            shares = float(shares)
+            price = float(price)
+        except Exception:
+            return True, "invalid size/price"
+        if shares <= 0 or price <= 0:
+            return True, "invalid size/price"
+
+        is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in {
+            "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"
+        }
+        notional = shares * price
+        if is_crypto:
+            inc, min_qty = self._get_crypto_order_limits(ticker)
+            d_inc = Decimal(str(inc))
+            valid = (Decimal(str(shares)) / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
+            if float(valid) <= 0:
+                return True, f"below RH qty increment ({inc})"
+            if float(valid) + 1e-12 < float(min_qty):
+                return True, f"below RH min qty ({min_qty} {ticker})"
+            # RH also rejects tiny notionals on some pairs
+            if notional < 1.0:
+                return True, f"below ~$1 RH crypto floor (${notional:.4f})"
+            return False, ""
+        if notional < 1.0:
+            return True, f"stock fractional under $1 (${notional:.4f})"
+        return False, ""
 
     def _get_crypto_qty_increment(self, ticker):
         if ticker not in self._crypto_inc_cache:
@@ -141,15 +212,19 @@ class RobinhoodAdapter(BaseBroker):
                 self._crypto_inc_cache[ticker] = 1.0 if ticker in ["PEPE", "SHIB", "BONK"] else 0.000001
         return self._crypto_inc_cache[ticker]
 
+
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours):
         is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
         if is_crypto:
-            inc = self._get_crypto_qty_increment(ticker)
+            inc, min_qty = self._get_crypto_order_limits(ticker)
             d_inc = Decimal(str(inc))
             decimals = abs(d_inc.as_tuple().exponent)
-            d_qty = Decimal(str(trade_dollars / price))
+            d_qty = Decimal(str(trade_dollars / price)) if price > 0 else Decimal("0")
             valid_qty_dec = (d_qty / d_inc).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_inc
-            if valid_qty_dec <= 0: return f"Skipped: Cannot afford 1 increment", 0.0, None
+            if valid_qty_dec <= 0:
+                return f"Skipped: Cannot afford 1 increment", 0.0, None
+            if float(valid_qty_dec) + 1e-12 < float(min_qty):
+                return f"Skipped: Below RH min order ({min_qty} {ticker})", 0.0, None
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
             actual_spent = float(valid_qty_dec) * price
             try:
@@ -185,12 +260,15 @@ class RobinhoodAdapter(BaseBroker):
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours):
         is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
         if is_crypto:
-            inc = self._get_crypto_qty_increment(ticker)
+            inc, min_qty = self._get_crypto_order_limits(ticker)
             d_inc = Decimal(str(inc))
             decimals = abs(d_inc.as_tuple().exponent)
             d_qty = Decimal(str(shares_val))
             valid_qty_dec = (d_qty / d_inc).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_inc
-            if valid_qty_dec <= 0: return "Skipped: Quantity too small", None
+            if valid_qty_dec <= 0:
+                return "Skipped: Quantity too small", None
+            if float(valid_qty_dec) + 1e-12 < float(min_qty):
+                return f"Skipped: Dust below RH min ({min_qty} {ticker})", None
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
             try:
                 res = r.order_sell_crypto_by_quantity(ticker, safe_qty_str)
@@ -199,8 +277,19 @@ class RobinhoodAdapter(BaseBroker):
                     conf, state = self.confirm_order(oid, is_crypto=True)
                     tag = "Filled" if conf else f"Pending/{state}"
                     return f"Crypto Sell {tag} ({safe_qty_str})", oid
+                # RH sometimes returns validation errors as dict without id
+                err = str(res)
+                if "too small" in err.lower() or "at least" in err.lower():
+                    return f"Skipped: {res}", None
                 return f"Fail: {res}", None
-            except Exception as e: return f"Fail: {e}", None
+            except Exception as e:
+                err = str(e)
+                if "too small" in err.lower() or "at least" in err.lower():
+                    return f"Skipped: {err}", None
+                return f"Fail: {e}", None
+
+        if price <= 0:
+            return "Skipped: No valid market price (delisted/untradeable)", None
 
         if shares_val >= 1.0:
             qty_to_sell = int(shares_val)
@@ -213,18 +302,28 @@ class RobinhoodAdapter(BaseBroker):
                     tag = "Filled" if conf else f"Pending/{state}"
                     return f"Sell {tag} ({qty_to_sell})", oid
                 return f"Fail: {res}", None
-            except Exception as e: return f"Fail: {e}", None
+            except Exception as e:
+                err = str(e)
+                if "list index" in err.lower() or "not a valid" in err.lower():
+                    return f"Skipped: Untradeable ticker ({err})", None
+                return f"Fail: {e}", None
 
         if use_ext_hours: return "Skipped: Ext. Hours blocks fractional sells.", None
-        if (shares_val * price) < 1.00: return f"Fail: Fractional value under $1.00", None
+        if (shares_val * price) < 1.00: return f"Skipped: Fractional value under $1.00", None
 
-        res = r.order_sell_fractional_by_quantity(ticker, shares_val, timeInForce='gfd')
-        if isinstance(res, dict) and ("id" in res or "state" in res):
-            oid = res.get('id')
-            conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
-            tag = "Filled" if conf else f"Pending/{state}"
-            return f"Sell {tag} ({shares_val})", oid
-        return f"Fail: {res}", None
+        try:
+            res = r.order_sell_fractional_by_quantity(ticker, shares_val, timeInForce='gfd')
+            if isinstance(res, dict) and ("id" in res or "state" in res):
+                oid = res.get('id')
+                conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                tag = "Filled" if conf else f"Pending/{state}"
+                return f"Sell {tag} ({shares_val})", oid
+            return f"Fail: {res}", None
+        except Exception as e:
+            err = str(e)
+            if "list index" in err.lower() or "not a valid" in err.lower():
+                return f"Skipped: Untradeable ticker ({err})", None
+            return f"Fail: {e}", None
 
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
         """Poll Robinhood until filled/cancelled/rejected or timeout."""
@@ -360,6 +459,15 @@ class CoinbaseAdapter(BaseBroker):
 
     def get_live_price(self, ticker):
         clean = str(ticker).replace("-USD", "").upper()
+        # Hard block equity/ETF symbols — Coinbase has no SPY-USD etc (stops 404 spam)
+        equity_block = {
+            "SPY", "QQQ", "TQQQ", "SOXL", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META",
+            "AMZN", "VOO", "VTI", "IWM", "DIA", "PLTR", "SOUN", "SNDL", "PLUG", "GOEVQ",
+            "SPCX", "NFLX", "GOOG", "GOOGL", "INTC", "BAC", "F", "GE", "DIS",
+        }
+        if clean in equity_block or clean.endswith("Q") and len(clean) >= 4:
+            return 0.0
+
         if self.is_connected and self.client:
             try:
                 product_id = f"{clean}-USD"
@@ -371,7 +479,7 @@ class CoinbaseAdapter(BaseBroker):
                         return price
             except Exception:
                 pass
-        # yfinance fallback (paper mode / API hiccups)
+        # yfinance crypto fallback only (never treat as stock)
         try:
             df = yf.Ticker(f"{clean}-USD").history(period="1d")
             if not df.empty:
@@ -379,6 +487,71 @@ class CoinbaseAdapter(BaseBroker):
         except Exception:
             pass
         return 0.0
+
+    def _get_product_limits(self, ticker):
+        """
+        Return dict with base_increment, base_min_size, quote_min_size for a CB product.
+        Cached per ticker.
+        """
+        clean = str(ticker).replace("-USD", "").upper()
+        if not hasattr(self, '_product_limits_cache'):
+            self._product_limits_cache = {}
+        if clean in self._product_limits_cache:
+            return self._product_limits_cache[clean]
+
+        limits = {
+            'base_increment': 0.00000001,
+            'base_min_size': 0.0,
+            'quote_min_size': 1.0,  # sensible default USD floor
+        }
+        if self.is_connected and self.client:
+            try:
+                prod = self.client.get_product(product_id=f"{clean}-USD")
+                data = prod.to_dict() if hasattr(prod, 'to_dict') else prod
+                if isinstance(data, dict):
+                    for key in ('base_increment', 'base_min_size', 'quote_min_size', 'min_market_funds'):
+                        raw = data.get(key)
+                        if raw is None:
+                            continue
+                        try:
+                            val = float(raw)
+                        except Exception:
+                            continue
+                        if key == 'min_market_funds' and val > 0:
+                            limits['quote_min_size'] = max(limits['quote_min_size'], val)
+                        elif val > 0:
+                            limits[key] = val
+            except Exception:
+                pass
+        if limits['base_min_size'] <= 0:
+            limits['base_min_size'] = limits['base_increment']
+        self._product_limits_cache[clean] = limits
+        return limits
+
+    def position_is_dust(self, ticker, shares, price, asset_type=""):
+        """True when Coinbase cannot market-sell this size (base/quote mins)."""
+        try:
+            shares = float(shares)
+            price = float(price)
+        except Exception:
+            return True, "invalid size/price"
+        if shares <= 0 or price <= 0:
+            return True, "invalid size/price"
+
+        limits = self._get_product_limits(ticker)
+        inc = limits['base_increment']
+        min_base = limits['base_min_size']
+        min_quote = limits['quote_min_size']
+        d_inc = Decimal(str(inc))
+        valid = (Decimal(str(shares)) / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
+        if float(valid) <= 0:
+            return True, f"below CB base increment ({inc})"
+        if float(valid) + 1e-12 < float(min_base):
+            return True, f"below CB min size ({min_base} {str(ticker).upper()})"
+        notional = float(valid) * price
+        if min_quote > 0 and notional + 1e-9 < float(min_quote):
+            return True, f"below CB min notional (${min_quote:.2f}, have ${notional:.4f})"
+        return False, ""
 
     def _extract_order_id(self, data):
         if not isinstance(data, dict):
@@ -417,9 +590,12 @@ class CoinbaseAdapter(BaseBroker):
         product_id = f"{clean}-USD"
 
         try:
-            prod = self.client.get_product(product_id=product_id)
-            prod_data = prod.to_dict() if hasattr(prod, 'to_dict') else prod
-            base_increment = float(prod_data.get('base_increment', 0.00000001))
+            dust, reason = self.position_is_dust(clean, shares_val, price, asset_type)
+            if dust:
+                return f"Skipped: Dust ({reason})", None
+
+            limits = self._get_product_limits(clean)
+            base_increment = float(limits.get('base_increment', 0.00000001))
 
             d_inc = Decimal(str(base_increment))
             decimals = abs(d_inc.as_tuple().exponent)
