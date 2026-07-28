@@ -497,16 +497,23 @@ class MarketAdvisorGUI(QMainWindow):
     #  SYSTEM TRAY (Sonarr/Radarr-style background + restore)
     # ---------------------------------------------------------
     def _make_app_icon(self):
-        """Simple chart-style icon so we don't need an external .ico file."""
+        """Load the Market Advisor icon (candles + trend); fall back to a drawn mark."""
+        base = os.path.dirname(os.path.abspath(__file__))
+        for name in ("app_icon.ico", "app_icon.png"):
+            path = os.path.join(base, name)
+            if os.path.isfile(path):
+                icon = QIcon(path)
+                if not icon.isNull():
+                    return icon
         pm = QPixmap(64, 64)
         pm.fill(Qt.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(QColor("#1B5E20"))
+        p.setBrush(QColor("#0D3B2E"))
         p.setPen(Qt.NoPen)
         p.drawRoundedRect(2, 2, 60, 60, 12, 12)
-        p.setPen(QPen(QColor("#A5D6A7"), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        pts = [QPoint(12, 44), QPoint(24, 36), QPoint(34, 40), QPoint(46, 22), QPoint(54, 18)]
+        p.setPen(QPen(QColor("#A5D6A7"), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        pts = [QPoint(10, 46), QPoint(22, 38), QPoint(32, 42), QPoint(44, 24), QPoint(54, 16)]
         for i in range(len(pts) - 1):
             p.drawLine(pts[i], pts[i + 1])
         p.end()
