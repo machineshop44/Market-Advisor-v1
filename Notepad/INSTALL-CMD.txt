@@ -1,0 +1,110 @@
+Market Advisor v1 — what to install in CMD
+==========================================
+Use these commands on a fresh PC (Windows).
+Open Command Prompt or PowerShell and run them in order.
+
+
+1) Make sure Python 3.12 is installed
+------------------------------------
+Check:
+  py -3.12 --version
+
+If that fails, install Python 3.12 from:
+  https://www.python.org/downloads/
+(During install, check "Add python.exe to PATH".)
+
+
+2) Go to the project folder
+---------------------------
+  cd "C:\Users\machi\Desktop\Market Advisor v1"
+
+(If you copied from Google Drive, use that folder path instead.)
+
+
+3) Install all Python packages (one command)
+--------------------------------------------
+  py -3.12 -m pip install --upgrade pip
+  py -3.12 -m pip install -r requirements.txt
+
+That installs:
+  - PyQt5                 (desktop UI)
+  - yfinance              (prices / charts / scoring)
+  - pandas                (data)
+  - robin_stocks          (Robinhood)
+  - coinbase-advanced-py  (Coinbase Advanced API)
+  - finvizfinance         (breakout / penny scanner)
+
+
+4) Settings (only if settings.json is missing)
+----------------------------------------------
+  copy "Src\settings.example.json" "Src\settings.json"
+
+Then open Src\settings.json in Notepad and fill in:
+  - Robinhood email / password
+  - Coinbase API key / secret
+  - Discord webhook (optional)
+
+If you mirrored from Google Drive, settings.json should already be there — skip this step.
+
+
+5) Run the app
+--------------
+Best (icon / tray, like Sonarr):
+  Double-click: Start Market Advisor.vbs
+  Or make a Desktop shortcut once:
+    powershell -ExecutionPolicy Bypass -File "Create-Desktop-Shortcut.ps1"
+
+  Close the window (X) = keep running in the system tray (near the clock).
+  Double-click the tray icon = open the window again.
+  Right-click tray icon -> Quit = fully exit.
+
+Debug (shows CMD):
+  cd Src
+  py -3.12 main.py
+
+Or double-click:
+  Src\run.bat
+
+
+Moving to another PC (home machine)
+-----------------------------------
+The Desktop "Market Advisor.lnk" icon is THIS-PC only (it points at a fixed path).
+Do NOT rely on copying the .lnk file by itself.
+
+What IS portable (backed up on Google Drive):
+  G:\My Drive\Python Scripts\Market Advisor v1
+  including settings.json, Start Market Advisor.vbs, Create-Desktop-Shortcut.ps1
+
+At home:
+  1. Copy that whole folder from Google Drive to the PC
+  2. Run steps 1 and 3 above (Python + pip install)
+  3. From inside the copied folder, run:
+       powershell -ExecutionPolicy Bypass -File "Create-Desktop-Shortcut.ps1"
+     That builds a NEW Desktop icon for that machine.
+  4. Or just double-click Start Market Advisor.vbs in the folder
+
+
+Optional (only if you use GitHub sync)
+--------------------------------------
+  winget install GitHub.cli
+  gh auth login
+
+Periodic GitHub backup (this PC):
+  Windows task "MarketAdvisor-GitHub-Sync" runs every Sunday at 6:00 PM.
+  Script: sync-to-github.ps1 (skips secrets like settings.json).
+  Manual run anytime:
+    powershell -ExecutionPolicy Bypass -File "sync-to-github.ps1"
+
+  Note: that scheduled task is this-PC only. On a new machine, recreate it or run the script manually / after setup.
+
+
+Quick reinstall (if something breaks)
+-------------------------------------
+  cd "C:\Users\machi\Desktop\Market Advisor v1"
+  py -3.12 -m pip install -r requirements.txt --force-reinstall
+
+
+Web monitor (no extra install)
+------------------------------
+While the app is running, open in a browser:
+  http://127.0.0.1:8791/

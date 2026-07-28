@@ -13,9 +13,10 @@ from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBo
                              QLabel, QTableWidget, QTableWidgetItem, QHeaderView, 
                              QPushButton, QMessageBox, QInputDialog, QLineEdit, 
                              QApplication, QStatusBar, QFrame, QCheckBox, QComboBox,
-                             QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog, QDialog, QFormLayout, QGroupBox)
+                             QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog, QDialog, QFormLayout, QGroupBox,
+                             QSystemTrayIcon, QMenu, QAction)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QEventLoop, QPoint
-from PyQt5.QtGui import QPainter, QPen, QColor, QPalette, QPixmap, QPolygon
+from PyQt5.QtGui import QPainter, QPen, QColor, QPalette, QPixmap, QPolygon, QIcon
 
 import market_data
 import scoring
@@ -475,6 +476,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.update_market_status()
         self.log_event("Application initialized. Verifying connections...")
         self._start_web_monitor()
+        self._setup_system_tray()
 
         QTimer.singleShot(100, self.run_startup_sequence)
 
@@ -490,6 +492,89 @@ class MarketAdvisorGUI(QMainWindow):
     @property
     def cycle_broker(self):
         return self.brokers.get(self.cycle_broker_name, self.brokers["Robinhood"])
+
+    # ---------------------------------------------------------
+    #  SYSTEM TRAY (Sonarr/Radarr-style background + restore)
+    # ---------------------------------------------------------
+    def _make_app_icon(self):
+        """Simple chart-style icon so we don't need an external .ico file."""
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor("#1B5E20"))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(2, 2, 60, 60, 12, 12)
+        p.setPen(QPen(QColor("#A5D6A7"), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        pts = [QPoint(12, 44), QPoint(24, 36), QPoint(34, 40), QPoint(46, 22), QPoint(54, 18)]
+        for i in range(len(pts) - 1):
+            p.drawLine(pts[i], pts[i + 1])
+        p.end()
+        return QIcon(pm)
+
+    def _setup_system_tray(self):
+        self._force_quit = False
+        self._tray_tip_shown = False
+        self.app_icon = self._make_app_icon()
+        self.setWindowIcon(self.app_icon)
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon = None
+            self.log_event("System tray unavailable — close will exit the app.")
+            return
+
+        self.tray_icon = QSystemTrayIcon(self.app_icon, self)
+        self.tray_icon.setToolTip("Market Advisor")
+
+        menu = QMenu()
+        show_act = QAction("Open Market Advisor", self)
+        show_act.triggered.connect(self.show_from_tray)
+        menu.addAction(show_act)
+        menu.addSeparator()
+        quit_act = QAction("Quit", self)
+        quit_act.triggered.connect(self.quit_from_tray)
+        menu.addAction(quit_act)
+
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        # Double-click or single left-click restores the window
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.show_from_tray()
+
+    def show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_from_tray(self):
+        self._force_quit = True
+        self.close()
+
+    def closeEvent(self, event):
+        # X / Alt+F4 → hide to tray (keeps auto-trader + web monitor alive)
+        if self.tray_icon and not self._force_quit:
+            event.ignore()
+            self.hide()
+            if not self._tray_tip_shown:
+                self._tray_tip_shown = True
+                self.tray_icon.showMessage(
+                    "Market Advisor",
+                    "Still running in the tray. Double-click the icon to open, or right-click → Quit.",
+                    QSystemTrayIcon.Information,
+                    4000,
+                )
+            return
+        try:
+            monitor.stop_monitor()
+        except Exception:
+            pass
+        if self.tray_icon:
+            self.tray_icon.hide()
+        event.accept()
+        QApplication.instance().quit()
 
     # ---------------------------------------------------------
     #  GUI INPUT INTERCEPTOR FOR 2FA
@@ -2728,7 +2813,17 @@ class MarketAdvisorGUI(QMainWindow):
         return discovered
 
     def _bg_scan_core(self):
-        return [{'symbol': s, 'type': 'Stock/ETF'} for s in ["SPY", "QQQ", "TQQQ", "SOXL", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META"]]
+        # Mega-caps + liquid ETFs (index, sector, thematic, bonds/metals). Curated — not the full ETF universe.
+        return [{'symbol': s, 'type': 'Stock/ETF'} for s in [
+            # Mega-cap stocks
+            "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META", "AMZN", "GOOGL",
+            # Broad / leveraged index ETFs
+            "SPY", "QQQ", "IWM", "DIA", "TQQQ", "SQQQ", "SOXL", "SOXS",
+            # Sector / thematic ETFs
+            "XLK", "XLF", "XLE", "XLV", "SMH", "ARKK", "IBIT",
+            # Bonds / metals / volatility hedges
+            "TLT", "HYG", "GLD", "SLV", "UVXY",
+        ]]
 
     def toggle_paper_mode(self):
         self.paper_mode = not self.paper_mode

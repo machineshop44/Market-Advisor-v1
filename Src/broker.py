@@ -227,15 +227,34 @@ class RobinhoodAdapter(BaseBroker):
                 return f"Skipped: Below RH min order ({min_qty} {ticker})", 0.0, None
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
             actual_spent = float(valid_qty_dec) * price
+            # RH often 422s sub-$5 crypto notionals (esp. BTC); skip cleanly instead of submitting.
+            min_notional = max(5.0, float(min_qty) * float(price) if price > 0 else 5.0)
+            if actual_spent + 1e-9 < min_notional:
+                return (
+                    f"Skipped: Below RH crypto floor (${actual_spent:.2f} < ${min_notional:.2f})",
+                    0.0,
+                    None,
+                )
             try:
                 res = r.order_buy_crypto_by_quantity(ticker, safe_qty_str)
                 if isinstance(res, dict) and 'id' in res:
                     oid = res['id']
                     conf, state = self.confirm_order(oid, is_crypto=True)
+                    if not conf and state and any(
+                        x in str(state).lower() for x in ("reject", "fail", "cancel", "unconfirm")
+                    ):
+                        return f"Skipped: RH rejected ({state})", 0.0, None
                     tag = "Filled" if conf else f"Pending/{state}"
                     return f"Crypto Buy {tag} ({actual_spent:.2f})", actual_spent, oid
+                err = str(res)
+                if "422" in err or res is None:
+                    return f"Skipped: RH rejected small/invalid crypto size ({res})", 0.0, None
                 return f"Fail: {res}", 0.0, None
-            except Exception as e: return f"Fail: {e}", 0.0, None
+            except Exception as e:
+                err = str(e)
+                if "422" in err:
+                    return f"Skipped: RH 422 (size/limits) for {ticker}", 0.0, None
+                return f"Fail: {e}", 0.0, None
 
         if use_ext_hours:
             qty_to_buy = int(trade_dollars / price) if price > 0 else 0

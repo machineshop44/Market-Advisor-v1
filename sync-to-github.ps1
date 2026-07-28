@@ -1,5 +1,6 @@
 # Sync local Market Advisor changes to GitHub (safe paths only).
-# Skips secrets; no-ops when the working tree is clean.
+# Skips secrets via .gitignore; no-ops when the working tree is clean.
+# Scheduled: Windows task "MarketAdvisor-GitHub-Sync" — Sundays 6:00 PM
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -16,9 +17,17 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# Stage known project files; never touch secrets (.gitignore already excludes settings.json etc.)
-git add -- README.md .gitignore Src/*.py Src/*.bat Src/settings.example.json 2>$null
-git add -u -- Src README.md .gitignore 2>$null
+# Stage project files; .gitignore keeps settings.json / journals / logs out
+git add -- `
+  README.md `
+  .gitignore `
+  requirements.txt `
+  sync-to-github.ps1 `
+  "Start Market Advisor.vbs" `
+  Create-Desktop-Shortcut.ps1 `
+  Notepad `
+  Src 2>$null
+git add -u 2>$null
 
 $status = git status --porcelain
 if (-not $status) {
