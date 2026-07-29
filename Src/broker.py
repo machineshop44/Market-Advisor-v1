@@ -1,20 +1,45 @@
 import time
 import math
+import importlib
 from decimal import Decimal, ROUND_DOWN
-import robin_stocks.robinhood as r
 
-# Attempt to import Coinbase Advanced SDK
-try:
-    from coinbase.rest import RESTClient
-    COINBASE_AVAILABLE = True
-except ImportError:
-    COINBASE_AVAILABLE = False
 
-# Fallback crypto fetcher
-try:
-    import yfinance as yf
-except ImportError:
-    pass
+class _LazyModule:
+    """Import a heavy module on first attribute access (keeps startup fast)."""
+
+    def __init__(self, module_name):
+        self._module_name = module_name
+        self._mod = None
+
+    def _load(self):
+        if self._mod is None:
+            self._mod = importlib.import_module(self._module_name)
+        return self._mod
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+r = _LazyModule("robin_stocks.robinhood")
+yf = _LazyModule("yfinance")
+
+_RESTClient = None
+_coinbase_checked = False
+COINBASE_AVAILABLE = False  # updated on first Coinbase login attempt
+
+
+def _get_rest_client_class():
+    global _RESTClient, _coinbase_checked, COINBASE_AVAILABLE
+    if not _coinbase_checked:
+        _coinbase_checked = True
+        try:
+            from coinbase.rest import RESTClient as _RC
+            _RESTClient = _RC
+            COINBASE_AVAILABLE = True
+        except ImportError:
+            _RESTClient = None
+            COINBASE_AVAILABLE = False
+    return _RESTClient
 
 class BaseBroker:
     """The master interface that all broker adapters must strictly follow."""
@@ -133,7 +158,7 @@ class RobinhoodAdapter(BaseBroker):
                 df = yf.Ticker(f"{clean}-USD").history(period="1d")
                 if not df.empty: return float(df['Close'].iloc[-1])
             except Exception: pass
-            return 1.0
+            return 0.0
         try:
             p = r.stocks.get_latest_price(clean)
             if p and len(p) > 0 and p[0] is not None:
@@ -376,7 +401,8 @@ class CoinbaseAdapter(BaseBroker):
         self.client = None
 
     def login(self, credentials):
-        if not COINBASE_AVAILABLE:
+        RESTClient = _get_rest_client_class()
+        if not RESTClient or not COINBASE_AVAILABLE:
             return False, "coinbase-advanced-py not installed"
         
         api_key = credentials.get('api_key')

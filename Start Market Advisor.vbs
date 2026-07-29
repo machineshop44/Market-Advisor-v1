@@ -1,10 +1,5 @@
-' Launches Market Advisor with no CMD window (tray-friendly, like Sonarr/Radarr).
 Option Explicit
-Dim sh, fso, root, src
-Set fso = CreateObject("Scripting.FileSystemObject")
+Dim sh
 Set sh = CreateObject("WScript.Shell")
-root = fso.GetParentFolderName(WScript.ScriptFullName)
-src = root & "\Src"
-sh.CurrentDirectory = src
-' 0 = hidden window; False = don't wait
-sh.Run "pyw -3.12 main.py", 0, False
+sh.CurrentDirectory = "C:\Users\machi\Desktop\Market Advisor v1\Src"
+sh.Run """C:\Users\machi\AppData\Local\Programs\Python\Python312\pythonw.exe"" ""C:\Users\machi\Desktop\Market Advisor v1\Src\main.py""", 0, False

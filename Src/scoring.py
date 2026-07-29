@@ -1,15 +1,25 @@
 import os
 import json
 import time
-import pandas as pd
-import yfinance as yf
 from datetime import datetime
+
+# Lazy heavy deps — pandas/yfinance are only pulled when scoring actually runs
+_yf = None
+
+
+def _get_yf():
+    global _yf
+    if _yf is None:
+        import yfinance as yf
+        _yf = yf
+    return _yf
+
 
 # Fallback wrapper to hook into the main GUI's price feed
 try:
     from market_data import fetch_current_price
 except ImportError:
-    def fetch_current_price(ticker): return 1.0
+    def fetch_current_price(ticker): return 0.0
 
 # =========================================================================
 # BROKER FEE PROFILES
@@ -151,7 +161,7 @@ def _get_trend_data(ticker, interval="5m", period="5d"):
 
     result = (False, False, None, False)
     try:
-        df = yf.Ticker(_safe_ticker(ticker)).history(period=period, interval=interval)
+        df = _get_yf().Ticker(_safe_ticker(ticker)).history(period=period, interval=interval)
         if df.empty or len(df) < 20:
             _trend_cache[cache_key] = (time.time(), result)
             return result
@@ -204,8 +214,22 @@ def _check_hysteresis(ticker, current_price, is_crypto, broker_id):
     return False, "DO NOT BUY (Waiting for Dip)"
 
 
-def save_state():
-    """Persist TTP/cooldown memory so restarts don't wipe trade state."""
+_state_dirty = False
+_last_state_save = 0.0
+_STATE_SAVE_MIN_INTERVAL = 3.0  # seconds — avoid writing JSON on every HOLD eval
+
+
+def save_state(force=False):
+    """Persist TTP/cooldown memory so restarts don't wipe trade state.
+
+    Debounced: rapid evaluate_holding calls mark dirty and write at most
+    every few seconds unless force=True (SELL / shutdown flush).
+    """
+    global _state_dirty, _last_state_save
+    _state_dirty = True
+    now = time.time()
+    if not force and (now - _last_state_save) < _STATE_SAVE_MIN_INTERVAL:
+        return
     try:
         payload = {
             "portfolio": _portfolio_memory,
@@ -214,8 +238,17 @@ def save_state():
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+        _state_dirty = False
+        _last_state_save = now
     except Exception as e:
         print(f"scoring save_state error: {e}")
+
+
+def flush_state():
+    """Write pending scoring memory immediately (end of portfolio pass / exit)."""
+    global _state_dirty
+    if _state_dirty:
+        save_state(force=True)
 
 
 def load_state():
@@ -305,26 +338,26 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     roi = (current_price - avg_cost) / avg_cost
 
     if roi <= fees["hard_stop"]:
-        save_state()
+        save_state(force=True)
         return f"SELL (Hard Stop: {roi*100:.2f}%)"
 
     peak_roi = (highest - avg_cost) / avg_cost
     if peak_roi >= fees["ttp_arm"]:
         trail_trigger_price = highest * (1.0 - fees["ttp_trail"])
         if current_price <= trail_trigger_price:
-            save_state()
+            save_state(force=True)
             return f"SELL (TTP Triggered - Peak: +{peak_roi*100:.2f}%, Exit: +{roi*100:.2f}%)"
         save_state()
         return f"HOLD (TTP Armed - Peak: +{peak_roi*100:.2f}%)"
 
     if held_time_minutes >= 120 and roi < fees["stale_roi"]:
-        save_state()
+        save_state(force=True)
         return f"SELL (Stale > 2h, ROI: {roi*100:.2f}%)"
     elif held_time_minutes >= 60 and roi >= fees["time_60m_target"]:
-        save_state()
+        save_state(force=True)
         return f"SELL (Time-Stop > 1h, +{fees['time_60m_target']*100:.1f}% Target Hit)"
     elif held_time_minutes >= 30 and roi >= fees["time_30m_target"]:
-        save_state()
+        save_state(force=True)
         return f"SELL (Time-Stop > 30m, +{fees['time_30m_target']*100:.1f}% Target Hit)"
 
     save_state()
