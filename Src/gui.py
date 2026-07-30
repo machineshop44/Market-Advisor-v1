@@ -91,6 +91,7 @@ def load_settings():
         "discord_webhook": "",
         "discord_alert_level": "All Alerts (Every Trade & Heartbeat)",
         "discord_heartbeat_schedule": "Rolling (every hour from now)",
+        "discord_big_win_roi_pct": 1.5,
         "monitor_enabled": True,
         "monitor_host": "127.0.0.1",
         "monitor_port": 8791,
@@ -102,13 +103,13 @@ def load_settings():
         "min_trade_dollars": 5.0,
         "limit_offset_pct": 0.1,
         "daily_profit_target": 0.0,
-        "daily_loss_limit": 5.0,
-        "max_open_positions": 8,
+        "daily_loss_limit": 8.0,
+        "max_open_positions": 6,
         "max_buys_per_cycle": 2,
-        "interval_crypto": 30,
+        "interval_crypto": 45,
         "interval_penny": 60,
         "interval_core": 300,
-        "interval_portfolio": 60,
+        "interval_portfolio": 45,
         "interval_balance_refresh": 60,
         "rh_email": "",
         "rh_password": "",
@@ -569,6 +570,14 @@ class MarketAdvisorGUI(QMainWindow):
             "Robinhood": RobinhoodAdapter(),
             "Coinbase": CoinbaseAdapter()
         }
+        try:
+            from scoring import register_regime_brokers
+            register_regime_brokers(
+                robinhood=self.brokers["Robinhood"],
+                coinbase=self.brokers["Coinbase"],
+            )
+        except Exception:
+            pass
         self.active_broker_name = "Robinhood"
         self.view_mode = "All"  # Dropdown: All | Robinhood | Coinbase
         self.penny_tab_index = 3
@@ -607,6 +616,9 @@ class MarketAdvisorGUI(QMainWindow):
         self._balances_fetched_once = False
         self._launch_failsafe_waits = 0
         self.current_trading_day = datetime.now().date()
+        self._sell_defer_log = {}  # (broker, ticker, reason) -> session label last logged
+        self._frac_ext_ineligible = set()  # RH tickers rejected for ext-hours fractionals
+        self._last_equity_session_label = None
         
         self.trade_locks = {}
         self._portfolio_fingerprint = ""
@@ -1163,6 +1175,7 @@ class MarketAdvisorGUI(QMainWindow):
             self._record_buy_cost(broker_name, ticker, price, shares_bought)
             status = f"[PAPER] Buy Simulated ({format_currency(trade_dollars)})"
             self._journal_fill("BUY", ticker, asset_type, price, status, dollars=trade_dollars, qty=shares_bought)
+            self._attach_protective_stop(broker_name, ticker, asset_type, price, trade_dollars)
             return status, trade_dollars
         result = self.cycle_broker.place_buy_order(
             ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
@@ -1176,6 +1189,14 @@ class MarketAdvisorGUI(QMainWindow):
         if spent and spent > 0 and price > 0:
             self._record_buy_cost(broker_name, ticker, price, spent / price)
         self._journal_fill("BUY", ticker, asset_type, price, status, dollars=spent, qty=(spent / price) if price and spent else None, order_id=order_id)
+        filled_ok = (
+            spent and spent > 0
+            and "Fail" not in str(status)
+            and "Skipped" not in str(status)
+            and "Filled" in str(status)
+        )
+        if filled_ok:
+            self._attach_protective_stop(broker_name, ticker, asset_type, price, spent)
         return status, spent
 
     def execute_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
@@ -1190,15 +1211,19 @@ class MarketAdvisorGUI(QMainWindow):
             sell_qty = min(shares_val, pos['shares'])
             proceeds = sell_qty * price
             pos['shares'] -= sell_qty
-            if pos['shares'] <= 1e-9:
+            fully_exited = pos['shares'] <= 1e-9
+            if fully_exited:
                 del book[ticker]
                 self.cost_basis_cache.get(broker_name, {}).pop(ticker, None)
+                self._cancel_protective_stop(broker_name, ticker, asset_type)
             else:
                 book[ticker] = pos
             self.sandbox_cash[broker_name] = self.sandbox_cash.get(broker_name, 0.0) + proceeds
             status = f"[PAPER] Sell Simulated ({format_currency(proceeds)})"
             self._journal_fill("SELL", ticker, asset_type, price, status, dollars=proceeds, qty=sell_qty)
             return status
+        # Live: cancel protective first so reserved shares can sell
+        self._cancel_protective_stop(broker_name, ticker, asset_type)
         result = self.cycle_broker.place_sell_order(
             ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
             market_hours=market_hours, allow_fractional=allow_fractional,
@@ -1210,10 +1235,19 @@ class MarketAdvisorGUI(QMainWindow):
             status, order_id = result, None
         if "Fail" not in status and "Skipped" not in status:
             self.cost_basis_cache.get(broker_name, {}).pop(ticker, None)
+        # Don't journal session/eligibility skips — those are deferred and would spam Recent Trades
+        st_l = str(status).lower()
+        if "Skipped" in str(status) and (
+            "overnight" in st_l
+            or "fractional" in st_l
+            or "ext. hours" in st_l
+            or "session" in st_l
+        ):
+            return status
         self._journal_fill("SELL", ticker, asset_type, price, status, dollars=shares_val * price, qty=shares_val, order_id=order_id)
         return status
 
-    def send_discord_alert(self, message, is_trade=False, embed=None):
+    def send_discord_alert(self, message, is_trade=False, embed=None, urgent=False):
         webhook_url = self.settings.get("discord_webhook", "").strip()
         if not webhook_url:
             return
@@ -1221,7 +1255,12 @@ class MarketAdvisorGUI(QMainWindow):
         alert_lvl = self.settings.get("discord_alert_level", "All Alerts (Every Trade & Heartbeat)")
         if alert_lvl == "Disabled Completely":
             return
-        if is_trade and alert_lvl == "Important Only (Critical Alerts & Hourly Heartbeat)":
+        # Important Only = critical/urgent + heartbeat; suppress routine trade spam
+        if (
+            is_trade
+            and not urgent
+            and alert_lvl == "Important Only (Critical Alerts & Hourly Heartbeat)"
+        ):
             return
 
         def _post():
@@ -1250,6 +1289,46 @@ class MarketAdvisorGUI(QMainWindow):
                 self.log_event(f"Discord webhook failed: {res[6:]}")
 
         self.run_thread(_post, _done)
+
+    def _avg_cost_for(self, broker_name, ticker):
+        """Look up tracked avg cost (cost_basis_cache stores plain floats per ticker)."""
+        cache = self.cost_basis_cache.get(broker_name) or {}
+        entry = cache.get(ticker)
+        if entry is None and ticker:
+            entry = cache.get(str(ticker).upper())
+        try:
+            return float(entry or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _sell_roi(self, broker_name, ticker, price, avg_cost=None):
+        """Return ROI fraction for a sell, or None if unknown."""
+        try:
+            px = float(price or 0)
+        except (TypeError, ValueError):
+            return None
+        cost = avg_cost
+        if cost is None:
+            cost = self._avg_cost_for(broker_name, ticker)
+        try:
+            cost = float(cost or 0)
+        except (TypeError, ValueError):
+            return None
+        if px <= 0 or cost <= 0:
+            return None
+        return (px - cost) / cost
+
+    def _is_big_win_roi(self, roi):
+        """True when ROI meets Discord big-win threshold (settings %, default 2%)."""
+        if roi is None:
+            return False
+        try:
+            thr_pct = float(self.settings.get("discord_big_win_roi_pct", 1.5) or 0)
+        except (TypeError, ValueError):
+            thr_pct = 2.0
+        if thr_pct <= 0:
+            return False
+        return float(roi) * 100.0 >= thr_pct
 
     def _heartbeat_align_minute(self, mode):
         """Return clock minute to align hourly ping, or None for rolling."""
@@ -1712,14 +1791,14 @@ class MarketAdvisorGUI(QMainWindow):
                 if target_profit > 0 and pl_val >= target_profit:
                     msg = f"🎯 **[{broker_name}] Day Profit Target Reached!** Target: {format_currency(target_profit)} | Gain: {format_currency(pl_val)}. Disarming Auto-Trader."
                     self.log_event(msg)
-                    self.send_discord_alert(msg)
+                    self.send_discord_alert(msg, urgent=True)
                     self._disarm_broker(broker_name)
 
                 loss_limit = self.settings.get("daily_loss_limit", 0.0)
                 if loss_limit > 0 and pl_val <= -loss_limit:
                     msg = f"🚨 **[{broker_name}] MAX DAILY LOSS LIMIT HIT!** Limit: -{format_currency(loss_limit)} | Loss: -{pl_str}. EMERGENCY HALT DISARMING AUTO-TRADER."
                     self.log_event(msg)
-                    self.send_discord_alert(msg)
+                    self.send_discord_alert(msg, urgent=True)
                     self._disarm_broker(broker_name)
 
         if hasattr(self, 'home_master_pl_lbl'):
@@ -1925,6 +2004,64 @@ class MarketAdvisorGUI(QMainWindow):
             "fractional_ok": False,
             "equity_tradeable": False,
         }
+
+    def _sync_equity_session_state(self, session=None):
+        """Clear per-session defer bookkeeping when the equity window changes."""
+        session = session or self.get_equity_session_info()
+        label = session.get("label") or "UNKNOWN"
+        prev = getattr(self, "_last_equity_session_label", None)
+        if prev != label:
+            self._last_equity_session_label = label
+            self._sell_defer_log = {}
+            if label == "REGULAR":
+                # Extended-hours ineligible list only applies outside regular hours
+                self._frac_ext_ineligible = set()
+        return session
+
+    def _rh_equity_sell_defer_reason(self, ticker, shares_val, price, asset_type, session):
+        """
+        If this RH equity sell cannot succeed in the current session, return a short reason.
+        Crypto / Coinbase always return None (24/7).
+        """
+        is_crypto = "crypto" in str(asset_type or "").lower() or str(ticker).upper() in KNOWN_CRYPTOS
+        if is_crypto:
+            return None
+        if not session.get("equity_tradeable"):
+            return "equity markets closed"
+        try:
+            shares = float(shares_val or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        try:
+            px = float(price or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        # Sub-1 share positions need RH fractionals
+        if 0 < shares < 1.0:
+            if px > 0 and (shares * px) < 1.00:
+                return "fractional notional under $1"
+            if not session.get("fractional_ok"):
+                return (
+                    "fractional equity sells blocked until ~7am ET / regular hours "
+                    "(after-hours fractionals end ~7:30pm ET)"
+                )
+            if session.get("label") != "REGULAR" and str(ticker).upper() in self._frac_ext_ineligible:
+                return "ticker not eligible for extended-hours fractionals (waiting for regular open)"
+        return None
+
+    def _note_deferred_sell(self, broker, ticker, reason, session_label, notes):
+        """Log a deferred sell once per ticker/reason for this session label."""
+        key = (str(broker), str(ticker).upper(), str(reason)[:64])
+        if self._sell_defer_log.get(key) == session_label:
+            return
+        self._sell_defer_log[key] = session_label
+        notes.append(f"[{broker}] Deferring [{ticker}] — {reason}")
+
+    def _mark_frac_ext_ineligible(self, ticker, status):
+        """Remember tickers RH rejects for extended-hours fractionals."""
+        st = str(status or "").lower()
+        if "ext. hours fractional not eligible" in st or "ext. hours fractional rejected" in st:
+            self._frac_ext_ineligible.add(str(ticker).upper())
 
     def is_extended_hours_active(self):
         """True outside regular 9:30–4 ET (extended or overnight)."""
@@ -2762,6 +2899,10 @@ class MarketAdvisorGUI(QMainWindow):
             "Important Only (Critical Alerts & Hourly Heartbeat)", 
             "Disabled Completely"
         ])
+        self.discord_lvl_combo.setToolTip(
+            "Important Only: critical alerts, big-win sells, day profit/loss limits, "
+            "and hourly heartbeat (routine trade fills are suppressed)."
+        )
         saved_lvl = self.settings.get("discord_alert_level", "All Alerts (Every Trade & Heartbeat)")
         index = self.discord_lvl_combo.findText(saved_lvl)
         if index >= 0:
@@ -2796,6 +2937,17 @@ class MarketAdvisorGUI(QMainWindow):
         hb_box.addStretch()
         form_layout.addLayout(hb_box)
 
+        big_win_box = QHBoxLayout()
+        big_win_box.addWidget(QLabel("Big-win Discord ROI % (fires under Important Only):"))
+        self.discord_big_win_spin = QDoubleSpinBox()
+        self.discord_big_win_spin.setRange(0.1, 100.0)
+        self.discord_big_win_spin.setSingleStep(0.5)
+        self.discord_big_win_spin.setDecimals(1)
+        self.discord_big_win_spin.setValue(float(self.settings.get("discord_big_win_roi_pct", 1.5)))
+        big_win_box.addWidget(self.discord_big_win_spin)
+        big_win_box.addStretch()
+        form_layout.addLayout(big_win_box)
+
         mon_box = QHBoxLayout()
         self.monitor_enabled_chk = QCheckBox("Web Monitor (read-only)")
         self.monitor_enabled_chk.setChecked(bool(self.settings.get("monitor_enabled", True)))
@@ -2824,7 +2976,7 @@ class MarketAdvisorGUI(QMainWindow):
         form_layout.addWidget(mon_hint)
 
         alloc_box = QHBoxLayout()
-        alloc_box.addWidget(QLabel("Stock/ETF Allocation % per Trade:"))
+        alloc_box.addWidget(QLabel("Stock/ETF Max Allocation % (risk ceiling):"))
         self.alloc_stock_spin = QDoubleSpinBox()
         self.alloc_stock_spin.setRange(0.5, 50.0)
         stock_default = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0))
@@ -2834,7 +2986,7 @@ class MarketAdvisorGUI(QMainWindow):
         form_layout.addLayout(alloc_box)
 
         alloc_crypto_box = QHBoxLayout()
-        alloc_crypto_box.addWidget(QLabel("Crypto Allocation % per Trade:"))
+        alloc_crypto_box.addWidget(QLabel("Crypto Max Allocation % (risk ceiling):"))
         self.alloc_crypto_spin = QDoubleSpinBox()
         self.alloc_crypto_spin.setRange(0.5, 50.0)
         crypto_default = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 5.0))
@@ -2842,6 +2994,15 @@ class MarketAdvisorGUI(QMainWindow):
         alloc_crypto_box.addWidget(self.alloc_crypto_spin)
         alloc_crypto_box.addStretch()
         form_layout.addLayout(alloc_crypto_box)
+
+        alloc_hint = QLabel(
+            "Primary size is risk-based (~0.75% equity / hard-stop distance). "
+            "Allocation % caps notional; 12% cash reserve is always held back."
+        )
+        alloc_hint.setObjectName("settingsHint")
+        alloc_hint.setWordWrap(True)
+        alloc_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        form_layout.addWidget(alloc_hint)
 
         # Keep legacy widget name used by older code paths
         self.alloc_spin = self.alloc_stock_spin
@@ -2879,7 +3040,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.loss_spin = QDoubleSpinBox()
         self.loss_spin.setRange(0.0, 10000.0)
         self.loss_spin.setSingleStep(5.0)
-        self.loss_spin.setValue(self.settings.get("daily_loss_limit", 5.0))
+        self.loss_spin.setValue(self.settings.get("daily_loss_limit", 8.0))
         loss_box.addWidget(self.loss_spin)
         loss_box.addStretch()
         form_layout.addLayout(loss_box)
@@ -2888,7 +3049,7 @@ class MarketAdvisorGUI(QMainWindow):
         max_pos_box.addWidget(QLabel("Max Open Positions per Broker (0 = unlimited):"))
         self.max_pos_spin = QSpinBox()
         self.max_pos_spin.setRange(0, 100)
-        self.max_pos_spin.setValue(int(self.settings.get("max_open_positions", 8)))
+        self.max_pos_spin.setValue(int(self.settings.get("max_open_positions", 6)))
         max_pos_box.addWidget(self.max_pos_spin)
         max_pos_box.addStretch()
         form_layout.addLayout(max_pos_box)
@@ -2908,7 +3069,7 @@ class MarketAdvisorGUI(QMainWindow):
         c_box.addWidget(QLabel("Crypto Engine (Min 30s):"))
         self.c_spin = QSpinBox()
         self.c_spin.setRange(30, 3600)
-        self.c_spin.setValue(self.settings.get("interval_crypto", 30))
+        self.c_spin.setValue(self.settings.get("interval_crypto", 45))
         c_box.addWidget(self.c_spin)
         c_box.addStretch()
         form_layout.addLayout(c_box)
@@ -2935,7 +3096,7 @@ class MarketAdvisorGUI(QMainWindow):
         port_box.addWidget(QLabel("Portfolio Engine (Min 30s):"))
         self.port_spin = QSpinBox()
         self.port_spin.setRange(30, 3600)
-        self.port_spin.setValue(self.settings.get("interval_portfolio", 60))
+        self.port_spin.setValue(self.settings.get("interval_portfolio", 45))
         port_box.addWidget(self.port_spin)
         port_box.addStretch()
         form_layout.addLayout(port_box)
@@ -3336,13 +3497,13 @@ class MarketAdvisorGUI(QMainWindow):
                 ):
                     continue
 
-            if now - self.last_crypto_time[broker_name] >= self.settings.get("interval_crypto", 30):
+            if now - self.last_crypto_time[broker_name] >= self.settings.get("interval_crypto", 45):
                 task = (broker_name, "CRYPTO")
                 if task not in self.task_queue: self.task_queue.append(task)
                 self.last_crypto_time[broker_name] = now
 
             # Portfolio / sell checks: both brokers, 24/7 (crypto holdings don't care about equity hours)
-            if now - self.last_port_time[broker_name] >= self.settings.get("interval_portfolio", 60):
+            if now - self.last_port_time[broker_name] >= self.settings.get("interval_portfolio", 45):
                 task = (broker_name, "PORTFOLIO")
                 if task not in self.task_queue: self.task_queue.append(task)
                 self.last_port_time[broker_name] = now
@@ -3667,22 +3828,109 @@ class MarketAdvisorGUI(QMainWindow):
             self.portfolio_table.setItem(row, 6, action_item)
         self.set_working_state(False)
 
-    def calculate_order_sizing(self, current_bp, asset_type=""):
+    def calculate_order_sizing(self, current_bp, asset_type="", entry_price=0.0, equity=None):
+        """
+        Risk-based primary size: (equity * 0.75%) / hard_stop_distance.
+        allocation_pct_* remains a hard ceiling; cash reserve applied inside calculate_risk_sizing.
+        """
+        from scoring import calculate_risk_sizing, get_stop_distance_pct
         is_crypto = "crypto" in str(asset_type).lower()
         if is_crypto:
             alloc_pct = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 5.0)) / 100.0
         else:
             alloc_pct = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0)) / 100.0
         min_dollars = self.settings.get("min_trade_dollars", 5.0)
-        trade_amount = round(current_bp * alloc_pct, 2)
-        if trade_amount < min_dollars and current_bp >= min_dollars:
-            trade_amount = min_dollars
-        if trade_amount > current_bp:
-            trade_amount = current_bp
-        if trade_amount < 1.0:
-            return 0.0
-        return trade_amount
+        broker_id = getattr(self.cycle_broker, "broker_id", None) or self.cycle_broker_name.upper()
+        stop_d = get_stop_distance_pct(broker_id, asset_type=asset_type)
+        eq = float(equity) if equity is not None else None
+        if eq is None:
+            try:
+                eq, _ = self.get_broker_balances(self.cycle_broker_name)
+            except Exception:
+                eq = float(current_bp or 0.0)
+        return calculate_risk_sizing(
+            eq, current_bp, stop_d, alloc_pct, min_dollars=min_dollars,
+        )
 
+    def _attach_protective_stop(self, broker_name, ticker, asset_type, price, spent):
+        """After a successful buy: broker stop if live; virtual stop in paper. Software TTP remains backup."""
+        from scoring import (
+            get_stop_distance_pct, get_trail_pct, get_protective_order,
+            set_protective_order, clear_protective_order,
+        )
+        try:
+            qty = (float(spent) / float(price)) if price and spent else 0.0
+            if qty <= 0 or price <= 0:
+                return
+            broker_id = broker_name.upper()
+            existing = get_protective_order(broker_id, ticker)
+            if existing and existing.get("order_id"):
+                self.log_event(f"[{broker_name}] Protective already tracked for {ticker} — skip duplicate")
+                return
+            stop_pct = get_stop_distance_pct(broker_id, ticker, asset_type)
+            trail_pct = get_trail_pct(broker_id, ticker, asset_type)
+            stop_px = float(price) * (1.0 - stop_pct)
+            if self.paper_mode:
+                set_protective_order(broker_id, ticker, {
+                    "order_id": f"paper-{ticker}-{int(time.time())}",
+                    "kind": "virtual_stop",
+                    "stop_price": stop_px,
+                    "qty": qty,
+                    "paper": True,
+                })
+                self.log_event(
+                    f"[{broker_name}] [PAPER] Virtual stop {ticker} @ {stop_px:.4f} "
+                    f"(-{stop_pct*100:.1f}%); software TTP trail {trail_pct*100:.1f}%"
+                )
+                return
+            broker = self.brokers.get(broker_name)
+            if not broker or not broker.is_connected:
+                self.log_event(f"[{broker_name}] No broker for protective stop on {ticker} — software TTP only")
+                return
+            ok, oid, msg = broker.place_protective_stop(
+                ticker, asset_type, qty, price, stop_pct, trail_pct=trail_pct,
+            )
+            if ok and oid:
+                set_protective_order(broker_id, ticker, {
+                    "order_id": oid,
+                    "kind": "broker_stop",
+                    "stop_price": stop_px,
+                    "qty": qty,
+                    "paper": False,
+                })
+                self.log_event(f"[{broker_name}] Protective stop attached [{ticker}]: {msg}")
+            else:
+                clear_protective_order(broker_id, ticker)
+                self.log_event(
+                    f"[{broker_name}] Could not attach broker stop [{ticker}]: {msg} — software TTP remains"
+                )
+        except Exception as e:
+            self.log_event(f"[{broker_name}] Protective stop error [{ticker}]: {e}")
+
+    def _cancel_protective_stop(self, broker_name, ticker, asset_type=""):
+        """Cancel orphan protective orders after a full exit."""
+        from scoring import get_protective_order, clear_protective_order
+        broker_id = broker_name.upper()
+        info = get_protective_order(broker_id, ticker)
+        if not info:
+            return
+        oid = info.get("order_id")
+        is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
+        if self.paper_mode or info.get("paper") or (oid and str(oid).startswith("paper-")):
+            clear_protective_order(broker_id, ticker)
+            self.log_event(f"[{broker_name}] [PAPER] Cleared virtual stop for {ticker}")
+            return
+        broker = self.brokers.get(broker_name)
+        if broker and oid:
+            try:
+                ok, msg = broker.cancel_order(oid, is_crypto=is_crypto)
+                self.log_event(
+                    f"[{broker_name}] Cancel protective [{ticker}] "
+                    f"{'OK' if ok else 'fail'}: {msg}"
+                )
+            except Exception as e:
+                self.log_event(f"[{broker_name}] Cancel protective error [{ticker}]: {e}")
+        clear_protective_order(broker_id, ticker)
     def execute_portfolio_trades(self, auto_mode=False):
         total_rows = self.portfolio_table.rowCount()
         if total_rows == 0: return
@@ -3727,11 +3975,18 @@ class MarketAdvisorGUI(QMainWindow):
                 shares_val = float(self.portfolio_table.item(row, 2).text() or 0.0)
             except Exception:
                 shares_val = 0.0
+            try:
+                avg_cost = float(
+                    self.portfolio_table.item(row, 3).text().replace('$', '').replace(',', '') or 0.0
+                )
+            except Exception:
+                avg_cost = 0.0
             sell_list.append({
                 "broker": row_broker,
                 "ticker": ticker,
                 "shares": shares_val,
                 "price": price,
+                "avg_cost": avg_cost,
                 "type": asset_type,
                 "table_row": row,
             })
@@ -3804,8 +4059,8 @@ class MarketAdvisorGUI(QMainWindow):
 
         if not auto_mode:
             sample_type = filtered[0].get("asset_type", "")
-            _, bp = self.get_broker_balances(self.cycle_broker_name)
-            trade_dollars = self.calculate_order_sizing(bp, sample_type)
+            equity, bp = self.get_broker_balances(self.cycle_broker_name)
+            trade_dollars = self.calculate_order_sizing(bp, sample_type, equity=equity)
             if trade_dollars <= 0:
                 QMessageBox.warning(self, "Insufficient Funds", "Buying power is too low for the minimum order size.")
                 return
@@ -3825,13 +4080,14 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _bg_buy_batch(self, candidates, rank=False):
         """Place buys on a worker thread (confirm_order sleeps stay off the UI)."""
+        from scoring import concentration_blocks_buy
         broker_name = self.cycle_broker_name
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
         session = self.get_equity_session_info()
         use_ext = session["use_ext"]
         market_hours = session["market_hours"]
         allow_fractional = session["fractional_ok"]
-        max_positions = int(self.settings.get("max_open_positions", 8))
+        max_positions = int(self.settings.get("max_open_positions", 6))
         max_buys = int(self.settings.get("max_buys_per_cycle", 2))
         notes = []
         ranked = list(candidates or [])
@@ -3851,11 +4107,28 @@ class MarketAdvisorGUI(QMainWindow):
             top = ", ".join(f"{c.get('ticker')}({float(c.get('score') or 0):.0f})" for c in ranked[:3])
             notes.append(f"[{broker_name}] Ranked {len(ranked)} buys — top: {top}")
 
-        _, bp = self.get_broker_balances(broker_name)
-        held = {a["ticker"].upper() for a in (self.get_broker_holdings(broker_name) or [])}
+        equity, bp = self.get_broker_balances(broker_name)
+        holdings = self.get_broker_holdings(broker_name) or []
+        held = {a["ticker"].upper() for a in holdings}
         open_count = len(held)
         # Refresh monitor cache from this bg holdings pull
         self._holdings_count_cache[broker_name] = open_count
+
+        holdings_meta = []
+        broker = self.brokers.get(broker_name)
+        for a in holdings:
+            t = a.get("ticker") or ""
+            is_c = "crypto" in str(a.get("type") or "").lower() or str(t).upper() in KNOWN_CRYPTOS
+            px = 0.0
+            try:
+                px = float(broker.get_live_price(t) if broker else 0.0) or 0.0
+            except Exception:
+                px = 0.0
+            holdings_meta.append({
+                "ticker": t,
+                "value": float(a.get("shares") or 0) * px,
+                "is_crypto": is_c,
+            })
 
         fills = []
         buys_done = 0
@@ -3863,6 +4136,7 @@ class MarketAdvisorGUI(QMainWindow):
             ticker = c.get("ticker") or ""
             asset_type = c.get("asset_type") or ""
             price = float(c.get("price") or 0.0)
+            is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
             if buys_done >= max_buys:
                 notes.append(f"[{broker_name}] Buy cap reached ({max_buys}/cycle) — stopping this pulse")
                 break
@@ -3872,13 +4146,28 @@ class MarketAdvisorGUI(QMainWindow):
             if ticker.upper() in held:
                 notes.append(f"[{broker_name}] Skipped [{ticker}]: already holding")
                 continue
-            if price <= 0:
-                notes.append(f"[{broker_name}] Skipped [{ticker}]: invalid price")
+            # Fresh live price — reject missing/stale quotes (no buy on blind data)
+            live = 0.0
+            try:
+                live = float(broker.get_live_price(ticker) if broker else 0.0) or 0.0
+            except Exception:
+                live = 0.0
+            if live <= 0:
+                notes.append(f"[{broker_name}] Skipped [{ticker}]: missing/stale live price")
                 continue
-            row_dollars = self.calculate_order_sizing(bp, asset_type)
+            price = live
+            # Size first so crypto-book check can use proposed dollars
+            row_dollars = self.calculate_order_sizing(bp, asset_type, entry_price=price, equity=equity)
             if row_dollars <= 0:
-                notes.append(f"[{broker_name}] Skipping buys — buying power too low ({format_currency(bp)})")
+                notes.append(f"[{broker_name}] Skipping buys — buying power/risk size too low ({format_currency(bp)})")
                 break
+            blocked, reason = concentration_blocks_buy(
+                ticker, held, holdings_meta=holdings_meta, portfolio_value=equity,
+                proposed_dollars=row_dollars, is_crypto=is_crypto,
+            )
+            if blocked:
+                notes.append(f"[{broker_name}] Skipped [{ticker}]: concentration — {reason}")
+                continue
             status, spent = self.execute_buy_order(
                 ticker, asset_type, price, row_dollars, offset, use_ext,
                 market_hours=market_hours, allow_fractional=allow_fractional,
@@ -3890,6 +4179,11 @@ class MarketAdvisorGUI(QMainWindow):
                 buys_done += 1
                 if spent:
                     bp = max(0.0, bp - float(spent))
+                    holdings_meta.append({
+                        "ticker": ticker,
+                        "value": float(spent),
+                        "is_crypto": is_crypto,
+                    })
             fills.append({
                 "ticker": ticker,
                 "status": status,
@@ -3935,14 +4229,16 @@ class MarketAdvisorGUI(QMainWindow):
     def _bg_execute_sell_batch(self, sell_list):
         """Place sells on a worker thread."""
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
-        session = self.get_equity_session_info()
+        session = self._sync_equity_session_state()
         use_ext = session["use_ext"]
         market_hours = session["market_hours"]
         allow_fractional = session["fractional_ok"]
         equity_open = session["equity_tradeable"]
+        session_label = session.get("label") or "UNKNOWN"
         prior = self._cycle_broker
         fills = []
         notes = []
+        deferred = []
         try:
             for item in sell_list or []:
                 ticker = item.get("ticker")
@@ -3950,14 +4246,53 @@ class MarketAdvisorGUI(QMainWindow):
                 self._cycle_broker = row_broker
                 asset_type = item.get("type", "")
                 is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
-                if row_broker == "Robinhood" and not is_crypto and not equity_open:
-                    notes.append(f"[{row_broker}] Skipped [{ticker}]: equity session closed")
-                    continue
+                shares = item.get("shares") or 0.0
+                price = item.get("price") or 0.0
+                avg_cost = item.get("avg_cost")
+                try:
+                    avg_cost = float(avg_cost) if avg_cost is not None else 0.0
+                except (TypeError, ValueError):
+                    avg_cost = 0.0
+                if avg_cost <= 0:
+                    avg_cost = self._avg_cost_for(row_broker, ticker)
+
+                if row_broker == "Robinhood" and not is_crypto:
+                    if not equity_open:
+                        self._note_deferred_sell(
+                            row_broker, ticker, "equity markets closed", session_label, notes
+                        )
+                        deferred.append(str(ticker).upper())
+                        continue
+                    defer = self._rh_equity_sell_defer_reason(
+                        ticker, shares, price, asset_type, session
+                    )
+                    if defer:
+                        self._note_deferred_sell(row_broker, ticker, defer, session_label, notes)
+                        deferred.append(str(ticker).upper())
+                        continue
+
                 status = self.execute_sell_order(
-                    ticker, asset_type, item.get("price") or 0.0, item.get("shares") or 0.0,
+                    ticker, asset_type, price, shares,
                     offset, use_ext,
                     market_hours=market_hours, allow_fractional=allow_fractional,
                 )
+                self._mark_frac_ext_ineligible(ticker, status)
+                # If RH just told us this ticker can't frac in ext hours, don't keep retrying
+                if (
+                    row_broker == "Robinhood"
+                    and not is_crypto
+                    and float(shares or 0) < 1.0
+                    and str(ticker).upper() in self._frac_ext_ineligible
+                    and "Skipped" in str(status)
+                ):
+                    self._note_deferred_sell(
+                        row_broker,
+                        ticker,
+                        "ticker not eligible for extended-hours fractionals (waiting for regular open)",
+                        session_label,
+                        notes,
+                    )
+                    # Still record one execution line this cycle (first rejection), then defer later
                 ok = "Fail" not in status and "Skipped" not in status
                 fills.append({
                     "ticker": ticker,
@@ -3966,10 +4301,13 @@ class MarketAdvisorGUI(QMainWindow):
                     "ok": ok,
                     "skipped": "Skipped" in status,
                     "table_row": item.get("table_row"),
+                    "price": price,
+                    "avg_cost": avg_cost,
+                    "shares": shares,
                 })
         finally:
             self._cycle_broker = prior
-        return {"fills": fills, "notes": notes}
+        return {"fills": fills, "notes": notes, "deferred": deferred}
 
     def _on_sell_batch_done(self, payload, auto_mode=False, finish_cycle=False):
         payload = payload or {}
@@ -3983,7 +4321,29 @@ class MarketAdvisorGUI(QMainWindow):
                 self.set_lock(ticker)
             self.log_event(f"[{broker}] Execution [{ticker}]: {status}")
             if not fill.get("skipped"):
-                self.send_discord_alert(f"SELL {ticker}: {status}", is_trade=True)
+                roi = None
+                if fill.get("ok"):
+                    roi = self._sell_roi(
+                        broker, ticker, fill.get("price"), fill.get("avg_cost"),
+                    )
+                if fill.get("ok") and self._is_big_win_roi(roi):
+                    gain_pct = float(roi) * 100.0
+                    dollar_part = ""
+                    try:
+                        shares = float(fill.get("shares") or 0)
+                        px = float(fill.get("price") or 0)
+                        cost = float(fill.get("avg_cost") or 0)
+                        if shares > 0 and px > 0 and cost > 0:
+                            dollar_part = f" ({format_currency((px - cost) * shares)})"
+                    except (TypeError, ValueError):
+                        dollar_part = ""
+                    self.send_discord_alert(
+                        f"🎉 BIG WIN SELL {ticker}: +{gain_pct:.1f}%{dollar_part} — {status}",
+                        is_trade=True,
+                        urgent=True,
+                    )
+                else:
+                    self.send_discord_alert(f"SELL {ticker}: {status}", is_trade=True)
             row = fill.get("table_row")
             if row is not None and hasattr(self, "portfolio_table") and row < self.portfolio_table.rowCount():
                 try:
@@ -4215,15 +4575,53 @@ class MarketAdvisorGUI(QMainWindow):
                     'ticker': a['ticker'],
                     'shares': float(a.get('shares') or 0),
                     'price': float(price or 0),
+                    'avg_cost': float(a.get('cost') or 0),
                     'type': a.get('type') or asset_type or '',
                 })
 
         sell_n = len(sell_list)
-        self.log_event(f"[AUTO] [{broker}] PORTFOLIO scored — {sell_n} SELL signal(s)")
-        if sell_list and self._is_broker_auto_trading():
+        session = self._sync_equity_session_state()
+        actionable = []
+        deferred = []
+        notes_tmp = []
+        for item in sell_list:
+            if str(item.get("broker") or broker) == "Robinhood":
+                defer = self._rh_equity_sell_defer_reason(
+                    item.get("ticker"), item.get("shares"), item.get("price"),
+                    item.get("type"), session,
+                )
+                if defer:
+                    deferred.append(str(item.get("ticker") or "?").upper())
+                    self._note_deferred_sell(
+                        "Robinhood", item.get("ticker"), defer,
+                        session.get("label") or "UNKNOWN", notes_tmp,
+                    )
+                    continue
+            actionable.append(item)
+
+        if deferred:
+            uniq = sorted(set(deferred))
+            if notes_tmp:
+                # First time these are deferred this session — announce once
+                self.log_event(
+                    f"[AUTO] [{broker}] PORTFOLIO scored — {sell_n} SELL signal(s); "
+                    f"deferring {len(uniq)} until tradable: {', '.join(uniq)}"
+                )
+                for n in notes_tmp:
+                    self.log_event(n)
+            elif actionable:
+                self.log_event(
+                    f"[AUTO] [{broker}] PORTFOLIO scored — {sell_n} SELL signal(s) "
+                    f"({len(actionable)} actionable, {len(uniq)} still deferred)"
+                )
+            # else: all still deferred — stay quiet this cycle
+        else:
+            self.log_event(f"[AUTO] [{broker}] PORTFOLIO scored — {sell_n} SELL signal(s)")
+
+        if actionable and self._is_broker_auto_trading():
             self._set_engine_banner(f"🤖 💰 [{broker}] PORTFOLIO — executing...", "#00897B")
             self.run_cycle_thread(
-                lambda: self._bg_execute_sell_batch(sell_list),
+                lambda: self._bg_execute_sell_batch(actionable),
                 lambda res: self._on_sell_batch_done(res, auto_mode=True, finish_cycle=True)
             )
         else:
@@ -4410,6 +4808,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["discord_webhook"] = self.discord_input.text().strip()
         self.settings["discord_alert_level"] = self.discord_lvl_combo.currentText()
         self.settings["discord_heartbeat_schedule"] = self.discord_hb_combo.currentText()
+        self.settings["discord_big_win_roi_pct"] = self.discord_big_win_spin.value()
         self.settings["monitor_enabled"] = self.monitor_enabled_chk.isChecked()
         self.settings["monitor_port"] = int(self.monitor_port_spin.value())
         self.settings["monitor_host"] = self.settings.get("monitor_host", "127.0.0.1") or "127.0.0.1"

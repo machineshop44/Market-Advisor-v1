@@ -51,13 +51,24 @@ class BaseBroker:
     def logout(self): raise NotImplementedError
     def get_account_balances(self): raise NotImplementedError
     def get_current_holdings(self): raise NotImplementedError
-    def get_live_price(self, ticker): raise NotImplementedError
+    def get_live_price(self, ticker, allow_yahoo_fallback=True): raise NotImplementedError
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
                         market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
                          market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
         return False, "unsupported"
+    def cancel_order(self, order_id, is_crypto=False):
+        """Cancel an open order by id. Returns (ok, message)."""
+        return False, "unsupported"
+    def place_protective_stop(self, ticker, asset_type, quantity, entry_price, stop_pct,
+                              trail_pct=None):
+        """
+        Attach broker-side protective sell after a buy fill.
+        Returns (ok: bool, order_id or None, message).
+        Paper / unsupported brokers should no-op with a clear message.
+        """
+        return False, None, "protective stops unsupported"
     def position_is_dust(self, ticker, shares, price, asset_type=""):
         """Return (is_dust, reason). Default: under $1 notional."""
         try:
@@ -67,7 +78,6 @@ class BaseBroker:
         except Exception:
             return True, "invalid size/price"
         return False, ""
-
 
 class RobinhoodAdapter(BaseBroker):
     """The Robinhood translation layer."""
@@ -148,7 +158,7 @@ class RobinhoodAdapter(BaseBroker):
         except Exception: pass
         return assets
 
-    def get_live_price(self, ticker):
+    def get_live_price(self, ticker, allow_yahoo_fallback=True):
         clean = str(ticker).replace("-USD", "").upper()
         cryptos = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
         if clean in cryptos:
@@ -156,6 +166,8 @@ class RobinhoodAdapter(BaseBroker):
                 q = r.crypto.get_crypto_quote(clean)
                 if q and 'mark_price' in q and float(q['mark_price']) > 0: return float(q['mark_price'])
             except Exception: pass
+            if not allow_yahoo_fallback:
+                return 0.0
             try:
                 df = yf.Ticker(f"{clean}-USD").history(period="1d")
                 if not df.empty: return float(df['Close'].iloc[-1])
@@ -369,7 +381,10 @@ class RobinhoodAdapter(BaseBroker):
                     )
                 if isinstance(res, dict) and ("id" in res or "state" in res):
                     oid = res.get("id")
-                    conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                    conf, state = self.confirm_order(oid, is_crypto=False, timeout_sec=45) if oid else (False, "unknown")
+                    if oid and not conf:
+                        self.cancel_order(oid, is_crypto=False)
+                        return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
                     tag = "Filled" if conf else f"Pending/{state}"
                     suffix = " Ext" if want_ext else ""
                     return f"Buy Fractional{suffix} {tag} ({trade_dollars:.2f})", trade_dollars, oid
@@ -399,7 +414,10 @@ class RobinhoodAdapter(BaseBroker):
             )
             if isinstance(res, dict) and ("id" in res or "state" in res):
                 oid = res.get("id")
-                conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                conf, state = self.confirm_order(oid, is_crypto=False, timeout_sec=45) if oid else (False, "unknown")
+                if oid and not conf:
+                    self.cancel_order(oid, is_crypto=False)
+                    return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
                 tag = "Filled" if conf else f"Pending/{state}"
                 return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
             return f"Fail: {res}", 0.0, None
@@ -423,7 +441,10 @@ class RobinhoodAdapter(BaseBroker):
         )
         if isinstance(res, dict) and ("id" in res or "state" in res):
             oid = res.get("id")
-            conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+            conf, state = self.confirm_order(oid, is_crypto=False, timeout_sec=45) if oid else (False, "unknown")
+            if oid and not conf:
+                self.cancel_order(oid, is_crypto=False)
+                return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
             tag = "Filled" if conf else f"Pending/{state}"
             return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
         return f"Fail: {res}", 0.0, None
@@ -544,6 +565,77 @@ class RobinhoodAdapter(BaseBroker):
             time.sleep(1.2)
         return False, last_state
 
+    def cancel_order(self, order_id, is_crypto=False):
+        if not order_id:
+            return False, "no_id"
+        try:
+            if is_crypto:
+                cancel_fn = getattr(r, "cancel_crypto_order", None) or getattr(r.orders, "cancel_crypto_order", None)
+                cancel_fn(order_id)
+            else:
+                cancel_fn = getattr(r, "cancel_stock_order", None) or getattr(r.orders, "cancel_stock_order", None)
+                cancel_fn(order_id)
+            return True, "cancelled"
+        except Exception as e:
+            return False, str(e)
+
+    def place_protective_stop(self, ticker, asset_type, quantity, entry_price, stop_pct,
+                              trail_pct=None):
+        """
+        RH equities: prefer trailing stop at hard_stop % (disaster trail), else fixed stop-loss.
+        RH crypto: no stop API — caller keeps software TTP.
+        """
+        is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in {
+            "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"
+        }
+        if is_crypto:
+            return False, None, "RH crypto has no stop/trailing API — software TTP only"
+        try:
+            qty = float(quantity or 0)
+            entry = float(entry_price or 0)
+            stop_d = abs(float(stop_pct or 0))
+            if qty <= 0 or entry <= 0 or stop_d <= 0:
+                return False, None, "invalid qty/entry/stop"
+            # Whole-share stops are more reliable on RH; try fractional qty as-is first
+            qty_arg = qty if qty != int(qty) else int(qty)
+            trail_pct_points = round(stop_d * 100.0, 2)  # e.g. 3.5 for 3.5%
+            # 1) Trailing stop — rises with price; software TTP still handles tighter trails
+            try:
+                place_trail = getattr(r, "order_sell_trailing_stop", None) or getattr(r.orders, "order_sell_trailing_stop", None)
+                res = place_trail(
+                    str(ticker).upper(), qty_arg, trail_pct_points, "percentage",
+                    timeInForce="gtc", extendedHours=False,
+                )
+                if isinstance(res, dict) and res.get("id"):
+                    return True, res["id"], f"RH trailing stop {trail_pct_points}% (id={res['id'][:8]}…)"
+                trail_err = str(res)
+            except Exception as e:
+                trail_err = str(e)
+            # 2) Fixed stop-loss at hard_stop distance
+            stop_price = round(entry * (1.0 - stop_d), 4 if entry < 1.0 else 2)
+            try:
+                place_stop = getattr(r, "order_sell_stop_loss", None) or getattr(r.orders, "order_sell_stop_loss", None)
+                res = place_stop(
+                    str(ticker).upper(), qty_arg, stop_price,
+                    timeInForce="gtc", extendedHours=False,
+                )
+                if isinstance(res, dict) and res.get("id"):
+                    return True, res["id"], f"RH stop-loss @ {stop_price} (id={res['id'][:8]}…)"
+                # 3) Stop-limit fallback (limit a hair below stop)
+                limit_price = round(stop_price * 0.995, 4 if entry < 1.0 else 2)
+                place_sl = getattr(r, "order_sell_stop_limit", None) or getattr(r.orders, "order_sell_stop_limit", None)
+                res2 = place_sl(
+                    str(ticker).upper(), qty_arg, limit_price, stop_price,
+                    timeInForce="gtc", extendedHours=False,
+                )
+                if isinstance(res2, dict) and res2.get("id"):
+                    return True, res2["id"], f"RH stop-limit @ {stop_price}/{limit_price}"
+                return False, None, f"RH stop failed (trail: {trail_err}; stop: {res})"
+            except Exception as e:
+                return False, None, f"RH stop failed (trail: {trail_err}; stop: {e})"
+        except Exception as e:
+            return False, None, f"RH protective stop error: {e}"
+
 
 class CoinbaseAdapter(BaseBroker):
     """The Coinbase Advanced Trade translation layer."""
@@ -654,7 +746,7 @@ class CoinbaseAdapter(BaseBroker):
             pass
         return assets
 
-    def get_live_price(self, ticker):
+    def get_live_price(self, ticker, allow_yahoo_fallback=True):
         clean = str(ticker).replace("-USD", "").upper()
         # Hard block equity/ETF symbols — Coinbase has no SPY-USD etc (stops 404 spam)
         equity_block = {
@@ -676,6 +768,8 @@ class CoinbaseAdapter(BaseBroker):
                         return price
             except Exception:
                 pass
+        if not allow_yahoo_fallback:
+            return 0.0
         # yfinance crypto fallback only (never treat as stock)
         try:
             df = yf.Ticker(f"{clean}-USD").history(period="1d")
@@ -844,3 +938,60 @@ class CoinbaseAdapter(BaseBroker):
                 pass
             time.sleep(1.2)
         return False, last_state.lower() if last_state else "unknown"
+
+    def cancel_order(self, order_id, is_crypto=False):
+        if not order_id or not self.client:
+            return False, "no_id"
+        try:
+            res = self.client.cancel_orders([str(order_id)])
+            data = res.to_dict() if hasattr(res, "to_dict") else res
+            return True, f"cancelled ({data})"
+        except Exception as e:
+            return False, str(e)
+
+    def place_protective_stop(self, ticker, asset_type, quantity, entry_price, stop_pct,
+                              trail_pct=None):
+        """
+        Coinbase Advanced: stop-limit GTC sell (no native trailing).
+        Limit sits slightly below stop for slippage buffer.
+        """
+        if not self.is_connected or not self.client:
+            return False, None, "not connected"
+        try:
+            clean = str(ticker).replace("-USD", "").upper()
+            qty = float(quantity or 0)
+            entry = float(entry_price or 0)
+            stop_d = abs(float(stop_pct or 0))
+            if qty <= 0 or entry <= 0 or stop_d <= 0:
+                return False, None, "invalid qty/entry/stop"
+            limits = self._get_product_limits(clean)
+            inc = float(limits.get("base_increment", 0.00000001))
+            d_inc = Decimal(str(inc))
+            decimals = abs(d_inc.as_tuple().exponent)
+            valid = (Decimal(str(qty)) / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
+            if float(valid) <= 0:
+                return False, None, "qty below CB increment"
+            stop_price = entry * (1.0 - stop_d)
+            limit_price = stop_price * 0.995
+            # Format prices sensibly
+            px_dec = 2 if entry >= 1.0 else 6
+            stop_s = f"{stop_price:.{px_dec}f}"
+            limit_s = f"{limit_price:.{px_dec}f}"
+            size_s = format(float(valid), f".{decimals}f")
+            client_order_id = f"prot-{int(time.time() * 1000)}"
+            res = self.client.stop_limit_order_gtc_sell(
+                client_order_id=client_order_id,
+                product_id=f"{clean}-USD",
+                base_size=size_s,
+                limit_price=limit_s,
+                stop_price=stop_s,
+                stop_direction="STOP_DIRECTION_STOP_DOWN",
+            )
+            data = res.to_dict() if hasattr(res, "to_dict") else res
+            if isinstance(data, dict) and data.get("success"):
+                oid = self._extract_order_id(data)
+                return True, oid, f"CB stop-limit @ {stop_s}/{limit_s}"
+            err = data.get("error_response") if isinstance(data, dict) else data
+            return False, None, f"CB stop-limit rejected: {err}"
+        except Exception as e:
+            return False, None, f"CB protective stop error: {e}"
