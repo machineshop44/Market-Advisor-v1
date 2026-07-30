@@ -28,28 +28,34 @@ except ImportError:
 # =========================================================================
 FEE_PROFILES = {
     "ROBINHOOD_STOCK": {
-        "ttp_arm": 0.020,          # +2.0% arms trail (commission-free)
+        "ttp_arm": 0.012,          # +1.2% arms trail (was 2.0% — too high for small RH tickets)
         "ttp_trail": 0.008,        # -0.8% trail
         "hard_stop": -0.035,       # -3.5%
-        "time_30m_target": 0.012,  # +1.2%
-        "time_60m_target": 0.010,  # +1.0%
+        "time_30m_target": 0.008,  # +0.8%
+        "time_60m_target": 0.006,  # +0.6%
+        "time_green_min": 45,      # minutes
+        "time_green_roi": 0.005,   # +0.5% any-green exit after time_green_min
         "stale_roi": -0.01,
     },
     "ROBINHOOD_CRYPTO": {
-        "ttp_arm": 0.028,          # RH crypto spread/fees usually < CB Advanced
+        "ttp_arm": 0.018,          # +1.8% (was 2.8%)
         "ttp_trail": 0.010,
         "hard_stop": -0.040,
-        "time_30m_target": 0.018,
-        "time_60m_target": 0.014,
+        "time_30m_target": 0.014,  # +1.4% — above typical RH crypto spread round-trip
+        "time_60m_target": 0.010,  # +1.0%
+        "time_green_min": 45,
+        "time_green_roi": 0.010,   # +1.0% min green (spread is the real cost on RH crypto)
         "stale_roi": -0.01,
     },
     "COINBASE": {
-        # Tuned for ~0.6% each side ≈ ~1.2% round-trip Advanced retail take-rate
-        "ttp_arm": 0.035,          # +3.5% arms trail → exit still clears fees
-        "ttp_trail": 0.010,        # -1.0% trail → min exit ≈ +2.5% gross
+        # Advanced retail taker ≈ 0.60% each side → ~1.2% round-trip (+ slippage buffer)
+        "ttp_arm": 0.022,          # +2.2% arms trail
+        "ttp_trail": 0.010,        # -1.0% trail → exit still ~+1.2%+ once armed above peak
         "hard_stop": -0.040,
-        "time_30m_target": 0.020,  # +2.0%
-        "time_60m_target": 0.015,  # +1.5%
+        "time_30m_target": 0.016,  # +1.6% clears ~1.2% fees + buffer
+        "time_60m_target": 0.014,  # +1.4%
+        "time_green_min": 45,
+        "time_green_roi": 0.015,   # +1.5% — never take a CB "win" that fees wipe out
         "stale_roi": -0.01,
     },
 }
@@ -60,7 +66,7 @@ CRYPTO_COOLDOWN = 10 * 60   # 10 minutes after selling crypto
 STOCK_COOLDOWN = 20 * 60    # 20 minutes after selling stocks
 
 RSI_PERIOD = 14
-RSI_CEILING = 60            # Over 60 = overbought, do not chase
+RSI_CEILING = 70            # 70 is standard; 60 was blocking too many real trends
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scoring_state.json")
 
@@ -179,7 +185,8 @@ def _get_trend_data(ticker, interval="5m", period="5d"):
         has_volume = current_vol >= (avg_vol_1h * 0.8)
 
         is_uptrend = df['Close'].iloc[-1] > ema20
-        is_bullish = (macd > sig) and (macd > 0)
+        # Crossover only — requiring macd > 0 blocked early (still-bullish) entries
+        is_bullish = (macd > sig)
 
         result = (is_bullish, is_uptrend, rsi, has_volume)
     except Exception:
@@ -349,6 +356,13 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
             return f"SELL (TTP Triggered - Peak: +{peak_roi*100:.2f}%, Exit: +{roi*100:.2f}%)"
         save_state()
         return f"HOLD (TTP Armed - Peak: +{peak_roi*100:.2f}%)"
+
+    # Green time-exit: bank modest winners that never reach TTP arm (was a profit dead-zone)
+    green_min = float(fees.get("time_green_min", 45) or 45)
+    green_roi = float(fees.get("time_green_roi", 0.005) or 0.005)
+    if held_time_minutes >= green_min and roi >= green_roi:
+        save_state(force=True)
+        return f"SELL (Time-Green > {green_min:.0f}m, +{roi*100:.2f}%)"
 
     if held_time_minutes >= 120 and roi < fees["stale_roi"]:
         save_state(force=True)

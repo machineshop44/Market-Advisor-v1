@@ -14,6 +14,8 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox, QSplashScreen, QMenu, QAction
 
+from version import APP_NAME, display_name, splash_subtitle, window_title, __version__ as APP_VERSION
+
 
 def _icon_path():
     base = os.path.dirname(os.path.abspath(__file__))
@@ -39,20 +41,24 @@ def _make_splash(app_icon):
     pm.fill(QColor("#0D3B2E"))
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
+    # Soft panel behind icon
+    p.setBrush(QColor("#124A3A"))
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(150, 22, 120, 120, 24, 24)
     if not app_icon.isNull():
-        ico = app_icon.pixmap(72, 72)
-        p.drawPixmap(174, 36, ico)
+        ico = app_icon.pixmap(88, 88)
+        p.drawPixmap(166, 38, ico)
     p.setPen(QColor("#E8F5E9"))
     font = QFont()
     font.setPointSize(16)
     font.setBold(True)
     p.setFont(font)
-    p.drawText(pm.rect().adjusted(0, 120, 0, 0), Qt.AlignHCenter | Qt.AlignTop, "Market Advisor")
+    p.drawText(pm.rect().adjusted(0, 148, 0, 0), Qt.AlignHCenter | Qt.AlignTop, APP_NAME)
     font.setPointSize(10)
     font.setBold(False)
     p.setFont(font)
-    p.setPen(QColor("#A5D6A7"))
-    p.drawText(pm.rect().adjusted(0, 155, 0, 0), Qt.AlignHCenter | Qt.AlignTop, "Starting…")
+    p.setPen(QColor("#1F8A70"))
+    p.drawText(pm.rect().adjusted(0, 180, 0, 0), Qt.AlignHCenter | Qt.AlignTop, f"{splash_subtitle()} · Starting…")
     p.end()
     splash = QSplashScreen(pm)
     splash.setWindowFlag(Qt.WindowStaysOnTopHint)
@@ -64,7 +70,7 @@ def _show_boot_tray(app, icon):
     if not QSystemTrayIcon.isSystemTrayAvailable():
         return None
     tray = QSystemTrayIcon(icon if not icon.isNull() else QIcon(), app)
-    tray.setToolTip("Market Advisor — starting…")
+    tray.setToolTip(f"{display_name()} — starting…")
     menu = QMenu()
     quit_act = QAction("Quit", menu)
     quit_act.triggered.connect(app.quit)
@@ -72,7 +78,7 @@ def _show_boot_tray(app, icon):
     tray.setContextMenu(menu)
     tray.show()
     tray.showMessage(
-        "Market Advisor",
+        display_name(),
         "Starting… window will open in a moment.",
         QSystemTrayIcon.Information,
         2500,
@@ -82,7 +88,8 @@ def _show_boot_tray(app, icon):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Market Advisor")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("machineshop44")
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
@@ -99,7 +106,7 @@ def main():
     splash.showMessage("Loading libraries…", Qt.AlignBottom | Qt.AlignHCenter, QColor("#E8F5E9"))
     app.processEvents()
 
-    splash.showMessage("Loading Market Advisor…", Qt.AlignBottom | Qt.AlignHCenter, QColor("#E8F5E9"))
+    splash.showMessage(f"Loading {APP_NAME}…", Qt.AlignBottom | Qt.AlignHCenter, QColor("#E8F5E9"))
     app.processEvents()
     from gui import MarketAdvisorGUI
 
@@ -107,7 +114,7 @@ def main():
         splash.close()
         QMessageBox.critical(
             None,
-            "Market Advisor",
+            APP_NAME,
             "System tray is not available on this PC.\nThe window close button will exit the app.",
         )
 

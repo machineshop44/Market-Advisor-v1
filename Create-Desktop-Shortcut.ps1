@@ -1,5 +1,5 @@
-# Creates Desktop + Start Menu shortcuts with custom icon AND AppUserModelID
-# so the Windows taskbar uses Market Advisor's icon instead of pythonw.exe.
+# Creates Desktop + Start Menu + project-root shortcuts with custom icon AND AppUserModelID
+# so the Windows taskbar uses Market Advisor's icon instead of pythonw.exe / script.exe.
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -13,7 +13,7 @@ if (-not (Test-Path $pythonw)) {
 }
 if (-not (Test-Path $pythonw)) { throw "pythonw.exe not found" }
 if (-not (Test-Path $main)) { throw "main.py not found: $main" }
-if (-not (Test-Path $ico)) { throw "app_icon.ico not found: $ico" }
+if (-not (Test-Path $ico)) { throw "app_icon.ico not found: $ico - run Src\generate_app_icon.py first" }
 
 $appId = "machineshop44.MarketAdvisor.1"
 $desktop = [Environment]::GetFolderPath("Desktop")
@@ -102,22 +102,17 @@ try {
 
 $desktopLnk = Join-Path $desktop "Market Advisor.lnk"
 $startLnk = Join-Path $startDir "Market Advisor.lnk"
+$rootLnk = Join-Path $root "Start Market Advisor.lnk"
 New-MaShortcut $desktopLnk
 New-MaShortcut $startLnk
+New-MaShortcut $rootLnk
 [LnkAumid]::SetAppUserModelId($desktopLnk, $appId)
 [LnkAumid]::SetAppUserModelId($startLnk, $appId)
+[LnkAumid]::SetAppUserModelId($rootLnk, $appId)
 
-# Keep VBS as a thin launcher that calls the same pythonw+main (icon still from Start Menu AUMID match)
+# Keep VBS as a silent launcher (no window). Prefer the .lnk for a branded icon.
 $vbs = @"
-' Market Advisor launcher (no CMD window)
-Option Explicit
-Dim sh
-Set sh = CreateObject("WScript.Shell")
-sh.CurrentDirectory = "$($src.Replace('\','\\'))"
-sh.Run """$($pythonw.Replace('\','\\'))"" ""$($main.Replace('\','\\'))""", 0, False
-"@
-# VBS needs single backslashes in paths when using quotes - write carefully
-$vbs = @"
+' Market Advisor silent launcher (no CMD). For the branded icon, use Start Market Advisor.lnk
 Option Explicit
 Dim sh
 Set sh = CreateObject("WScript.Shell")
@@ -128,7 +123,9 @@ Set-Content -Path (Join-Path $root "Start Market Advisor.vbs") -Value $vbs -Enco
 
 Write-Host "Desktop shortcut: $desktopLnk"
 Write-Host "Start Menu shortcut: $startLnk"
+Write-Host "Project start shortcut: $rootLnk"
+Write-Host "Silent VBS (no custom icon): $(Join-Path $root 'Start Market Advisor.vbs')"
 Write-Host "Target: $pythonw"
 Write-Host "Icon: $ico"
 Write-Host "AppUserModelID: $appId"
-Write-Host "Quit any running Market Advisor, then start from the Desktop shortcut."
+Write-Host "Quit any running Market Advisor, then start from the Desktop or project .lnk."

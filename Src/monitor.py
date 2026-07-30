@@ -9,10 +9,19 @@ import base64
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    from version import APP_NAME, display_name, __version__ as APP_VERSION
+except ImportError:
+    APP_NAME = "Market Advisor"
+    APP_VERSION = "0.0.0"
+    def display_name():
+        return f"{APP_NAME} {APP_VERSION}"
+
 _lock = threading.RLock()
 _status = {
     "updated_at": None,
-    "app": "Market Advisor v1",
+    "app": display_name(),
+    "version": APP_VERSION,
     "mode": "LIVE",
     "market": "Unknown",
     "auto_trader": {"Robinhood": False, "Coinbase": False},
@@ -130,7 +139,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Market Advisor Monitor</h1>
-  <div class="sub">Read-only · auto-refreshes · <span id="updated">—</span></div>
+  <div class="sub"><span id="appver">—</span> · read-only · auto-refreshes · <span id="updated">—</span></div>
 
   <div class="grid">
     <div class="card"><div class="label">Mode</div><div class="value sm" id="mode">—</div></div>
@@ -195,6 +204,7 @@ async function refresh(){
     const r = await fetch('/api/status', {cache:'no-store'});
     if(!r.ok) throw new Error(r.status);
     const d = await r.json();
+    document.getElementById('appver').textContent = d.app || ('v' + (d.version || ''));
     document.getElementById('updated').textContent = 'Updated ' + (d.updated_at || '—');
     document.getElementById('mode').textContent = d.mode || '—';
     document.getElementById('market').textContent = d.market || '—';

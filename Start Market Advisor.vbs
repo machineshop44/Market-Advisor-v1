@@ -1,3 +1,4 @@
+' Market Advisor silent launcher (no CMD). For the branded icon, use Start Market Advisor.lnk
 Option Explicit
 Dim sh
 Set sh = CreateObject("WScript.Shell")

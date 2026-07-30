@@ -52,8 +52,10 @@ class BaseBroker:
     def get_account_balances(self): raise NotImplementedError
     def get_current_holdings(self): raise NotImplementedError
     def get_live_price(self, ticker): raise NotImplementedError
-    def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours): raise NotImplementedError
-    def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours): raise NotImplementedError
+    def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
+                        market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
+    def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
+                         market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
         return False, "unsupported"
     def position_is_dust(self, ticker, shares, price, asset_type=""):
@@ -237,8 +239,68 @@ class RobinhoodAdapter(BaseBroker):
                 self._crypto_inc_cache[ticker] = 1.0 if ticker in ["PEPE", "SHIB", "BONK"] else 0.000001
         return self._crypto_inc_cache[ticker]
 
+    def _rh_place_fractional_order(self, symbol, quantity, side, use_ext_hours=False, time_in_force="gfd"):
+        """
+        Place a fractional equity order without robin_stocks' extended-hours bug.
 
-    def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours):
+        robin_stocks.orders.order() does int(quantity) whenever market_hours is
+        'extended_hours' / 'all_day_hours', which turns e.g. 0.12 META into 0 and
+        RH rejects with: quantity: Ensure this value is greater than 0.
+        """
+        from uuid import uuid4
+        from datetime import datetime
+        from robin_stocks.robinhood.helper import round_price, request_post
+        from robin_stocks.robinhood.urls import orders_url
+        from robin_stocks.robinhood.account import load_account_profile
+        from robin_stocks.robinhood.stocks import get_instruments_by_symbols, get_latest_price
+
+        symbol = str(symbol).upper().strip()
+        side = str(side).lower().strip()
+        qty = float(
+            Decimal(str(quantity)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        )
+        if qty <= 0:
+            return {"detail": "quantity rounded to 0", "quantity": ["Ensure this value is greater than 0."]}
+
+        use_ext = bool(use_ext_hours)
+        price_type = "ask_price" if side == "buy" else "bid_price"
+        price = round_price(next(iter(get_latest_price(symbol, price_type, use_ext)), 0.00))
+        ask = round_price(next(iter(get_latest_price(symbol, "ask_price", use_ext)), 0.00))
+        bid = round_price(next(iter(get_latest_price(symbol, "bid_price", use_ext)), 0.00))
+        instruments = get_instruments_by_symbols(symbol, info="url") or []
+        if not instruments:
+            return {"detail": f"No instrument URL for {symbol}"}
+
+        market_hours = "extended_hours" if use_ext else "regular_hours"
+        payload = {
+            "account": load_account_profile(info="url"),
+            "instrument": instruments[0],
+            "symbol": symbol,
+            "price": price,
+            "ask_price": ask,
+            "bid_ask_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "bid_price": bid,
+            "quantity": qty,  # keep fractional — do NOT int()
+            "ref_id": str(uuid4()),
+            "type": "limit" if use_ext else "market",
+            "time_in_force": time_in_force,
+            "trigger": "immediate",
+            "side": side,
+            "market_hours": market_hours,
+            "extended_hours": use_ext,
+            "order_form_version": 4,
+        }
+        if not use_ext and side == "sell" and payload["type"] == "market":
+            payload.pop("price", None)
+        elif not use_ext and side == "buy":
+            # Match robin_stocks regular-hours fractional buy behavior
+            payload["preset_percent_limit"] = "0.05"
+            payload["type"] = "limit"
+
+        return request_post(orders_url(), payload, jsonify_data=True)
+
+    def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
+                        market_hours="regular_hours", allow_fractional=True):
         is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
         if is_crypto:
             inc, min_qty = self._get_crypto_order_limits(ticker)
@@ -281,27 +343,93 @@ class RobinhoodAdapter(BaseBroker):
                     return f"Skipped: RH 422 (size/limits) for {ticker}", 0.0, None
                 return f"Fail: {e}", 0.0, None
 
-        if use_ext_hours:
+        # Prefer dollar fractional when RH allows it for this session.
+        # Overnight / late extended: fractionals OFF — whole-share limit only.
+        if allow_fractional:
+            try:
+                want_ext = bool(use_ext_hours or market_hours == "extended_hours")
+                if want_ext:
+                    # Convert $ → shares ourselves; bypass robin_stocks int(qty) bug
+                    ask = float(price) if price and price > 0 else 0.0
+                    if ask <= 0:
+                        try:
+                            from robin_stocks.robinhood.stocks import get_latest_price
+                            from robin_stocks.robinhood.helper import round_price
+                            ask = float(round_price(next(iter(get_latest_price(ticker, "ask_price", True)), 0.0)))
+                        except Exception:
+                            ask = 0.0
+                    frac_shares = (float(trade_dollars) / ask) if ask > 0 else 0.0
+                    res = self._rh_place_fractional_order(
+                        ticker, frac_shares, "buy", use_ext_hours=True, time_in_force="gfd"
+                    )
+                else:
+                    res = r.order_buy_fractional_by_price(
+                        ticker, trade_dollars, timeInForce="gfd",
+                        extendedHours=False, market_hours="regular_hours",
+                    )
+                if isinstance(res, dict) and ("id" in res or "state" in res):
+                    oid = res.get("id")
+                    conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                    tag = "Filled" if conf else f"Pending/{state}"
+                    suffix = " Ext" if want_ext else ""
+                    return f"Buy Fractional{suffix} {tag} ({trade_dollars:.2f})", trade_dollars, oid
+                frac_err = str(res)
+            except Exception as e:
+                frac_err = str(e)
+
+            if not use_ext_hours and market_hours == "regular_hours":
+                return f"Fail: {frac_err}", 0.0, None
+
+            # Extended/overnight fallback: whole-share limit if we can afford 1 share
             qty_to_buy = int(trade_dollars / price) if price > 0 else 0
-            if qty_to_buy < 1: return "Skipped: Cannot afford 1 whole share for Ext. Hours.", 0.0, None
+            if qty_to_buy < 1:
+                return (
+                    f"Skipped: Fractional unavailable ({frac_err[:80]}); "
+                    f"cannot afford 1 whole share.",
+                    0.0,
+                    None,
+                )
             limit_price = round(price * (1.0 + offset_pct), 4 if price < 1.0 else 2)
-            res = r.order_buy_limit(symbol=ticker, quantity=qty_to_buy, limitPrice=limit_price, timeInForce='gfd', extendedHours=True)
+            res = r.order_buy_limit(
+                symbol=ticker,
+                quantity=qty_to_buy,
+                limitPrice=limit_price,
+                timeInForce="gfd",
+                extendedHours=True,
+            )
             if isinstance(res, dict) and ("id" in res or "state" in res):
-                oid = res.get('id')
+                oid = res.get("id")
                 conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
                 tag = "Filled" if conf else f"Pending/{state}"
-                return f"Buy Limit {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
+                return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
             return f"Fail: {res}", 0.0, None
 
-        res = r.order_buy_fractional_by_price(ticker, trade_dollars, timeInForce='gfd')
+        # Session does not allow fractionals (overnight or late after-hours)
+        qty_to_buy = int(trade_dollars / price) if price > 0 else 0
+        if qty_to_buy < 1:
+            return (
+                "Skipped: Overnight/late session — RH blocks fractionals; "
+                "need ≥1 whole share (fractionals resume ~7am ET / regular open).",
+                0.0,
+                None,
+            )
+        limit_price = round(price * (1.0 + offset_pct), 4 if price < 1.0 else 2)
+        res = r.order_buy_limit(
+            symbol=ticker,
+            quantity=qty_to_buy,
+            limitPrice=limit_price,
+            timeInForce="gfd",
+            extendedHours=True,
+        )
         if isinstance(res, dict) and ("id" in res or "state" in res):
-            oid = res.get('id')
+            oid = res.get("id")
             conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
             tag = "Filled" if conf else f"Pending/{state}"
-            return f"Buy Fractional {tag} ({trade_dollars:.2f})", trade_dollars, oid
+            return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
         return f"Fail: {res}", 0.0, None
 
-    def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours):
+    def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
+                         market_hours="regular_hours", allow_fractional=True):
         is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
         if is_crypto:
             inc, min_qty = self._get_crypto_order_limits(ticker)
@@ -352,21 +480,45 @@ class RobinhoodAdapter(BaseBroker):
                     return f"Skipped: Untradeable ticker ({err})", None
                 return f"Fail: {e}", None
 
-        if use_ext_hours: return "Skipped: Ext. Hours blocks fractional sells.", None
-        if (shares_val * price) < 1.00: return f"Skipped: Fractional value under $1.00", None
+        # Fractional remainder / sub-1 share positions
+        if (shares_val * price) < 1.00:
+            return f"Skipped: Fractional value under $1.00", None
+
+        if not allow_fractional:
+            return (
+                "Skipped: Overnight/late session — RH blocks fractional equity sells "
+                "(OK again in extended ~7am ET or regular hours; after-hours fractionals end ~7:30pm ET).",
+                None,
+            )
 
         try:
-            res = r.order_sell_fractional_by_quantity(ticker, shares_val, timeInForce='gfd')
+            want_ext = bool(use_ext_hours or market_hours == "extended_hours")
+            if want_ext:
+                # Bypass robin_stocks int(qty) bug on extended_hours fractionals
+                res = self._rh_place_fractional_order(
+                    ticker, shares_val, "sell", use_ext_hours=True, time_in_force="gfd"
+                )
+            else:
+                res = r.order_sell_fractional_by_quantity(
+                    ticker, shares_val, timeInForce="gfd",
+                    extendedHours=False, market_hours="regular_hours",
+                )
             if isinstance(res, dict) and ("id" in res or "state" in res):
-                oid = res.get('id')
+                oid = res.get("id")
                 conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
                 tag = "Filled" if conf else f"Pending/{state}"
-                return f"Sell {tag} ({shares_val})", oid
+                suffix = " Ext" if want_ext else ""
+                return f"Sell{suffix} {tag} ({shares_val})", oid
+            err = str(res)
+            if want_ext:
+                return f"Skipped: Ext. Hours fractional not eligible ({err[:100]})", None
             return f"Fail: {res}", None
         except Exception as e:
             err = str(e)
             if "list index" in err.lower() or "not a valid" in err.lower():
                 return f"Skipped: Untradeable ticker ({err})", None
+            if use_ext_hours or market_hours == "extended_hours":
+                return f"Skipped: Ext. Hours fractional rejected ({err[:100]})", None
             return f"Fail: {e}", None
 
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
@@ -606,7 +758,8 @@ class CoinbaseAdapter(BaseBroker):
             return sr.get('order_id')
         return data.get('order_id') or data.get('id')
 
-    def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours):
+    def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
+                        market_hours="regular_hours", allow_fractional=True):
         if not self.is_connected: return "Fail: Not connected", 0.0, None
         clean = str(ticker).replace("-USD", "").upper()
         product_id = f"{clean}-USD"
@@ -629,7 +782,8 @@ class CoinbaseAdapter(BaseBroker):
         except Exception as e:
             return f"Fail: {e}", 0.0, None
 
-    def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours):
+    def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
+                         market_hours="regular_hours", allow_fractional=True):
         if not self.is_connected: return "Fail: Not connected", None
         clean = str(ticker).replace("-USD", "").upper()
         product_id = f"{clean}-USD"

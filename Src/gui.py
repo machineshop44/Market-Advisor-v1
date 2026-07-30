@@ -6,6 +6,7 @@ import json
 import builtins
 import urllib.request
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_DOWN
 
 from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,14 +14,23 @@ from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBo
                              QPushButton, QMessageBox, QInputDialog, QLineEdit, 
                              QApplication, QStatusBar, QFrame, QCheckBox, QComboBox,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog, QDialog, QFormLayout, QGroupBox,
-                             QSystemTrayIcon, QMenu, QAction)
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QEventLoop, QPoint
+                             QSystemTrayIcon, QMenu, QAction, QScrollArea, QSizePolicy)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QEventLoop, QPoint, QSize
 from PyQt5.QtGui import QPainter, QPen, QColor, QPalette, QPixmap, QPolygon, QIcon
 import threading
 
 import journal
 import monitor
 from broker import RobinhoodAdapter, CoinbaseAdapter
+from version import (
+    APP_NAME,
+    APP_NAME_COMPACT,
+    VERSION_NOTE,
+    display_name,
+    user_agent,
+    window_title,
+    __version__ as APP_VERSION,
+)
 
 # Heavy scoring/finviz libs load on first use (pandas/yfinance/robin are slow)
 _FINVIZ_AVAILABLE = None
@@ -99,6 +109,7 @@ def load_settings():
         "interval_penny": 60,
         "interval_core": 300,
         "interval_portfolio": 60,
+        "interval_balance_refresh": 60,
         "rh_email": "",
         "rh_password": "",
         "cb_api_key": "",
@@ -116,6 +127,7 @@ def load_settings():
     if defaults.get("interval_penny", 60) < 60: defaults["interval_penny"] = 60
     if defaults.get("interval_core", 300) < 120: defaults["interval_core"] = 300
     if defaults.get("interval_portfolio", 60) < 30: defaults["interval_portfolio"] = 30
+    if defaults.get("interval_balance_refresh", 60) < 30: defaults["interval_balance_refresh"] = 30
         
     return defaults
 
@@ -152,16 +164,138 @@ def format_money(value):
         return "$0.00"
 
 
+# Brand-aligned UI tokens (splash green #0D3B2E → teal accent, softer radii)
+UI_ACCENT = "#1F8A70"
+UI_ACCENT_HOVER = "#26A69A"
+UI_SUCCESS = "#2E7D32"
+UI_DANGER = "#C62828"
+UI_RADIUS_BTN = 9
+UI_RADIUS_CARD = 12
+UI_RADIUS_INPUT = 8
+UI_RADIUS_FRAME = 10
+UI_ROW_HEIGHT = 34
+
+# Design baseline ≈ default fitted window; fonts/padding scale from this.
+UI_BASE_W = 1120
+UI_BASE_H = 720
+UI_SCALE_MIN = 0.82
+UI_SCALE_MAX = 1.12
+_UI_SCALE = 1.0
+
+
+def ui_scale():
+    return _UI_SCALE
+
+
+def set_ui_scale(scale):
+    global _UI_SCALE
+    _UI_SCALE = max(UI_SCALE_MIN, min(UI_SCALE_MAX, float(scale)))
+
+
+def compute_ui_scale(width, height):
+    """Scale from window size without letting ultrawide inflate type forever."""
+    if width <= 0 or height <= 0:
+        return 1.0
+    # Past design width, extra horizontal space should be empty margin — not bigger fonts
+    capped_w = min(float(width), float(UI_BASE_W))
+    sx = capped_w / UI_BASE_W
+    sy = float(height) / UI_BASE_H
+    return max(UI_SCALE_MIN, min(UI_SCALE_MAX, (sx * sy) ** 0.5))
+
+
+def ui_px(base, minimum=1):
+    """Scale a design-pixel value for the current window size."""
+    return max(minimum, int(round(float(base) * _UI_SCALE)))
+
+
+def polish_trades_header(table):
+    """Compact columns + Status absorbs leftover width (avoids ultrawide stretch mess)."""
+    if table is None:
+        return
+    hdr = table.horizontalHeader()
+    for col in range(table.columnCount()):
+        hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+    # Status is usually the long message column
+    status_col = min(5, table.columnCount() - 1)
+    if table.columnCount() > 0:
+        hdr.setSectionResizeMode(status_col, QHeaderView.Stretch)
+
+
 def top_bar_btn_style(bg, fg="white"):
     """
     Widget-level QSS replaces app theme rules for that button.
     Include padding/min-height so Mode/Auto-Trader don't shrink vs Refresh in light mode.
     """
     return (
-        f"QPushButton {{ background-color: {bg}; color: {fg}; font-weight: bold; "
-        f"border-radius: 4px; border: 1px solid #1a1a1a; "
-        f"padding: 6px 12px; min-height: 28px; }}"
+        f"QPushButton {{ background-color: {bg}; color: {fg}; font-weight: 600; "
+        f"border-radius: {ui_px(UI_RADIUS_BTN)}px; border: 1px solid rgba(0,0,0,40); "
+        f"padding: {ui_px(7)}px {ui_px(14)}px; min-height: {ui_px(28)}px; }}"
     )
+
+
+def action_btn_style(kind="primary"):
+    """Shared Scan / Score / Execute / Save button look."""
+    colors = {
+        "primary": UI_ACCENT,
+        "success": UI_SUCCESS,
+        "danger": UI_DANGER,
+    }
+    bg = colors.get(kind, UI_ACCENT)
+    return (
+        f"QPushButton {{ background-color: {bg}; color: white; font-weight: 600; "
+        f"padding: {ui_px(10)}px {ui_px(14)}px; border-radius: {ui_px(UI_RADIUS_BTN)}px; border: none; }}"
+        f"QPushButton:hover {{ background-color: {UI_ACCENT_HOVER if kind == 'primary' else bg}; }}"
+    )
+
+
+def section_header_style():
+    return (
+        f"font-size: {ui_px(15)}px; font-weight: 600; letter-spacing: 0.2px; "
+        f"padding: {ui_px(6)}px 0 {ui_px(4)}px 0;"
+    )
+
+
+def metric_label_style(color, size=16):
+    """Color/size for money metrics. Padding avoids stylesheet-font clipping in GroupBoxes."""
+    fs = ui_px(size)
+    pad = max(2, fs // 6)
+    return (
+        f"font-size: {fs}px; font-weight: 600; color: {color}; "
+        f"background: transparent; padding: {pad}px 2px;"
+    )
+
+
+def theme_colors(dark_mode):
+    """Readable semantic colors for both themes (light tuned for contrast)."""
+    if dark_mode:
+        return {
+            "accent": UI_ACCENT,
+            "success": "#00E676",
+            "danger": "#FF5252",
+            "warn": "#FFB300",
+            "muted": "#9AA0A6",
+            "text": "#E8EAED",
+            "neutral": "#B0B0B0",
+        }
+    return {
+        "accent": "#0F6B56",
+        "success": "#1B5E20",
+        "danger": "#B71C1C",
+        "warn": "#E65100",
+        "muted": "#3C4043",
+        "text": "#1A1A1A",
+        "neutral": "#424242",
+    }
+
+
+def polish_table(table):
+    """Taller rows, quieter chrome — call once when creating each table."""
+    if table is None:
+        return
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(ui_px(UI_ROW_HEIGHT))
 
 
 def _write_combo_arrow_png(path, fill_hex):
@@ -199,14 +333,29 @@ def format_quantity(value):
         return "0"
 
 
+class CompactScrollArea(QScrollArea):
+    """Scroll area that does not force the main window taller than the screen."""
+
+    def sizeHint(self):
+        return QSize(720, 420)
+
+    def minimumSizeHint(self):
+        return QSize(480, 240)
+
+
 class WorkingSpinner(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(20, 20)
+        self._base_size = 20
+        self.apply_scale()
         self.angle = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.rotate)
         self.is_spinning = False
+
+    def apply_scale(self):
+        s = ui_px(self._base_size)
+        self.setFixedSize(s, s)
 
     def start(self):
         self.is_spinning = True
@@ -225,14 +374,19 @@ class WorkingSpinner(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        side = min(self.width(), self.height())
+        inset = max(2, side // 10)
+        arc = max(8, side - inset * 2)
         if self.is_spinning:
-            pen = QPen(QColor("#007ACC"), 3)
+            pen = QPen(QColor("#007ACC"), max(2, side // 8))
             painter.setPen(pen)
-            painter.drawArc(2, 2, 16, 16, -self.angle * 16, 270 * 16)
+            painter.drawArc(inset, inset, arc, arc, -self.angle * 16, 270 * 16)
         else:
-            pen = QPen(QColor("#2E7D32"), 3)
+            pen = QPen(QColor("#2E7D32"), max(2, side // 8))
             painter.setPen(pen)
-            painter.drawEllipse(6, 6, 8, 8)
+            d = max(4, side // 3)
+            o = (side - d) // 2
+            painter.drawEllipse(o, o, d, d)
 
 
 class BotActivityAnimator(QWidget):
@@ -244,16 +398,22 @@ class BotActivityAnimator(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(120, 44)
+        # Compact — banner sits above tabs; tall animator was crushing Home cards
+        self._base_w, self._base_h = 88, 32
+        self.apply_scale()
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.mode = "rest"
         self.frame = 0
-        self.accent = QColor("#2b78e4")
+        self.accent = QColor(UI_ACCENT)
         self.dark = True
         self._tickers = ["BTC", "ETH", "SOL", "SPY", "QQQ", "AVAX", "LINK", "NVDA", "AAPL", "DOGE"]
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(90)
+
+    def apply_scale(self):
+        self.setFixedSize(ui_px(self._base_w), ui_px(self._base_h))
+        self.update()
 
     def set_dark(self, dark):
         self.dark = bool(dark)
@@ -273,7 +433,7 @@ class BotActivityAnimator(QWidget):
         elif mode == "execute":
             self.accent = QColor("#EF5350")
         elif mode == "armed":
-            self.accent = QColor("#2b78e4")
+            self.accent = QColor(UI_ACCENT)
         else:
             self.accent = QColor("#757575")
         self.update()
@@ -390,8 +550,13 @@ class MarketAdvisorGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MarketAdvisor v1.0 - Multi-Broker Quantitative Platform")
-        self.resize(1300, 880)
+        self.setWindowTitle(window_title())
+        self._fit_to_screen()
+        set_ui_scale(compute_ui_scale(self.width(), self.height()))
+        self._ui_scale = ui_scale()
+        self._scale_timer = QTimer(self)
+        self._scale_timer.setSingleShot(True)
+        self._scale_timer.timeout.connect(self._on_scale_timer)
         self._launch_discord_finished.connect(self._on_launch_discord_finished)
         self._log_line_ready.connect(self._append_log_line_ui)
         
@@ -420,6 +585,9 @@ class MarketAdvisorGUI(QMainWindow):
         self._reconnect_fail_streak = {"Robinhood": 0, "Coinbase": 0}
         self._reconnect_in_flight = {"Robinhood": False, "Coinbase": False}
         self._holdings_count_cache = {"Robinhood": 0, "Coinbase": 0}
+        self._balance_bad_streak = {"Robinhood": 0, "Coinbase": 0}
+        self._balances_refresh_in_flight = False
+        self._last_idle_balance_refresh = 0.0
         self.cost_basis_cache = {"Robinhood": {}, "Coinbase": {}}
         self._scoring_state_loaded = False
         self.last_crypto_time = {"Robinhood": 0, "Coinbase": 0}
@@ -456,15 +624,16 @@ class MarketAdvisorGUI(QMainWindow):
         
         central_widget = QWidget()
         self.main_layout = QVBoxLayout(central_widget)
-        self.main_layout.setContentsMargins(10, 10, 10, 10)
-        self.main_layout.setSpacing(10)
+        m = ui_px(10)
+        self.main_layout.setContentsMargins(m, m, m, m)
+        self.main_layout.setSpacing(m)
         self.setCentralWidget(central_widget)
 
         self.build_persistent_top_bar()
         self.build_auto_trader_banner()
 
         self.tabs = QTabWidget()
-        self.main_layout.addWidget(self.tabs)
+        self.main_layout.addWidget(self.tabs, 1)  # take leftover height so banner can't crush Home
         
         self.setup_status_bar()
         
@@ -482,10 +651,161 @@ class MarketAdvisorGUI(QMainWindow):
         self.apply_theme()
         self.update_market_status()
         self.log_event("Application initialized. Verifying connections...")
+        self.log_event(f"Version {APP_VERSION}" + (f" — {VERSION_NOTE}" if VERSION_NOTE else ""))
         self._setup_system_tray()  # tray visible immediately
 
         # Remaining tabs + startup connect after first paint
         QTimer.singleShot(0, self._finish_ui_build)
+
+    def _fit_to_screen(self):
+        """Open at a usable size that fits the available desktop; allow shrinking."""
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            # Leave room for taskbar / window chrome
+            target_w = min(1200, max(920, avail.width() - 48))
+            target_h = min(780, max(600, avail.height() - 64))
+            self.resize(target_w, target_h)
+            self.setMinimumSize(760, 520)
+            frame = self.frameGeometry()
+            frame.moveCenter(avail.center())
+            self.move(frame.topLeft())
+        else:
+            self.resize(1120, 720)
+            self.setMinimumSize(760, 520)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_scale_timer"):
+            self._scale_timer.start(90)
+
+    def _on_scale_timer(self):
+        new_scale = compute_ui_scale(self.width(), self.height())
+        if abs(new_scale - getattr(self, "_ui_scale", 1.0)) < 0.025:
+            return
+        set_ui_scale(new_scale)
+        self._ui_scale = ui_scale()
+        self._apply_ui_scale()
+
+    def _apply_ui_scale(self):
+        """Re-apply fonts, padding, and min sizes for the current UI scale."""
+        m = ui_px(10)
+        if hasattr(self, "main_layout"):
+            self.main_layout.setContentsMargins(m, m, m, m)
+            self.main_layout.setSpacing(m)
+
+        if hasattr(self, "_top_bar_layout"):
+            self._top_bar_layout.setContentsMargins(ui_px(12), ui_px(8), ui_px(12), ui_px(8))
+            self._top_bar_layout.setSpacing(ui_px(10))
+
+        if hasattr(self, "broker_dropdown"):
+            self.broker_dropdown.setFixedWidth(ui_px(120))
+        if hasattr(self, "portfolio_val_lbl"):
+            self.portfolio_val_lbl.setMinimumWidth(ui_px(130))
+        if hasattr(self, "buying_power_lbl"):
+            self.buying_power_lbl.setMinimumWidth(ui_px(150))
+        if hasattr(self, "daily_profit_lbl"):
+            self.daily_profit_lbl.setMinimumWidth(ui_px(120))
+        for btn, mh, mw in (
+            (getattr(self, "paper_mode_btn", None), 34, 108),
+            (getattr(self, "dark_mode_btn", None), 34, 68),
+            (getattr(self, "auto_trade_btn", None), 34, 138),
+        ):
+            if btn is not None:
+                btn.setMinimumHeight(ui_px(mh))
+                btn.setMinimumWidth(ui_px(mw))
+
+        if hasattr(self, "_at_banner_layout"):
+            self._at_banner_layout.setContentsMargins(ui_px(10), ui_px(4), ui_px(10), ui_px(4))
+            self._at_banner_layout.setSpacing(ui_px(8))
+        if hasattr(self, "at_status_frame"):
+            self.at_status_frame.setMaximumHeight(ui_px(48))
+
+        if hasattr(self, "_home_layout"):
+            self._home_layout.setContentsMargins(ui_px(18), ui_px(14), ui_px(18), ui_px(14))
+            self._home_layout.setSpacing(ui_px(12))
+        if hasattr(self, "_master_card_layout"):
+            self._master_card_layout.setContentsMargins(ui_px(18), ui_px(18), ui_px(18), ui_px(16))
+            self._master_card_layout.setSpacing(ui_px(6))
+        if hasattr(self, "_rh_card_layout"):
+            self._rh_card_layout.setContentsMargins(ui_px(16), ui_px(14), ui_px(16), ui_px(14))
+            self._rh_card_layout.setSpacing(ui_px(28))
+        if hasattr(self, "_cb_card_layout"):
+            self._cb_card_layout.setContentsMargins(ui_px(16), ui_px(14), ui_px(16), ui_px(14))
+            self._cb_card_layout.setSpacing(ui_px(28))
+        if hasattr(self, "recent_trades_table"):
+            self.recent_trades_table.setMinimumHeight(ui_px(140))
+            polish_trades_header(self.recent_trades_table)
+
+        if hasattr(self, "_status_layout"):
+            self._status_layout.setContentsMargins(ui_px(8), ui_px(4), ui_px(12), ui_px(4))
+            self._status_layout.setSpacing(ui_px(10))
+        if hasattr(self, "status_bar"):
+            self.status_bar.setMinimumHeight(ui_px(28))
+        if hasattr(self, "status_text"):
+            self.status_text.setMinimumWidth(ui_px(200))
+        if hasattr(self, "market_status_lbl"):
+            self.market_status_lbl.setMinimumWidth(ui_px(200))
+        if hasattr(self, "spinner") and hasattr(self.spinner, "apply_scale"):
+            self.spinner.apply_scale()
+        if hasattr(self, "bot_animator") and hasattr(self.bot_animator, "apply_scale"):
+            self.bot_animator.apply_scale()
+
+        # Theme QSS + metric/home/top-bar styles all read current ui_px()
+        self.apply_theme()
+        self._restyle_scaled_widgets()
+        self._refresh_home_balance_labels()
+        if hasattr(self, "paper_mode_btn"):
+            self.paper_mode_btn.setStyleSheet(
+                top_bar_btn_style("#E65100") if self.paper_mode else top_bar_btn_style("#1B5E20")
+            )
+        if hasattr(self, "auto_trade_btn"):
+            active = any(self.auto_trade_enabled.values()) if hasattr(self, "auto_trade_enabled") else False
+            self.auto_trade_btn.setStyleSheet(
+                top_bar_btn_style(UI_DANGER) if active else top_bar_btn_style("#424242")
+            )
+            if hasattr(self, "at_status_lbl"):
+                self._reset_autotrader_banner_style()
+
+    def _restyle_scaled_widgets(self):
+        """Refresh one-off stylesheets that are not covered by global theme QSS."""
+        for lbl in self.findChildren(QLabel):
+            if lbl.objectName() == "sectionHeader":
+                lbl.setStyleSheet(section_header_style())
+            elif lbl.objectName() == "homeTitle":
+                lbl.setStyleSheet(
+                    f"font-size: {ui_px(20)}px; font-weight: 600; "
+                    f"margin: {ui_px(4)}px 0 {ui_px(8)}px 0;"
+                )
+            elif lbl.objectName() == "homeBrokerMetric":
+                lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
+            elif lbl.objectName() == "settingsHint":
+                lbl.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+            elif lbl.objectName() == "settingsVersion":
+                note = f"  ·  {VERSION_NOTE}" if VERSION_NOTE else ""
+                lbl.setText(f"{display_name()}{note}")
+                lbl.setStyleSheet(
+                    f"color: #6B7280; font-size: {ui_px(12)}px; margin-top: {ui_px(18)}px;"
+                )
+
+        for btn in self.findChildren(QPushButton):
+            kind = btn.property("uiBtnKind")
+            if kind:
+                extra = btn.property("uiBtnExtra") or ""
+                btn.setStyleSheet(action_btn_style(str(kind)) + (str(extra) if extra else ""))
+
+        for combo in self.findChildren(QComboBox):
+            if combo.objectName() == "logFilterCombo":
+                combo.setFixedWidth(ui_px(130))
+
+        for btn in self.findChildren(QPushButton):
+            name = btn.objectName()
+            if name == "copyLogBtn":
+                btn.setFixedWidth(ui_px(100))
+            elif name == "saveLogBtn":
+                btn.setFixedWidth(ui_px(120))
+            elif name == "clearLogBtn":
+                btn.setFixedWidth(ui_px(100))
 
     def _finish_ui_build(self):
         """Deferred scanner/portfolio/settings tabs — window + tray already visible."""
@@ -509,7 +829,8 @@ class MarketAdvisorGUI(QMainWindow):
                 self.core_tab_index = i
 
         self._apply_view_mode_tabs()
-        self.apply_theme()
+        # Scale once deferred tabs exist (action buttons / section headers tagged)
+        self._apply_ui_scale()
         QTimer.singleShot(0, lambda: self.director_timer.start(1000))
 
         # Warm heavy libs in the background so the first score/scan doesn't hitch
@@ -564,7 +885,7 @@ class MarketAdvisorGUI(QMainWindow):
     #  SYSTEM TRAY (Sonarr/Radarr-style background + restore)
     # ---------------------------------------------------------
     def _make_app_icon(self):
-        """Load the Market Advisor icon (candles + trend); fall back to a drawn mark."""
+        """Load Market Advisor brand icon; fall back to a drawn candle mark."""
         base = os.path.dirname(os.path.abspath(__file__))
         for name in ("app_icon.ico", "app_icon.png"):
             path = os.path.join(base, name)
@@ -578,11 +899,20 @@ class MarketAdvisorGUI(QMainWindow):
         p.setRenderHint(QPainter.Antialiasing)
         p.setBrush(QColor("#0D3B2E"))
         p.setPen(Qt.NoPen)
-        p.drawRoundedRect(2, 2, 60, 60, 12, 12)
-        p.setPen(QPen(QColor("#A5D6A7"), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        pts = [QPoint(10, 46), QPoint(22, 38), QPoint(32, 42), QPoint(44, 24), QPoint(54, 16)]
+        p.drawRoundedRect(2, 2, 60, 60, 14, 14)
+        # trend
+        p.setPen(QPen(QColor("#A5D6A7"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        pts = [QPoint(10, 48), QPoint(22, 40), QPoint(32, 44), QPoint(44, 26), QPoint(54, 18)]
         for i in range(len(pts) - 1):
             p.drawLine(pts[i], pts[i + 1])
+        # mini candles
+        p.setPen(Qt.NoPen)
+        for cx, top, bot, color in ((20, 30, 42, "#F8FAF9"), (32, 22, 38, "#1F8A70"), (44, 14, 32, "#F8FAF9")):
+            p.setBrush(QColor(color))
+            p.drawRoundedRect(cx - 4, top, 8, bot - top, 1, 1)
+            p.setPen(QPen(QColor(color), 1))
+            p.drawLine(cx, top - 4, cx, bot + 4)
+            p.setPen(Qt.NoPen)
         p.end()
         return QIcon(pm)
 
@@ -598,10 +928,10 @@ class MarketAdvisorGUI(QMainWindow):
             return
 
         self.tray_icon = QSystemTrayIcon(self.app_icon, self)
-        self.tray_icon.setToolTip("Market Advisor")
+        self.tray_icon.setToolTip(display_name())
 
         menu = QMenu()
-        show_act = QAction("Open Market Advisor", self)
+        show_act = QAction(f"Open {APP_NAME}", self)
         show_act.triggered.connect(self.show_from_tray)
         menu.addAction(show_act)
         menu.addSeparator()
@@ -628,21 +958,50 @@ class MarketAdvisorGUI(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        # X / Alt+F4 → hide to tray (keeps auto-trader + web monitor alive)
+        # X / Alt+F4 → ask: tray vs quit (tray keeps auto-trader + web monitor alive)
         if self.tray_icon and not self._force_quit:
-            event.ignore()
-            self.hide()
-            if not self._tray_tip_shown:
-                self._tray_tip_shown = True
-                self.tray_icon.showMessage(
-                    "Market Advisor",
-                    "Still running in the tray. Double-click the icon to open, or right-click → Quit.",
-                    QSystemTrayIcon.Information,
-                    4000,
-                )
-            return
+            box = QMessageBox(self)
+            box.setWindowTitle(APP_NAME)
+            box.setIcon(QMessageBox.Question)
+            box.setText(f"Close {APP_NAME}?")
+            box.setInformativeText(
+                "Minimize to tray keeps the auto-trader and web monitor running in the background.\n"
+                "Quit fully stops the app."
+            )
+            tray_btn = box.addButton("Minimize to tray", QMessageBox.AcceptRole)
+            quit_btn = box.addButton("Quit app", QMessageBox.DestructiveRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(tray_btn)
+            box.exec_()
+            clicked = box.clickedButton()
+
+            if clicked == cancel_btn or clicked is None:
+                event.ignore()
+                return
+
+            if clicked == tray_btn:
+                event.ignore()
+                self.hide()
+                if not self._tray_tip_shown:
+                    self._tray_tip_shown = True
+                    self.tray_icon.showMessage(
+                        display_name(),
+                        "Still running in the tray. Double-click the icon to open, or right-click → Quit.",
+                        QSystemTrayIcon.Information,
+                        4000,
+                    )
+                return
+
+            # Quit app — fall through to full shutdown
+            self._force_quit = True
+
         try:
             monitor.stop_monitor()
+        except Exception:
+            pass
+        try:
+            from scoring import flush_state
+            flush_state()
         except Exception:
             pass
         if self.tray_icon:
@@ -780,7 +1139,8 @@ class MarketAdvisorGUI(QMainWindow):
         if app is not None and QThread.currentThread() == app.thread():
             QTimer.singleShot(0, self.refresh_recent_trades)
 
-    def execute_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours):
+    def execute_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
+                          market_hours="regular_hours", allow_fractional=True):
         """Paper-mode-aware buy. Never calls the real broker API when self.paper_mode is True."""
         broker_name = self.cycle_broker_name
         if self.paper_mode:
@@ -804,7 +1164,10 @@ class MarketAdvisorGUI(QMainWindow):
             status = f"[PAPER] Buy Simulated ({format_currency(trade_dollars)})"
             self._journal_fill("BUY", ticker, asset_type, price, status, dollars=trade_dollars, qty=shares_bought)
             return status, trade_dollars
-        result = self.cycle_broker.place_buy_order(ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours)
+        result = self.cycle_broker.place_buy_order(
+            ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
+            market_hours=market_hours, allow_fractional=allow_fractional,
+        )
         if isinstance(result, tuple) and len(result) >= 3:
             status, spent, order_id = result[0], result[1], result[2]
         else:
@@ -815,7 +1178,8 @@ class MarketAdvisorGUI(QMainWindow):
         self._journal_fill("BUY", ticker, asset_type, price, status, dollars=spent, qty=(spent / price) if price and spent else None, order_id=order_id)
         return status, spent
 
-    def execute_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours):
+    def execute_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
+                           market_hours="regular_hours", allow_fractional=True):
         """Paper-mode-aware sell. Never calls the real broker API when self.paper_mode is True."""
         broker_name = self.cycle_broker_name
         if self.paper_mode:
@@ -835,7 +1199,10 @@ class MarketAdvisorGUI(QMainWindow):
             status = f"[PAPER] Sell Simulated ({format_currency(proceeds)})"
             self._journal_fill("SELL", ticker, asset_type, price, status, dollars=proceeds, qty=sell_qty)
             return status
-        result = self.cycle_broker.place_sell_order(ticker, asset_type, price, shares_val, offset_pct, use_ext_hours)
+        result = self.cycle_broker.place_sell_order(
+            ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
+            market_hours=market_hours, allow_fractional=allow_fractional,
+        )
         if isinstance(result, tuple):
             status = result[0]
             order_id = result[1] if len(result) > 1 else None
@@ -871,7 +1238,7 @@ class MarketAdvisorGUI(QMainWindow):
                 req = urllib.request.Request(
                     webhook_url,
                     data=payload,
-                    headers={'Content-Type': 'application/json', 'User-Agent': 'MarketAdvisor/1.0'},
+                    headers={'Content-Type': 'application/json', 'User-Agent': user_agent()},
                 )
                 urllib.request.urlopen(req, timeout=10)
                 return "ok"
@@ -935,10 +1302,10 @@ class MarketAdvisorGUI(QMainWindow):
         combined_eq = combined_cash = combined_pl = 0.0
         any_down = False
 
+        # Always show both brokers (armed or not) so a false loss-halt doesn't "erase" RH from Discord
         for name in ("Robinhood", "Coinbase"):
-            if name not in active:
-                continue
             connected = self.brokers[name].is_connected or self.paper_mode
+            armed = bool(self.auto_trade_enabled.get(name))
             if not connected:
                 any_down = True
             p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
@@ -948,7 +1315,12 @@ class MarketAdvisorGUI(QMainWindow):
             combined_eq += p_val
             combined_cash += bp
             combined_pl += pl
-            status = "✅ Online" if connected else "⚠️ Down"
+            if not connected:
+                status = "⚠️ Down"
+            elif armed:
+                status = "✅ Online · Armed"
+            else:
+                status = "⏸️ Online · Disarmed"
             pl_txt = f"+{format_money(pl)}" if pl >= 0 else format_money(pl)
             fields.append({
                 "name": name,
@@ -987,7 +1359,7 @@ class MarketAdvisorGUI(QMainWindow):
             "description": "Auto-trader heartbeat — balances & day P&L by broker",
             "color": color,
             "fields": fields,
-            "footer": {"text": "Market Advisor · dual-broker telemetry"},
+            "footer": {"text": f"{display_name()} · dual-broker telemetry"},
             "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
 
@@ -1059,7 +1431,7 @@ class MarketAdvisorGUI(QMainWindow):
                 req = urllib.request.Request(
                     webhook_url,
                     data=payload,
-                    headers={"Content-Type": "application/json", "User-Agent": "MarketAdvisor/1.0"},
+                    headers={"Content-Type": "application/json", "User-Agent": user_agent()},
                 )
                 urllib.request.urlopen(req, timeout=15)
                 self._launch_discord_finished.emit(True, "")
@@ -1105,7 +1477,10 @@ class MarketAdvisorGUI(QMainWindow):
             return False
         return self._launch_equity_total() > 0.01
 
-    def refresh_account_balances(self):
+    def refresh_account_balances(self, quiet=False):
+        """Pull broker equity/cash. quiet=True skips the status-bar spinner (idle polls)."""
+        if getattr(self, "_balances_refresh_in_flight", False):
+            return
         today = datetime.now().date()
         if today > self.current_trading_day:
             self.current_trading_day = today
@@ -1113,15 +1488,20 @@ class MarketAdvisorGUI(QMainWindow):
             self._persist_session_baselines()
             self.log_event("🌅 Midnight reached. Daily P&L Tracker reset for the new day.")
 
-        self.set_working_state(True, f"Fetching {self.active_broker_name} balances...")
+        self._balances_refresh_in_flight = True
+        if not quiet:
+            self.set_working_state(True, f"Fetching {self.active_broker_name} balances...")
 
         def _ok(totals):
+            self._balances_refresh_in_flight = False
             self._on_all_balances_fetched(totals if isinstance(totals, dict) else {})
 
         def _fail(err):
+            self._balances_refresh_in_flight = False
             self.log_event(f"Balance fetch error: {err}")
             # Keep last known totals — do not overwrite with zeros (corrupts Day P&L / Discord)
-            self.set_working_state(False)
+            if not quiet:
+                self.set_working_state(False)
             if getattr(self, "_pending_launch_checkin", False) and not getattr(self, "_launch_checkin_sent", False):
                 self._send_discord_launch_checkin()
             self.publish_monitor_status()
@@ -1139,19 +1519,150 @@ class MarketAdvisorGUI(QMainWindow):
             try:
                 if self.paper_mode or broker.is_connected:
                     p_val, bp = self.get_broker_balances(name)
-                    totals[name] = {"p_val": float(p_val or 0.0), "bp": float(bp or 0.0)}
+                    totals[name] = {
+                        "p_val": float(p_val or 0.0),
+                        "bp": float(bp or 0.0),
+                        "ok": True,
+                    }
                 else:
-                    totals[name] = {"p_val": 0.0, "bp": 0.0}
+                    # Disconnected — do not invent $0 equity (that fake-trips day-loss limits)
+                    totals[name] = {"ok": False, "reason": "disconnected"}
             except Exception as e:
-                totals[name] = {"p_val": 0.0, "bp": 0.0}
-                print(f"balance error [{name}]: {e}")
+                totals[name] = {"ok": False, "reason": str(e)}
+                try:
+                    if sys.stdout is not None:
+                        print(f"balance error [{name}]: {e}")
+                except Exception:
+                    pass
         return totals
 
+    def _balance_reading_is_suspicious(self, broker_name, new_p, old_p, baseline):
+        """
+        True when a new equity print looks like a failed API read, not a real wipe.
+        Classic bug: overnight RH glitch → $0 equity → Day P&L ≈ −entire account → false loss halt.
+        """
+        new_p = float(new_p or 0.0)
+        old_p = float(old_p or 0.0)
+        baseline = float(baseline or 0.0) if baseline else 0.0
+
+        # Near-zero when we recently had real money
+        if new_p <= 0.50 and old_p >= 5.0:
+            return True
+        if new_p <= 0.50 and baseline >= 5.0:
+            return True
+
+        # Sudden collapse vs last good reading (keep real large moves after 2 confirms)
+        if old_p >= 20.0 and new_p < old_p * 0.35 and (old_p - new_p) >= 15.0:
+            return True
+
+        return False
+
+    def _merge_balance_totals(self, incoming):
+        """Keep last-good equity when a broker fetch fails or returns a suspicious wipe."""
+        prev = getattr(self, "_last_balance_totals", {}) or {}
+        if not hasattr(self, "_balance_bad_streak"):
+            self._balance_bad_streak = {"Robinhood": 0, "Coinbase": 0}
+
+        merged = {}
+        trusted = {"Robinhood": False, "Coinbase": False}
+
+        for name in ("Robinhood", "Coinbase"):
+            raw = incoming.get(name) if isinstance(incoming, dict) else None
+            old = prev.get(name) or {}
+            old_p = float(old.get("p_val", 0.0) or 0.0)
+            old_bp = float(old.get("bp", 0.0) or 0.0)
+            baseline = self.session_starts.get(name)
+
+            if not isinstance(raw, dict) or raw.get("ok") is False:
+                reason = (raw or {}).get("reason", "fetch failed") if isinstance(raw, dict) else "missing"
+                self._balance_bad_streak[name] = self._balance_bad_streak.get(name, 0) + 1
+                self.log_event(f"[{name}] Balance fetch unreliable ({reason}) — keeping last good equity {format_money(old_p)}")
+                merged[name] = {"p_val": old_p, "bp": old_bp}
+                trusted[name] = False
+                continue
+
+            new_p = float(raw.get("p_val", 0.0) or 0.0)
+            new_bp = float(raw.get("bp", 0.0) or 0.0)
+
+            if self._balance_reading_is_suspicious(name, new_p, old_p, baseline):
+                streak = self._balance_bad_streak.get(name, 0) + 1
+                self._balance_bad_streak[name] = streak
+                if streak < 2:
+                    self.log_event(
+                        f"[{name}] Ignoring suspicious equity {format_money(new_p)} "
+                        f"(was {format_money(old_p)}; baseline {format_money(baseline or 0)}) "
+                        f"— need another confirming read before trusting it"
+                    )
+                    merged[name] = {"p_val": old_p, "bp": old_bp}
+                    trusted[name] = False
+                    continue
+                # Second consecutive collapse — accept (could be real)
+                self.log_event(
+                    f"[{name}] Equity collapse confirmed on 2nd read "
+                    f"({format_money(old_p)} → {format_money(new_p)}); accepting"
+                )
+
+            self._balance_bad_streak[name] = 0
+            merged[name] = {"p_val": new_p, "bp": new_bp}
+            trusted[name] = True
+
+        return merged, trusted
+
+    def _refresh_home_balance_labels(self):
+        """UI-only refresh of Home / top-bar money labels from cached totals (safe on resize)."""
+        merged = getattr(self, "_last_balance_totals", None) or {}
+        if not merged:
+            return
+        master_val = sum(float((d or {}).get("p_val", 0) or 0) for d in merged.values())
+        master_bp = sum(float((d or {}).get("bp", 0) or 0) for d in merged.values())
+        if hasattr(self, "home_master_val_lbl"):
+            self.home_master_val_lbl.setText(format_money(master_val))
+            self.home_master_bp_lbl.setText(f"Combined Liquid Cash: {format_money(master_bp)}")
+
+        combined_pl = 0.0
+        tc = theme_colors(self.dark_mode)
+        for broker_name in ("Robinhood", "Coinbase"):
+            p_val = float((merged.get(broker_name) or {}).get("p_val", 0.0) or 0.0)
+            bp = float((merged.get(broker_name) or {}).get("bp", 0.0) or 0.0)
+            pl_val = 0.0
+            start = self.session_starts.get(broker_name)
+            if start is not None and start > 0:
+                pl_val = p_val - start
+            combined_pl += pl_val
+            pl_str = format_money(abs(pl_val))
+            pl_display = f"+{pl_str}" if pl_val >= 0 else f"-{pl_str}"
+            color = tc["success"] if pl_val > 0.001 else (
+                tc["danger"] if pl_val < -0.001 else tc["neutral"]
+            )
+            if broker_name == "Robinhood" and hasattr(self, "home_rh_val_lbl"):
+                self.home_rh_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
+                self.home_rh_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
+                self.home_rh_pl_lbl.setText(f"Day P&L: {pl_display}")
+                self.home_rh_pl_lbl.setStyleSheet(metric_label_style(color, 15))
+            elif broker_name == "Coinbase" and hasattr(self, "home_cb_val_lbl"):
+                self.home_cb_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
+                self.home_cb_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
+                self.home_cb_pl_lbl.setText(f"Day P&L: {pl_display}")
+                self.home_cb_pl_lbl.setStyleSheet(metric_label_style(color, 15))
+
+        if hasattr(self, "home_master_pl_lbl"):
+            cpl_str = format_money(abs(combined_pl))
+            cpl_display = f"+{cpl_str}" if combined_pl >= 0 else f"-{cpl_str}"
+            cpl_color = tc["success"] if combined_pl > 0.001 else (
+                tc["danger"] if combined_pl < -0.001 else tc["neutral"]
+            )
+            self.home_master_pl_lbl.setText(f"Combined Day P&L: {cpl_display}")
+            self.home_master_pl_lbl.setStyleSheet(metric_label_style(cpl_color, 20))
+
+        if hasattr(self, "portfolio_val_lbl"):
+            self._refresh_top_bar_from_cache()
+
     def _on_all_balances_fetched(self, totals):
-        self._last_balance_totals = totals
+        merged, trusted = self._merge_balance_totals(totals if isinstance(totals, dict) else {})
+        self._last_balance_totals = merged
         # Update Master Totals
-        master_val = sum(d['p_val'] for d in totals.values())
-        master_bp = sum(d['bp'] for d in totals.values())
+        master_val = sum(float((d or {}).get("p_val", 0) or 0) for d in merged.values())
+        master_bp = sum(float((d or {}).get("bp", 0) or 0) for d in merged.values())
         
         if hasattr(self, 'home_master_val_lbl'):
             self.home_master_val_lbl.setText(format_money(master_val))
@@ -1161,11 +1672,11 @@ class MarketAdvisorGUI(QMainWindow):
 
         # Process Each Broker
         for broker_name in ["Robinhood", "Coinbase"]:
-            p_val = totals.get(broker_name, {}).get('p_val', 0.0)
-            bp = totals.get(broker_name, {}).get('bp', 0.0)
+            p_val = float((merged.get(broker_name) or {}).get("p_val", 0.0) or 0.0)
+            bp = float((merged.get(broker_name) or {}).get("bp", 0.0) or 0.0)
             
             # Session Init (persisted for the calendar day so restarts keep Day P&L)
-            if self.session_starts[broker_name] is None and p_val > 0:
+            if self.session_starts[broker_name] is None and p_val > 0 and trusted.get(broker_name):
                 self.session_starts[broker_name] = p_val
                 self._persist_session_baselines()
                 self.log_event(f"[{broker_name}] Baseline Equity set to: {format_currency(p_val)}")
@@ -1177,7 +1688,10 @@ class MarketAdvisorGUI(QMainWindow):
                 
             pl_str = format_money(abs(pl_val))
             pl_display = f"+{pl_str}" if pl_val >= 0 else f"-{pl_str}"
-            color = "#00E676" if pl_val > 0.001 else ("#FF5252" if pl_val < -0.001 else ("#E0E0E0" if self.dark_mode else "#616161"))
+            tc = theme_colors(self.dark_mode)
+            color = tc["success"] if pl_val > 0.001 else (
+                tc["danger"] if pl_val < -0.001 else tc["neutral"]
+            )
 
             # Update Home Banners
             if hasattr(self, 'home_rh_val_lbl'):
@@ -1185,15 +1699,15 @@ class MarketAdvisorGUI(QMainWindow):
                     self.home_rh_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
                     self.home_rh_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
                     self.home_rh_pl_lbl.setText(f"Day P&L: {pl_display}")
-                    self.home_rh_pl_lbl.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 16px;")
+                    self.home_rh_pl_lbl.setStyleSheet(metric_label_style(color, 15))
                 elif broker_name == "Coinbase":
                     self.home_cb_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
                     self.home_cb_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
                     self.home_cb_pl_lbl.setText(f"Day P&L: {pl_display}")
-                    self.home_cb_pl_lbl.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 16px;")
+                    self.home_cb_pl_lbl.setStyleSheet(metric_label_style(color, 15))
 
-            # Check target/loss for this broker if IT is currently auto-trading
-            if self.auto_trade_enabled.get(broker_name):
+            # Profit/loss limits only on trusted balance reads (never on a glitch $0)
+            if self.auto_trade_enabled.get(broker_name) and trusted.get(broker_name):
                 target_profit = self.settings.get("daily_profit_target", 0.0)
                 if target_profit > 0 and pl_val >= target_profit:
                     msg = f"🎯 **[{broker_name}] Day Profit Target Reached!** Target: {format_currency(target_profit)} | Gain: {format_currency(pl_val)}. Disarming Auto-Trader."
@@ -1211,9 +1725,12 @@ class MarketAdvisorGUI(QMainWindow):
         if hasattr(self, 'home_master_pl_lbl'):
             cpl_str = format_money(abs(combined_pl))
             cpl_display = f"+{cpl_str}" if combined_pl >= 0 else f"-{cpl_str}"
-            cpl_color = "#00E676" if combined_pl > 0.001 else ("#FF5252" if combined_pl < -0.001 else ("#E0E0E0" if self.dark_mode else "#616161"))
+            tc = theme_colors(self.dark_mode)
+            cpl_color = tc["success"] if combined_pl > 0.001 else (
+                tc["danger"] if combined_pl < -0.001 else tc["neutral"]
+            )
             self.home_master_pl_lbl.setText(f"Combined Day P&L: {cpl_display}")
-            self.home_master_pl_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {cpl_color};")
+            self.home_master_pl_lbl.setStyleSheet(metric_label_style(cpl_color, 20))
 
         # Top bar reflects current view (All = combined)
         self._refresh_top_bar_from_cache()
@@ -1222,7 +1739,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         # Launch Discord: first ping after balances, or upgrade an empty/$0 ping
         self._balances_fetched_once = True
-        master_val = self._launch_equity_total(totals)
+        master_val = self._launch_equity_total(merged)
         in_flight = getattr(self, "_launch_checkin_in_flight", False)
         pending = getattr(self, "_pending_launch_checkin", False)
         sent = getattr(self, "_launch_checkin_sent", False)
@@ -1329,43 +1846,149 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             pass
 
+    def _now_et(self):
+        """US Eastern — Robinhood equity sessions are always quoted in ET."""
+        return datetime.now(ZoneInfo("America/New_York"))
+
+    def get_equity_session_info(self):
+        """
+        Robinhood equity session map (Eastern Time):
+          REGULAR   9:30–16:00  — fractionals OK
+          EXTENDED  7:00–9:30 and 16:00–20:00 — fractionals OK only until 19:30 after close
+          OVERNIGHT 20:00–7:00 weekdays — whole shares only (no fractionals)
+          WEEKEND / CLOSED — no equity trading
+        """
+        now = self._now_et()
+        if now.weekday() >= 5:
+            return {
+                "label": "WEEKEND",
+                "market_hours": "regular_hours",
+                "use_ext": False,
+                "fractional_ok": False,
+                "equity_tradeable": False,
+            }
+
+        t = now.hour + now.minute / 60.0
+
+        # Regular market
+        if 9.5 <= t < 16.0:
+            return {
+                "label": "REGULAR",
+                "market_hours": "regular_hours",
+                "use_ext": False,
+                "fractional_ok": True,
+                "equity_tradeable": True,
+            }
+
+        # Premarket extended (fractionals allowed)
+        if 7.0 <= t < 9.5:
+            return {
+                "label": "EXTENDED",
+                "market_hours": "extended_hours",
+                "use_ext": True,
+                "fractional_ok": True,
+                "equity_tradeable": True,
+            }
+
+        # After-hours: fractionals until 7:30 PM ET; whole shares until 8:00 PM ET
+        if 16.0 <= t < 19.5:
+            return {
+                "label": "EXTENDED",
+                "market_hours": "extended_hours",
+                "use_ext": True,
+                "fractional_ok": True,
+                "equity_tradeable": True,
+            }
+        if 19.5 <= t < 20.0:
+            return {
+                "label": "EXTENDED",
+                "market_hours": "extended_hours",
+                "use_ext": True,
+                "fractional_ok": False,
+                "equity_tradeable": True,
+            }
+
+        # Overnight / 24hr market window — RH: whole shares only
+        if t >= 20.0 or t < 7.0:
+            return {
+                "label": "OVERNIGHT",
+                "market_hours": "all_day_hours",
+                "use_ext": True,
+                "fractional_ok": False,
+                "equity_tradeable": True,
+            }
+
+        return {
+            "label": "CLOSED",
+            "market_hours": "regular_hours",
+            "use_ext": False,
+            "fractional_ok": False,
+            "equity_tradeable": False,
+        }
+
     def is_extended_hours_active(self):
-        now = datetime.now()
-        if now.weekday() >= 5: return True
-        current_time = now.hour + (now.minute / 60.0)
-        if 9.5 <= current_time < 16.0: return False
-        return True
+        """True outside regular 9:30–4 ET (extended or overnight)."""
+        return self.get_equity_session_info()["label"] in ("EXTENDED", "OVERNIGHT", "WEEKEND")
 
     def is_equity_session_active(self):
         """
-        Robinhood stock scanners/trades: Mon–Fri premarket through after-hours
-        (~4:00–20:00 local). Crypto still runs 24/7 separately.
+        Robinhood stock scanners/trades during RH extended+regular window (7am–8pm ET).
+        Overnight whole-share trading is handled separately at order time.
+        Crypto still runs 24/7 separately.
         """
-        now = datetime.now()
-        if now.weekday() >= 5:
-            return False
-        current_time = now.hour + (now.minute / 60.0)
-        return 4.0 <= current_time < 20.0
+        info = self.get_equity_session_info()
+        return info["label"] in ("REGULAR", "EXTENDED")
 
     def update_market_status(self):
-        is_extended = self.is_extended_hours_active()
-        ext_color = "#FFB300" if self.dark_mode else "#F57F17"
-        reg_color = "#00E676" if self.dark_mode else "#2E7D32"
+        """Broker-aware session label. Coinbase/crypto is 24/7; equities follow US hours."""
+        if not hasattr(self, "market_status_lbl"):
+            return
 
-        if hasattr(self, 'market_status_lbl'):
-            if is_extended:
-                # Clarify weekend vs true extended-hours weekday
-                if datetime.now().weekday() >= 5:
-                    self.market_status_lbl.setText("Market: WEEKEND")
-                elif self.is_equity_session_active():
-                    self.market_status_lbl.setText("Market: EXTENDED")
-                else:
-                    self.market_status_lbl.setText("Market: CLOSED")
-                self.market_status_lbl.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {ext_color};")
+        tc = theme_colors(self.dark_mode)
+        open_color = tc["success"]
+        warn_color = tc["warn"]
+        closed_color = tc["danger"]
+
+        view = getattr(self, "view_mode", "All")
+        info = self.get_equity_session_info()
+        label = info["label"]
+
+        if label == "WEEKEND":
+            equity_text, equity_color = "WEEKEND", warn_color
+        elif label == "REGULAR":
+            equity_text, equity_color = "REGULAR", open_color
+        elif label == "EXTENDED":
+            if info["fractional_ok"]:
+                equity_text, equity_color = "EXTENDED", warn_color
             else:
-                self.market_status_lbl.setText("Market: REGULAR")
-                self.market_status_lbl.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {reg_color};")
+                equity_text, equity_color = "EXTENDED (whole only)", warn_color
+        elif label == "OVERNIGHT":
+            equity_text, equity_color = "OVERNIGHT (whole only)", warn_color
+        else:
+            equity_text, equity_color = "CLOSED", closed_color
 
+        if view == "Coinbase":
+            text, color = "Crypto: OPEN 24/7", open_color
+        elif view == "Robinhood":
+            text, color = f"Equities: {equity_text}", equity_color
+        else:
+            text = f"Equities: {equity_text}  ·  Crypto: 24/7"
+            color = equity_color if label != "REGULAR" else open_color
+
+        self.market_status_lbl.setText(text)
+        self.market_status_lbl.setStyleSheet(
+            f"font-size: {ui_px(14)}px; font-weight: 600; color: {color}; "
+            f"padding: {ui_px(2)}px {ui_px(10)}px {ui_px(2)}px {ui_px(8)}px;"
+        )
+        self.market_status_lbl.setToolTip(
+            "Robinhood equities (ET):\n"
+            "• Regular 9:30am–4pm — fractionals OK\n"
+            "• Extended 7–9:30am & 4–8pm — fractionals until ~7:30pm after-hours\n"
+            "• Overnight 8pm–7am — whole shares only (no fractionals)\n"
+            "Coinbase crypto trades 24/7."
+            if view != "Coinbase"
+            else "Coinbase Advanced crypto markets are open 24/7."
+        )
     def safe_delay(self, ms):
         loop = QEventLoop()
         QTimer.singleShot(ms, loop.quit)
@@ -1470,16 +2093,21 @@ class MarketAdvisorGUI(QMainWindow):
     def build_auto_trader_banner(self):
         self.at_status_frame = QFrame()
         self.at_status_frame.setObjectName("autoTraderBanner")
+        # Fixed vertical size so arming Auto-Trader never steals Home's layout room
+        self.at_status_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.at_status_frame.setMaximumHeight(ui_px(48))
         at_layout = QHBoxLayout(self.at_status_frame)
-        at_layout.setContentsMargins(12, 6, 12, 6)
-        at_layout.setSpacing(12)
+        at_layout.setContentsMargins(ui_px(10), ui_px(4), ui_px(10), ui_px(4))
+        at_layout.setSpacing(ui_px(8))
+        self._at_banner_layout = at_layout
 
         self.bot_animator = BotActivityAnimator(self.at_status_frame)
         self.bot_animator.set_dark(self.dark_mode)
 
-        self.at_status_lbl = QLabel("🤖 💤 Auto-Trader Offline")
+        self.at_status_lbl = QLabel("Auto-Trader Offline")
         self.at_status_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        self.at_status_lbl.setWordWrap(True)
+        self.at_status_lbl.setWordWrap(False)  # wrapping doubled banner height and clipped Home
+        self.at_status_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         at_layout.addWidget(self.bot_animator, 0)
         at_layout.addWidget(self.at_status_lbl, 1)
@@ -1491,72 +2119,67 @@ class MarketAdvisorGUI(QMainWindow):
         top_bar = QFrame()
         top_bar.setObjectName("topBar")
         top_bar.setFrameShape(QFrame.StyledPanel)
-        
-        layout = QHBoxLayout(top_bar)
-        layout.setContentsMargins(15, 8, 15, 8)
 
-        # Broker Switcher Dropdown
+        layout = QHBoxLayout(top_bar)
+        layout.setContentsMargins(ui_px(12), ui_px(8), ui_px(12), ui_px(8))
+        layout.setSpacing(ui_px(10))
+        self._top_bar_layout = layout
+
         self.broker_dropdown = QComboBox()
         self.broker_dropdown.setObjectName("brokerDropdown")
         self.broker_dropdown.addItems(["All", "Robinhood", "Coinbase"])
         self.broker_dropdown.setCurrentText("All")
-        self.broker_dropdown.setFixedWidth(130)
+        self.broker_dropdown.setFixedWidth(ui_px(120))
         self.broker_dropdown.setMaxVisibleItems(5)
         self.broker_dropdown.currentTextChanged.connect(self.on_broker_switch)
 
         self.portfolio_val_lbl = QLabel("Portfolio: $0.00")
-        self.portfolio_val_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #2b78e4;")
+        self.portfolio_val_lbl.setStyleSheet(metric_label_style(theme_colors(self.dark_mode)["accent"], 16))
+        self.portfolio_val_lbl.setMinimumWidth(ui_px(130))
 
         self.buying_power_lbl = QLabel("Buying Power: $0.00")
-        self.buying_power_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #2e7d32;")
+        self.buying_power_lbl.setStyleSheet(metric_label_style(theme_colors(self.dark_mode)["success"], 16))
+        self.buying_power_lbl.setMinimumWidth(ui_px(150))
 
-        self.daily_profit_lbl = QLabel("Day P&L: Loading...")
-        self.daily_profit_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #757575;")
+        self.daily_profit_lbl = QLabel("Day P&L: …")
+        self.daily_profit_lbl.setStyleSheet(metric_label_style(theme_colors(self.dark_mode)["neutral"], 16))
+        self.daily_profit_lbl.setMinimumWidth(ui_px(120))
 
-        self.market_status_lbl = QLabel("Market: Checking...")
-        self.market_status_lbl.setStyleSheet("font-size: 15px; font-weight: bold;")
-
-        self.refresh_bal_btn = QPushButton("🔄 Refresh Balances")
-        self.refresh_bal_btn.setFixedWidth(135)
-        self.refresh_bal_btn.setMinimumHeight(36)
-        self.refresh_bal_btn.clicked.connect(self.refresh_account_balances)
-
-        self.paper_mode_btn = QPushButton("🧪 Mode: PAPER" if self.paper_mode else "🟢 Mode: LIVE")
-        self.paper_mode_btn.setFixedWidth(130)
-        self.paper_mode_btn.setMinimumHeight(36)
+        self.paper_mode_btn = QPushButton("Mode: PAPER" if self.paper_mode else "Mode: LIVE")
+        self.paper_mode_btn.setMinimumHeight(ui_px(34))
+        self.paper_mode_btn.setMinimumWidth(ui_px(108))
         self.paper_mode_btn.setStyleSheet(
             top_bar_btn_style("#E65100") if self.paper_mode else top_bar_btn_style("#1B5E20")
         )
         self.paper_mode_btn.clicked.connect(self.toggle_paper_mode)
 
-        self.auto_trade_btn = QPushButton("🤖 Auto-Trader: OFF")
-        self.auto_trade_btn.setFixedWidth(150)
-        self.auto_trade_btn.setMinimumHeight(36)
+        self.dark_mode_btn = QPushButton("Light" if self.dark_mode else "Dark")
+        self.dark_mode_btn.setMinimumHeight(ui_px(34))
+        self.dark_mode_btn.setMinimumWidth(ui_px(68))
+        self.dark_mode_btn.setToolTip("Toggle light / dark theme")
+        self.dark_mode_btn.clicked.connect(self.toggle_dark_mode)
+
+        self.auto_trade_btn = QPushButton("Auto-Trader: OFF")
+        self.auto_trade_btn.setMinimumHeight(ui_px(34))
+        self.auto_trade_btn.setMinimumWidth(ui_px(138))
         self.auto_trade_btn.setStyleSheet(top_bar_btn_style("#424242"))
         self.auto_trade_btn.clicked.connect(self.toggle_auto_trade)
 
-        layout.addWidget(QLabel("Broker:"))
+        broker_lbl = QLabel("Broker")
+        broker_lbl.setObjectName("brokerHint")
+        broker_lbl.setStyleSheet(
+            f"color: {theme_colors(self.dark_mode)['muted']}; font-size: {ui_px(13)}px; font-weight: 600;"
+        )
+        self.broker_hint_lbl = broker_lbl
+        layout.addWidget(broker_lbl)
         layout.addWidget(self.broker_dropdown)
-        layout.addSpacing(15)
+        layout.addSpacing(ui_px(4))
         layout.addWidget(self.portfolio_val_lbl)
-        layout.addSpacing(15)
         layout.addWidget(self.buying_power_lbl)
-        layout.addSpacing(15)
         layout.addWidget(self.daily_profit_lbl)
-        layout.addSpacing(15)
-        layout.addWidget(self.market_status_lbl)
-        layout.addSpacing(15)
-        layout.addWidget(self.refresh_bal_btn)
-        layout.addSpacing(15)
+        layout.addStretch(1)
         layout.addWidget(self.paper_mode_btn)
-
-        self.dark_mode_btn = QPushButton("☀️ Light Mode" if self.dark_mode else "🌙 Dark Mode")
-        self.dark_mode_btn.setFixedWidth(120)
-        self.dark_mode_btn.setMinimumHeight(36)
-        self.dark_mode_btn.clicked.connect(self.toggle_dark_mode)
         layout.addWidget(self.dark_mode_btn)
-
-        layout.addStretch()
         layout.addWidget(self.auto_trade_btn)
 
         self.main_layout.addWidget(top_bar)
@@ -1584,6 +2207,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.active_broker_name = broker_name
         self.log_event(f"Switched view to: {broker_name}")
         self._apply_view_mode_tabs()
+        self.update_market_status()
         self._refresh_top_bar_from_cache()
         self.refresh_account_balances()
         self.manual_portfolio_reload(and_score=True, force=True)
@@ -1599,8 +2223,8 @@ class MarketAdvisorGUI(QMainWindow):
                 cur = totals.get(name, {}).get('p_val', 0.0)
                 if start is not None and start > 0:
                     pl_val += cur - start
-            self.portfolio_val_lbl.setText(f"Combined: {format_money(p_val)}")
-            self.buying_power_lbl.setText(f"Combined Cash: {format_money(bp)}")
+            self.portfolio_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
+            self.buying_power_lbl.setText(f"Buying Power: {format_money(bp)}")
         else:
             name = self.view_mode
             p_val = totals.get(name, {}).get('p_val', 0.0)
@@ -1612,105 +2236,215 @@ class MarketAdvisorGUI(QMainWindow):
 
         pl_str = format_money(abs(pl_val))
         pl_display = f"+{pl_str}" if pl_val >= 0 else f"-{pl_str}"
-        color = "#00E676" if pl_val > 0.001 else ("#FF5252" if pl_val < -0.001 else ("#E0E0E0" if self.dark_mode else "#616161"))
+        tc = theme_colors(self.dark_mode)
+        color = tc["success"] if pl_val > 0.001 else (
+            tc["danger"] if pl_val < -0.001 else tc["neutral"]
+        )
         self.daily_profit_lbl.setText(f"Day P&L: {pl_display}")
-        self.daily_profit_lbl.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {color};")
+        self.daily_profit_lbl.setStyleSheet(metric_label_style(color, 16))
+        # Keep portfolio / cash accents readable after theme flips
+        if hasattr(self, "portfolio_val_lbl"):
+            # Preserve current text; only refresh color weight
+            self.portfolio_val_lbl.setStyleSheet(metric_label_style(tc["accent"], 16))
+        if hasattr(self, "buying_power_lbl"):
+            self.buying_power_lbl.setStyleSheet(metric_label_style(tc["success"], 16))
+        if hasattr(self, "broker_hint_lbl"):
+            self.broker_hint_lbl.setStyleSheet(
+                f"color: {tc['muted']}; font-size: {ui_px(13)}px; font-weight: 600;"
+            )
+
+    def _style_home_cards(self):
+        """Theme-aware Home card surfaces (also re-run on dark/light toggle)."""
+        if self.dark_mode:
+            panel, line, mute = "#1A1D24", "#2A2F3A", "#9AA0A6"
+            title_fg = "#E8EAED"
+        else:
+            panel, line, mute = "#FFFFFF", "#C5CAD3", "#3C4043"
+            title_fg = "#1A1A1A"
+        tc = theme_colors(self.dark_mode)
+        # Extra padding-top so title + large net-worth font don't collide / clip
+        master = (
+            f"QGroupBox {{ font-size: {ui_px(15)}px; font-weight: 600; color: {title_fg}; "
+            f"background-color: {panel}; border: 1px solid {tc['accent']}; "
+            f"border-radius: {ui_px(UI_RADIUS_CARD)}px; margin-top: {ui_px(14)}px; "
+            f"padding-top: {ui_px(20)}px; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: {ui_px(16)}px; "
+            f"padding: 0 {ui_px(6)}px; }}"
+        )
+        broker = (
+            f"QGroupBox {{ font-size: {ui_px(13)}px; font-weight: 600; color: {title_fg}; "
+            f"background-color: {panel}; border: 1px solid {line}; "
+            f"border-radius: {ui_px(UI_RADIUS_CARD)}px; margin-top: {ui_px(12)}px; "
+            f"padding-top: {ui_px(16)}px; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: {ui_px(14)}px; "
+            f"padding: 0 {ui_px(5)}px; color: {mute}; }}"
+        )
+        if hasattr(self, "master_card"):
+            self.master_card.setStyleSheet(master)
+        if hasattr(self, "rh_card"):
+            self.rh_card.setStyleSheet(broker)
+        if hasattr(self, "cb_card"):
+            self.cb_card.setStyleSheet(broker)
+        if hasattr(self, "home_master_val_lbl"):
+            self.home_master_val_lbl.setStyleSheet(metric_label_style(tc["accent"], 36))
+            # Stylesheet fonts don't inflate sizeHint — pin height so $120 isn't clipped
+            self.home_master_val_lbl.setMinimumHeight(ui_px(48))
+        if hasattr(self, "home_master_bp_lbl"):
+            self.home_master_bp_lbl.setStyleSheet(metric_label_style(tc["success"], 16))
+            self.home_master_bp_lbl.setMinimumHeight(ui_px(24))
+        if hasattr(self, "home_master_pl_lbl"):
+            self.home_master_pl_lbl.setMinimumHeight(ui_px(26))
+        for name in (
+            "home_rh_val_lbl", "home_rh_bp_lbl",
+            "home_cb_val_lbl", "home_cb_bp_lbl",
+        ):
+            lbl = getattr(self, name, None)
+            if lbl is not None:
+                lbl.setStyleSheet(
+                    f"font-size: {ui_px(14)}px; font-weight: 600; padding: {ui_px(4)}px 2px;"
+                )
+                lbl.setMinimumHeight(ui_px(24))
+        for name in ("home_rh_pl_lbl", "home_cb_pl_lbl"):
+            lbl = getattr(self, name, None)
+            if lbl is not None:
+                lbl.setMinimumHeight(ui_px(24))
 
     def build_home_screen(self):
         tab = QWidget()
-        layout = QVBoxLayout()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scroll when Auto-Trader banner steals vertical room — never clip Net Worth / broker rows
+        scroll = CompactScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(ui_px(18), ui_px(14), ui_px(18), ui_px(14))
+        layout.setSpacing(ui_px(12))
+        self._home_layout = layout
         
-        title = QLabel("🏛️ Master Portfolio Command Center")
+        title = QLabel("Master Portfolio")
+        title.setObjectName("homeTitle")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 26px; font-weight: bold; margin-top: 15px; margin-bottom: 25px;")
+        title.setStyleSheet(
+            f"font-size: {ui_px(20)}px; font-weight: 600; "
+            f"margin: {ui_px(4)}px 0 {ui_px(8)}px 0;"
+        )
         layout.addWidget(title)
 
         # Master Combined Banner
-        self.master_card = QGroupBox("Global Aggregated Net Worth")
-        self.master_card.setStyleSheet("QGroupBox { font-size: 16px; font-weight: bold; border: 2px solid #2b78e4; border-radius: 6px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 15px; padding: 0 5px; }")
+        self.master_card = QGroupBox("Net Worth")
+        self.master_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         mc_layout = QVBoxLayout()
-        mc_layout.setContentsMargins(20, 20, 20, 20)
+        mc_layout.setContentsMargins(ui_px(18), ui_px(14), ui_px(18), ui_px(14))
+        mc_layout.setSpacing(ui_px(6))
+        self._master_card_layout = mc_layout
         
         self.home_master_val_lbl = QLabel("$0.00")
-        self.home_master_val_lbl.setStyleSheet("font-size: 42px; font-weight: bold; color: #2b78e4;")
         self.home_master_val_lbl.setAlignment(Qt.AlignCenter)
+        self.home_master_val_lbl.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.home_master_val_lbl.setMinimumHeight(ui_px(48))
         
         self.home_master_bp_lbl = QLabel("Combined Liquid Cash: $0.00")
-        self.home_master_bp_lbl.setStyleSheet("font-size: 18px; font-weight: bold; color: #2e7d32;")
         self.home_master_bp_lbl.setAlignment(Qt.AlignCenter)
+        self.home_master_bp_lbl.setMinimumHeight(ui_px(24))
 
         self.home_master_pl_lbl = QLabel("Combined Day P&L: $0.00")
-        self.home_master_pl_lbl.setStyleSheet("font-size: 22px; font-weight: bold; color: #E0E0E0;")
+        self.home_master_pl_lbl.setStyleSheet(metric_label_style(theme_colors(self.dark_mode)["neutral"], 18))
         self.home_master_pl_lbl.setAlignment(Qt.AlignCenter)
+        self.home_master_pl_lbl.setMinimumHeight(ui_px(26))
         
         mc_layout.addWidget(self.home_master_val_lbl)
         mc_layout.addWidget(self.home_master_bp_lbl)
         mc_layout.addWidget(self.home_master_pl_lbl)
         self.master_card.setLayout(mc_layout)
         layout.addWidget(self.master_card)
-        
-        layout.addSpacing(20)
 
         # Broker Line Items Container
         brokers_layout = QVBoxLayout()
-        brokers_layout.setSpacing(15)
+        brokers_layout.setSpacing(ui_px(12))
+
+        def _pack_broker_metrics(hbox, labels):
+            """Keep portfolio / BP / P&L grouped — don't fling them to opposite edges on wide windows."""
+            for lbl in labels:
+                lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Minimum)
+                lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                lbl.setMinimumHeight(ui_px(24))
+                hbox.addWidget(lbl)
+            hbox.addStretch(1)
 
         # Robinhood Line Item
-        self.rh_card = QGroupBox("Robinhood (Equities & Crypto)")
-        self.rh_card.setStyleSheet("QGroupBox { font-size: 14px; font-weight: bold; border: 1px solid #666666; border-radius: 4px; margin-top: 8px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }")
+        self.rh_card = QGroupBox("Robinhood · Equities & Crypto")
+        self.rh_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         rh_layout = QHBoxLayout()
-        rh_layout.setContentsMargins(15, 15, 15, 15)
+        rh_layout.setContentsMargins(ui_px(16), ui_px(12), ui_px(16), ui_px(12))
+        rh_layout.setSpacing(ui_px(28))
+        self._rh_card_layout = rh_layout
         
         self.home_rh_val_lbl = QLabel("Portfolio: $0.00")
-        self.home_rh_val_lbl.setStyleSheet("font-size: 16px;")
+        self.home_rh_val_lbl.setObjectName("homeBrokerMetric")
+        self.home_rh_val_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
         self.home_rh_bp_lbl = QLabel("Buying Power: $0.00")
-        self.home_rh_bp_lbl.setStyleSheet("font-size: 16px;")
+        self.home_rh_bp_lbl.setObjectName("homeBrokerMetric")
+        self.home_rh_bp_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
         self.home_rh_pl_lbl = QLabel("Day P&L: $0.00")
-        self.home_rh_pl_lbl.setStyleSheet("font-size: 16px;")
-        
-        rh_layout.addWidget(self.home_rh_val_lbl)
-        rh_layout.addWidget(self.home_rh_bp_lbl)
-        rh_layout.addWidget(self.home_rh_pl_lbl)
+        self.home_rh_pl_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
+        _pack_broker_metrics(
+            rh_layout,
+            (self.home_rh_val_lbl, self.home_rh_bp_lbl, self.home_rh_pl_lbl),
+        )
         self.rh_card.setLayout(rh_layout)
         brokers_layout.addWidget(self.rh_card)
 
         # Coinbase Line Item
-        self.cb_card = QGroupBox("Coinbase Advanced (Crypto Only)")
-        self.cb_card.setStyleSheet("QGroupBox { font-size: 14px; font-weight: bold; border: 1px solid #666666; border-radius: 4px; margin-top: 8px; } QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }")
+        self.cb_card = QGroupBox("Coinbase Advanced · Crypto")
+        self.cb_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         cb_layout = QHBoxLayout()
-        cb_layout.setContentsMargins(15, 15, 15, 15)
+        cb_layout.setContentsMargins(ui_px(16), ui_px(12), ui_px(16), ui_px(12))
+        cb_layout.setSpacing(ui_px(28))
+        self._cb_card_layout = cb_layout
         
         self.home_cb_val_lbl = QLabel("Portfolio: $0.00")
-        self.home_cb_val_lbl.setStyleSheet("font-size: 16px;")
+        self.home_cb_val_lbl.setObjectName("homeBrokerMetric")
+        self.home_cb_val_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
         self.home_cb_bp_lbl = QLabel("Buying Power: $0.00")
-        self.home_cb_bp_lbl.setStyleSheet("font-size: 16px;")
+        self.home_cb_bp_lbl.setObjectName("homeBrokerMetric")
+        self.home_cb_bp_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
         self.home_cb_pl_lbl = QLabel("Day P&L: $0.00")
-        self.home_cb_pl_lbl.setStyleSheet("font-size: 16px;")
-        
-        cb_layout.addWidget(self.home_cb_val_lbl)
-        cb_layout.addWidget(self.home_cb_bp_lbl)
-        cb_layout.addWidget(self.home_cb_pl_lbl)
+        self.home_cb_pl_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
+        _pack_broker_metrics(
+            cb_layout,
+            (self.home_cb_val_lbl, self.home_cb_bp_lbl, self.home_cb_pl_lbl),
+        )
         self.cb_card.setLayout(cb_layout)
         brokers_layout.addWidget(self.cb_card)
 
         layout.addLayout(brokers_layout)
-        layout.addSpacing(16)
 
-        journal_hdr = QLabel("Recent Trades (last 20)")
-        journal_hdr.setStyleSheet("font-size: 14px; font-weight: bold;")
+        journal_hdr = QLabel("Recent Trades")
+        journal_hdr.setObjectName("sectionHeader")
+        journal_hdr.setStyleSheet(section_header_style())
         layout.addWidget(journal_hdr)
 
         self.recent_trades_table = QTableWidget(0, 7)
         self.recent_trades_table.setHorizontalHeaderLabels(
             ["Time", "Broker", "Side", "Ticker", "Price", "Status", "Confirmed"]
         )
-        self.recent_trades_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.recent_trades_table.setMaximumHeight(220)
-        layout.addWidget(self.recent_trades_table)
-        layout.addStretch()
+        polish_trades_header(self.recent_trades_table)
+        self.recent_trades_table.setMinimumHeight(ui_px(140))
+        self.recent_trades_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        polish_table(self.recent_trades_table)
+        layout.addWidget(self.recent_trades_table, 1)
 
-        tab.setLayout(layout)
-        self.tabs.addTab(tab, "Home Center")
+        self._style_home_cards()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        self.tabs.addTab(tab, "Home")
         QTimer.singleShot(0, self.refresh_recent_trades)
 
     def refresh_recent_trades(self):
@@ -1735,8 +2469,10 @@ class MarketAdvisorGUI(QMainWindow):
     def build_portfolio_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
-        header = QLabel("📊 Active Portfolio Holdings")
-        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.setContentsMargins(16, 12, 16, 12)
+        header = QLabel("Portfolio Holdings")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
         layout.addWidget(header)
 
         select_bar = QHBoxLayout()
@@ -1744,7 +2480,7 @@ class MarketAdvisorGUI(QMainWindow):
         select_all_btn.clicked.connect(lambda: self.toggle_all_rows(self.portfolio_table, Qt.Checked))
         deselect_all_btn = QPushButton("Deselect All")
         deselect_all_btn.clicked.connect(lambda: self.toggle_all_rows(self.portfolio_table, Qt.Unchecked))
-        refresh_holdings_btn = QPushButton("🔄 Reload Holdings")
+        refresh_holdings_btn = QPushButton("Reload Holdings")
         refresh_holdings_btn.clicked.connect(self.manual_portfolio_reload)
         
         select_bar.addWidget(select_all_btn)
@@ -1756,15 +2492,18 @@ class MarketAdvisorGUI(QMainWindow):
         self.portfolio_table = QTableWidget(0, 8)
         self.portfolio_table.setHorizontalHeaderLabels(["Broker", "Ticker", "Shares", "Avg Cost", "Current Price", "Total Value", "Portfolio Action", "Trade Status"])
         self.portfolio_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        polish_table(self.portfolio_table)
         layout.addWidget(self.portfolio_table)
         
         scoring_btn = QPushButton("Run Scoring (Selected Only)")
-        scoring_btn.setStyleSheet("background-color: #2b78e4; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        scoring_btn.setProperty("uiBtnKind", "primary")
+        scoring_btn.setStyleSheet(action_btn_style("primary"))
         scoring_btn.clicked.connect(self.manual_score_portfolio)
         layout.addWidget(scoring_btn)
         
         execute_btn = QPushButton("Execute Approved Trades (LIVE - Selected Items Only)")
-        execute_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        execute_btn.setProperty("uiBtnKind", "danger")
+        execute_btn.setStyleSheet(action_btn_style("danger"))
         execute_btn.clicked.connect(lambda: self.execute_portfolio_trades(auto_mode=False))
         layout.addWidget(execute_btn)
         
@@ -1774,8 +2513,10 @@ class MarketAdvisorGUI(QMainWindow):
     def build_crypto_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
-        header = QLabel("🪙 Crypto Momentum Engine")
-        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.setContentsMargins(16, 12, 16, 12)
+        header = QLabel("Crypto Momentum")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
         layout.addWidget(header)
 
         select_bar = QHBoxLayout()
@@ -1792,20 +2533,24 @@ class MarketAdvisorGUI(QMainWindow):
         self.crypto_table = QTableWidget(0, 5)
         self.crypto_table.setHorizontalHeaderLabels(["Ticker", "Asset Type", "Current Price", "Entry Recommendation", "Trade Status"])
         self.crypto_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        polish_table(self.crypto_table)
         layout.addWidget(self.crypto_table)
         
         scan_btn = QPushButton("Manual Scan: Crypto")
-        scan_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        scan_btn.setProperty("uiBtnKind", "success")
+        scan_btn.setStyleSheet(action_btn_style("success"))
         scan_btn.clicked.connect(lambda: self.manual_scan_table(self.crypto_table, self._bg_scan_crypto))
         layout.addWidget(scan_btn)
 
         score_btn = QPushButton("Run Scoring (Selected Only)")
-        score_btn.setStyleSheet("background-color: #2b78e4; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        score_btn.setProperty("uiBtnKind", "primary")
+        score_btn.setStyleSheet(action_btn_style("primary"))
         score_btn.clicked.connect(lambda: self._manual_score_table(self.crypto_table))
         layout.addWidget(score_btn)
 
         execute_btn = QPushButton("Execute Crypto Trades (Selected Only)")
-        execute_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        execute_btn.setProperty("uiBtnKind", "danger")
+        execute_btn.setStyleSheet(action_btn_style("danger"))
         execute_btn.clicked.connect(lambda: self.execute_scanner_trades(self.crypto_table, auto_mode=False))
         layout.addWidget(execute_btn)
         
@@ -1815,8 +2560,10 @@ class MarketAdvisorGUI(QMainWindow):
     def build_penny_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
-        header = QLabel("🚀 Breakout Engine (Penny Stocks & Top Movers)")
-        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.setContentsMargins(16, 12, 16, 12)
+        header = QLabel("Breakouts · Penny & Movers")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
         layout.addWidget(header)
 
         select_bar = QHBoxLayout()
@@ -1833,20 +2580,24 @@ class MarketAdvisorGUI(QMainWindow):
         self.penny_table = QTableWidget(0, 5)
         self.penny_table.setHorizontalHeaderLabels(["Ticker", "Asset Type", "Current Price", "Entry Recommendation", "Trade Status"])
         self.penny_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        polish_table(self.penny_table)
         layout.addWidget(self.penny_table)
         
         scan_btn = QPushButton("Manual Scan: Breakouts")
-        scan_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        scan_btn.setProperty("uiBtnKind", "success")
+        scan_btn.setStyleSheet(action_btn_style("success"))
         scan_btn.clicked.connect(lambda: self.manual_scan_table(self.penny_table, self._bg_scan_penny))
         layout.addWidget(scan_btn)
 
         score_btn = QPushButton("Run Scoring (Selected Only)")
-        score_btn.setStyleSheet("background-color: #2b78e4; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        score_btn.setProperty("uiBtnKind", "primary")
+        score_btn.setStyleSheet(action_btn_style("primary"))
         score_btn.clicked.connect(lambda: self._manual_score_table(self.penny_table))
         layout.addWidget(score_btn)
 
         execute_btn = QPushButton("Execute Breakout Trades (Selected Only)")
-        execute_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        execute_btn.setProperty("uiBtnKind", "danger")
+        execute_btn.setStyleSheet(action_btn_style("danger"))
         execute_btn.clicked.connect(lambda: self.execute_scanner_trades(self.penny_table, auto_mode=False))
         layout.addWidget(execute_btn)
         
@@ -1856,8 +2607,10 @@ class MarketAdvisorGUI(QMainWindow):
     def build_core_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
-        header = QLabel("🏢 Core Engine (ETFs & Large Cap Tech)")
-        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.setContentsMargins(16, 12, 16, 12)
+        header = QLabel("Core · ETFs & Large Cap")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
         layout.addWidget(header)
 
         select_bar = QHBoxLayout()
@@ -1874,20 +2627,24 @@ class MarketAdvisorGUI(QMainWindow):
         self.core_table = QTableWidget(0, 5)
         self.core_table.setHorizontalHeaderLabels(["Ticker", "Asset Type", "Current Price", "Entry Recommendation", "Trade Status"])
         self.core_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        polish_table(self.core_table)
         layout.addWidget(self.core_table)
         
         scan_btn = QPushButton("Manual Scan: Core ETFs")
-        scan_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        scan_btn.setProperty("uiBtnKind", "success")
+        scan_btn.setStyleSheet(action_btn_style("success"))
         scan_btn.clicked.connect(lambda: self.manual_scan_table(self.core_table, self._bg_scan_core))
         layout.addWidget(scan_btn)
 
         score_btn = QPushButton("Run Scoring (Selected Only)")
-        score_btn.setStyleSheet("background-color: #2b78e4; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        score_btn.setProperty("uiBtnKind", "primary")
+        score_btn.setStyleSheet(action_btn_style("primary"))
         score_btn.clicked.connect(lambda: self._manual_score_table(self.core_table))
         layout.addWidget(score_btn)
 
         execute_btn = QPushButton("Execute Core Trades (Selected Only)")
-        execute_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        execute_btn.setProperty("uiBtnKind", "danger")
+        execute_btn.setStyleSheet(action_btn_style("danger"))
         execute_btn.clicked.connect(lambda: self.execute_scanner_trades(self.core_table, auto_mode=False))
         layout.addWidget(execute_btn)
         
@@ -1897,28 +2654,34 @@ class MarketAdvisorGUI(QMainWindow):
     def build_activity_log_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
+        layout.setContentsMargins(16, 12, 16, 12)
         header_bar = QHBoxLayout()
-        header = QLabel("Application & Execution Activity Log")
-        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        header = QLabel("Activity Log")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
 
         filter_lbl = QLabel("Show:")
         self.log_filter_combo = QComboBox()
+        self.log_filter_combo.setObjectName("logFilterCombo")
         self.log_filter_combo.addItems(["All", "Robinhood", "Coinbase"])
-        self.log_filter_combo.setFixedWidth(130)
+        self.log_filter_combo.setFixedWidth(ui_px(130))
         self.log_filter_combo.setToolTip("Filter log lines by broker (All keeps app-wide messages too)")
         self.log_filter_combo.currentTextChanged.connect(self._on_log_filter_changed)
 
         copy_log_btn = QPushButton("Copy Log")
-        copy_log_btn.setFixedWidth(100)
+        copy_log_btn.setObjectName("copyLogBtn")
+        copy_log_btn.setFixedWidth(ui_px(100))
         copy_log_btn.setToolTip("Copy the currently visible (filtered) activity log to the clipboard")
         copy_log_btn.clicked.connect(self.copy_log_to_clipboard)
 
         save_log_btn = QPushButton("Save Log File")
-        save_log_btn.setFixedWidth(120)
+        save_log_btn.setObjectName("saveLogBtn")
+        save_log_btn.setFixedWidth(ui_px(120))
         save_log_btn.clicked.connect(self.save_log_to_file)
 
         clear_log_btn = QPushButton("Clear Log")
-        clear_log_btn.setFixedWidth(100)
+        clear_log_btn.setObjectName("clearLogBtn")
+        clear_log_btn.setFixedWidth(ui_px(100))
         clear_log_btn.clicked.connect(self._clear_activity_log)
 
         header_bar.addWidget(header)
@@ -1938,7 +2701,16 @@ class MarketAdvisorGUI(QMainWindow):
 
     def build_settings_screen(self):
         tab = QWidget()
-        layout = QVBoxLayout()
+        scroll = CompactScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
         # Connections Manager Section
         conn_group = QGroupBox("Broker Connection Manager")
@@ -2047,7 +2819,8 @@ class MarketAdvisorGUI(QMainWindow):
         mon_box.addStretch()
         form_layout.addLayout(mon_box)
         mon_hint = QLabel("Open http://127.0.0.1:<port>/ while the app runs. Use Tailscale for phone access.")
-        mon_hint.setStyleSheet("color: #888; font-size: 11px;")
+        mon_hint.setObjectName("settingsHint")
+        mon_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
         form_layout.addWidget(mon_hint)
 
         alloc_box = QHBoxLayout()
@@ -2167,14 +2940,41 @@ class MarketAdvisorGUI(QMainWindow):
         port_box.addStretch()
         form_layout.addLayout(port_box)
 
+        bal_box = QHBoxLayout()
+        bal_box.addWidget(QLabel("Balance Auto-Refresh (Min 30s):"))
+        self.bal_spin = QSpinBox()
+        self.bal_spin.setRange(30, 3600)
+        self.bal_spin.setValue(int(self.settings.get("interval_balance_refresh", 60)))
+        self.bal_spin.setToolTip("How often equity/cash refresh while the app is open (even if Auto-Trader is off)")
+        bal_box.addWidget(self.bal_spin)
+        bal_box.addStretch()
+        form_layout.addLayout(bal_box)
+
         save_settings_btn = QPushButton("💾 Save Configuration")
-        save_settings_btn.setStyleSheet("background-color: #2b78e4; color: white; font-weight: bold; padding: 8px; margin-top: 15px; border-radius: 4px;")
+        save_settings_btn.setProperty("uiBtnKind", "primary")
+        save_settings_btn.setProperty("uiBtnExtra", "QPushButton { margin-top: 15px; }")
+        save_settings_btn.setStyleSheet(action_btn_style("primary") + "QPushButton { margin-top: 15px; }")
         save_settings_btn.clicked.connect(self.save_custom_settings)
         form_layout.addWidget(save_settings_btn)
 
+        ver_lbl = QLabel(
+            f"{display_name()}"
+            + (f"  ·  {VERSION_NOTE}" if VERSION_NOTE else "")
+        )
+        ver_lbl.setObjectName("settingsVersion")
+        ver_lbl.setWordWrap(True)
+        ver_lbl.setStyleSheet(
+            f"color: #6B7280; font-size: {ui_px(12)}px; margin-top: {ui_px(18)}px;"
+        )
+        form_layout.addWidget(ver_lbl)
+
         layout.addLayout(form_layout)
-        layout.addStretch()
-        tab.setLayout(layout)
+        layout.addStretch(1)
+        scroll.setWidget(inner)
+
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
         self.tabs.addTab(tab, "Settings")
 
     def connect_robinhood(self):
@@ -2334,17 +3134,26 @@ class MarketAdvisorGUI(QMainWindow):
     def _reset_autotrader_banner_style(self):
         if not hasattr(self, 'at_status_frame'):
             return
-        border = "#333333" if self.dark_mode else "#CCCCCC"
+        border = "#2A2F3A" if self.dark_mode else "#D8DCE3"
+        self.at_status_frame.setMaximumHeight(ui_px(48))
         self.at_status_frame.setStyleSheet(
-            f"QFrame#autoTraderBanner {{ background-color: transparent; border: 1px solid {border}; border-radius: 6px; padding: 4px; }}"
+            f"QFrame#autoTraderBanner {{ background-color: transparent; border: 1px solid {border}; "
+            f"border-radius: {ui_px(UI_RADIUS_FRAME)}px; padding: {ui_px(2)}px; }}"
         )
         if hasattr(self, 'at_status_lbl'):
-            self.at_status_lbl.setStyleSheet("font-size: 16px; font-weight: bold; background-color: transparent;")
+            self.at_status_lbl.setStyleSheet(
+                f"font-size: {ui_px(13)}px; font-weight: 600; background-color: transparent;"
+            )
         if hasattr(self, 'bot_animator'):
             self.bot_animator.set_dark(self.dark_mode)
 
     def _set_engine_banner(self, text, accent_color=None):
-        self.at_status_lbl.setText(text)
+        # Keep single-line; long status strings previously wrapped and crushed Home
+        msg = str(text or "")
+        if len(msg) > 110:
+            msg = msg[:107] + "…"
+        self.at_status_lbl.setText(msg)
+        self.at_status_lbl.setToolTip(str(text or ""))
         self._monitor_banner = text
         if hasattr(self, 'bot_animator'):
             self.bot_animator.set_mode_from_banner(text, accent_color)
@@ -2352,7 +3161,8 @@ class MarketAdvisorGUI(QMainWindow):
         if accent_color:
             border = accent_color
             self.at_status_frame.setStyleSheet(
-                f"QFrame#autoTraderBanner {{ background-color: transparent; border: 2px solid {border}; border-radius: 6px; padding: 4px; }}"
+                f"QFrame#autoTraderBanner {{ background-color: transparent; border: 2px solid {border}; "
+                f"border-radius: {ui_px(UI_RADIUS_FRAME)}px; padding: {ui_px(2)}px; }}"
             )
         else:
             self._reset_autotrader_banner_style()
@@ -2364,12 +3174,12 @@ class MarketAdvisorGUI(QMainWindow):
     def _update_autotrade_ui(self):
         active = [b for b, on in self.auto_trade_enabled.items() if on]
         if active:
-            self.auto_trade_btn.setText("🤖 Auto-Trader: ON")
-            self.auto_trade_btn.setStyleSheet(top_bar_btn_style("#d32f2f"))
+            self.auto_trade_btn.setText("Auto-Trader: ON")
+            self.auto_trade_btn.setStyleSheet(top_bar_btn_style(UI_DANGER))
             self.at_status_frame.setVisible(True)
-            self._set_engine_banner("🤖 ⚡ Auto-Trader Armed")
+            self._set_engine_banner("Auto-Trader Armed")
         else:
-            self.auto_trade_btn.setText("🤖 Auto-Trader: OFF")
+            self.auto_trade_btn.setText("Auto-Trader: OFF")
             self.auto_trade_btn.setStyleSheet(top_bar_btn_style("#424242"))
             self.at_status_frame.setVisible(False)
             self._reset_autotrader_banner_style()
@@ -2550,6 +3360,13 @@ class MarketAdvisorGUI(QMainWindow):
                     self.last_core_time[broker_name] = now
 
         self.process_queue()
+
+        # Quiet idle balance poll — keeps top-bar equity/P&L fresh even when auto-trader is off
+        bal_every = int(self.settings.get("interval_balance_refresh", 60) or 60)
+        bal_every = max(30, bal_every)
+        if now - getattr(self, "_last_idle_balance_refresh", 0.0) >= bal_every:
+            self._last_idle_balance_refresh = now
+            self.refresh_account_balances(quiet=True)
 
         # Throttle monitor publish (~every 3s) so the phone page stays fresh
         last_pub = getattr(self, "_monitor_last_publish", 0.0)
@@ -3010,7 +3827,10 @@ class MarketAdvisorGUI(QMainWindow):
         """Place buys on a worker thread (confirm_order sleeps stay off the UI)."""
         broker_name = self.cycle_broker_name
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
-        use_ext = self.is_extended_hours_active()
+        session = self.get_equity_session_info()
+        use_ext = session["use_ext"]
+        market_hours = session["market_hours"]
+        allow_fractional = session["fractional_ok"]
         max_positions = int(self.settings.get("max_open_positions", 8))
         max_buys = int(self.settings.get("max_buys_per_cycle", 2))
         notes = []
@@ -3059,7 +3879,10 @@ class MarketAdvisorGUI(QMainWindow):
             if row_dollars <= 0:
                 notes.append(f"[{broker_name}] Skipping buys — buying power too low ({format_currency(bp)})")
                 break
-            status, spent = self.execute_buy_order(ticker, asset_type, price, row_dollars, offset, use_ext)
+            status, spent = self.execute_buy_order(
+                ticker, asset_type, price, row_dollars, offset, use_ext,
+                market_hours=market_hours, allow_fractional=allow_fractional,
+            )
             ok = "Fail" not in status and "Skipped" not in status
             if ok:
                 held.add(ticker.upper())
@@ -3112,8 +3935,11 @@ class MarketAdvisorGUI(QMainWindow):
     def _bg_execute_sell_batch(self, sell_list):
         """Place sells on a worker thread."""
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
-        use_ext = self.is_extended_hours_active()
-        equity_open = self.is_equity_session_active()
+        session = self.get_equity_session_info()
+        use_ext = session["use_ext"]
+        market_hours = session["market_hours"]
+        allow_fractional = session["fractional_ok"]
+        equity_open = session["equity_tradeable"]
         prior = self._cycle_broker
         fills = []
         notes = []
@@ -3129,7 +3955,8 @@ class MarketAdvisorGUI(QMainWindow):
                     continue
                 status = self.execute_sell_order(
                     ticker, asset_type, item.get("price") or 0.0, item.get("shares") or 0.0,
-                    offset, use_ext
+                    offset, use_ext,
+                    market_hours=market_hours, allow_fractional=allow_fractional,
                 )
                 ok = "Fail" not in status and "Skipped" not in status
                 fills.append({
@@ -3473,7 +4300,7 @@ class MarketAdvisorGUI(QMainWindow):
     def run_core_cycle(self):
         broker = self.cycle_broker_name
         if self._is_broker_auto_trading(broker):
-            self._set_engine_banner(f"🤖 🏢 [{broker}] CORE — scan + score...", "#1E88E5")
+            self._set_engine_banner(f"[{broker}] CORE — scan + score...", UI_ACCENT)
         self.set_working_state(True, "Core scan+score...")
         self.core_table.setRowCount(0)
         self.run_cycle_thread(
@@ -3492,7 +4319,7 @@ class MarketAdvisorGUI(QMainWindow):
                     f"{c.get('ticker')}({float(c.get('score') or 0):.0f})" for c in buy_candidates[:3]
                 )
                 self.log_event(f"[{self.cycle_broker_name}] Ranked {len(buy_candidates)} buys — top: {top}")
-            self._set_engine_banner(f"🤖 💰 [{self.cycle_broker_name}] CORE — executing...", "#1E88E5")
+            self._set_engine_banner(f"[{self.cycle_broker_name}] CORE — executing...", UI_ACCENT)
             self.execute_scanner_trades(self.core_table, auto_mode=True, buy_candidates=buy_candidates)
         else:
             self.set_working_state(False)
@@ -3564,7 +4391,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.paper_mode = not self.paper_mode
         self.settings["paper_mode"] = self.paper_mode
         save_settings(self.settings)
-        self.paper_mode_btn.setText("🧪 Mode: PAPER" if self.paper_mode else "🟢 Mode: LIVE")
+        self.paper_mode_btn.setText("Mode: PAPER" if self.paper_mode else "Mode: LIVE")
         self.paper_mode_btn.setStyleSheet(
             top_bar_btn_style("#E65100") if self.paper_mode else top_bar_btn_style("#1B5E20")
         )
@@ -3573,9 +4400,11 @@ class MarketAdvisorGUI(QMainWindow):
         self.dark_mode = not self.dark_mode
         self.settings["dark_mode"] = self.dark_mode
         save_settings(self.settings)
-        self.dark_mode_btn.setText("☀️ Light Mode" if self.dark_mode else "🌙 Dark Mode")
+        self.dark_mode_btn.setText("Light" if self.dark_mode else "Dark")
         self.apply_theme()
+        self._style_home_cards()
         self._reset_autotrader_banner_style()
+        self.update_market_status()
 
     def save_custom_settings(self):
         self.settings["discord_webhook"] = self.discord_input.text().strip()
@@ -3599,6 +4428,8 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["interval_penny"] = self.p_spin.value()
         self.settings["interval_core"] = self.core_spin.value()
         self.settings["interval_portfolio"] = self.port_spin.value()
+        if hasattr(self, "bal_spin"):
+            self.settings["interval_balance_refresh"] = int(self.bal_spin.value())
         save_settings(self.settings)
         self._start_web_monitor()
         QMessageBox.information(self, "Settings Saved", "Configuration updated successfully!")
@@ -3660,161 +4491,266 @@ class MarketAdvisorGUI(QMainWindow):
     def setup_status_bar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self.status_bar.setMinimumHeight(ui_px(28))
         status_widget = QWidget()
         layout = QHBoxLayout(status_widget)
-        layout.setContentsMargins(5, 0, 10, 0)
+        layout.setContentsMargins(ui_px(8), ui_px(4), ui_px(12), ui_px(4))
+        layout.setSpacing(ui_px(10))
+        self._status_layout = layout
         self.spinner = WorkingSpinner(self)
         self.status_text = QLabel("System Ready")
-        self.status_text.setStyleSheet("font-weight: bold;")
-        self.status_text.setMinimumWidth(400)
+        self.status_text.setStyleSheet(
+            f"font-size: {ui_px(14)}px; font-weight: 600; color: {theme_colors(self.dark_mode)['text']};"
+        )
+        self.status_text.setMinimumWidth(ui_px(200))
         layout.addWidget(self.spinner)
         layout.addWidget(self.status_text, 1)
+
+        self.market_status_lbl = QLabel("…")
+        self.market_status_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.market_status_lbl.setMinimumWidth(ui_px(200))
+        layout.addWidget(self.market_status_lbl, 0)
+
         self.status_bar.addPermanentWidget(status_widget, 1)
+        self.update_market_status()
 
     def set_working_state(self, is_working, message=""):
+        tc = theme_colors(self.dark_mode)
         if is_working:
             self.spinner.start()
             self.status_text.setText(f"Working: {message}")
         else:
             self.spinner.stop()
             self.status_text.setText(message if message else "System Ready")
+        self.status_text.setStyleSheet(
+            f"font-size: {ui_px(14)}px; font-weight: 600; color: {tc['text']};"
+        )
         QApplication.processEvents()
 
     def apply_theme(self):
         arrow = combo_arrow_path(self.dark_mode)
+        accent = theme_colors(self.dark_mode)["accent"]
         if self.dark_mode:
             qss = f"""
-                QMainWindow, QWidget {{ background-color: #121212; color: #E0E0E0; }}
+                QMainWindow, QWidget {{ background-color: #0F1115; color: #E8EAED; }}
                 QLabel {{ background-color: transparent; }}
                 QFrame {{ background-color: transparent; }}
-                QFrame#topBar {{ background-color: #1E1E1E; border: 1px solid #333333; border-radius: 6px; }}
-                QFrame#autoTraderBanner {{ background-color: transparent; border: 1px solid #333333; border-radius: 6px; }}
-                QTabWidget::pane {{ border: 1px solid #333333; background-color: #121212; }}
-                QTabBar::tab {{ background-color: #1E1E1E; color: #A0A0A0; padding: 8px 20px; border: 1px solid #333333; min-width: 100px; }}
-                QTabBar::tab:selected {{ background-color: #2D2D2D; color: #FFFFFF; font-weight: bold; border-bottom: 2px solid #2b78e4; }}
-                QTableWidget {{
-                    background-color: #1E1E1E; color: #E0E0E0; gridline-color: #333333;
-                    border: 1px solid #333333; alternate-background-color: #242424;
+                QFrame#topBar {{
+                    background-color: #1A1D24; border: 1px solid #2A2F3A;
+                    border-radius: {ui_px(UI_RADIUS_FRAME)}px;
                 }}
-                QHeaderView::section {{ background-color: #2D2D2D; color: #FFFFFF; padding: 4px; border: 1px solid #333333; font-weight: bold; }}
-                QTableCornerButton::section {{ background-color: #2D2D2D; border: 1px solid #333333; }}
-                QPushButton {{ background-color: #2D2D2D; color: #FFFFFF; border: 1px solid #444444; border-radius: 4px; padding: 6px 12px; }}
-                QPushButton:hover {{ background-color: #3D3D3D; }}
+                QFrame#autoTraderBanner {{
+                    background-color: transparent; border: 1px solid #2A2F3A;
+                    border-radius: {ui_px(UI_RADIUS_FRAME)}px;
+                }}
+                QTabWidget::pane {{
+                    border: 1px solid #2A2F3A; background-color: #0F1115;
+                    border-radius: {ui_px(UI_RADIUS_INPUT)}px; top: -1px;
+                }}
+                QTabBar::tab {{
+                    background-color: #151820; color: #9AA0A6;
+                    padding: {ui_px(9)}px {ui_px(18)}px; margin-right: {ui_px(3)}px;
+                    border: 1px solid #2A2F3A; border-bottom: none;
+                    border-top-left-radius: {ui_px(8)}px; border-top-right-radius: {ui_px(8)}px;
+                    min-width: {ui_px(88)}px;
+                }}
+                QTabBar::tab:selected {{
+                    background-color: #1A1D24; color: #FFFFFF; font-weight: 600;
+                    border-bottom: 2px solid {accent};
+                }}
+                QTabBar::tab:hover:!selected {{ background-color: #1C2129; color: #E8EAED; }}
+                QTableWidget {{
+                    background-color: #1A1D24; color: #E8EAED; gridline-color: #2A2F3A;
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    alternate-background-color: #151820; outline: 0;
+                }}
+                QHeaderView::section {{
+                    background-color: #22262E; color: #9AA0A6; padding: {ui_px(8)}px {ui_px(6)}px;
+                    border: none; border-bottom: 1px solid #2A2F3A;
+                    font-weight: 600; font-size: {ui_px(11)}px;
+                }}
+                QTableCornerButton::section {{ background-color: #22262E; border: none; }}
+                QPushButton {{
+                    background-color: #22262E; color: #E8EAED;
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_BTN)}px;
+                    padding: {ui_px(7)}px {ui_px(14)}px;
+                }}
+                QPushButton:hover {{ background-color: #2A303A; border-color: #3A4150; }}
+                QPushButton:pressed {{ background-color: #1A1D24; }}
                 QLineEdit, QDoubleSpinBox, QSpinBox, QTextEdit {{
-                    background-color: #1E1E1E; color: #FFFFFF; border: 1px solid #444444;
-                    selection-background-color: #2b78e4; selection-color: #FFFFFF;
+                    background-color: #1A1D24; color: #E8EAED;
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    padding: {ui_px(5)}px {ui_px(8)}px;
+                    selection-background-color: {accent}; selection-color: #FFFFFF;
                 }}
                 QComboBox {{
-                    background-color: #1E1E1E; color: #FFFFFF; border: 1px solid #666666;
-                    padding: 4px 28px 4px 8px; font-weight: bold; min-height: 22px;
+                    background-color: #1A1D24; color: #E8EAED;
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    padding: {ui_px(5)}px {ui_px(28)}px {ui_px(5)}px {ui_px(10)}px; font-weight: 600; min-height: {ui_px(24)}px;
                 }}
-                QComboBox:hover {{ border: 1px solid #888888; }}
+                QComboBox:hover {{ border: 1px solid {UI_ACCENT_HOVER}; }}
                 QComboBox::drop-down {{
-                    subcontrol-origin: padding;
-                    subcontrol-position: top right;
-                    width: 26px;
-                    border-left: 1px solid #555555;
-                    background-color: #2D2D2D;
+                    subcontrol-origin: padding; subcontrol-position: top right;
+                    width: {ui_px(26)}px; border-left: 1px solid #2A2F3A;
+                    background-color: #22262E;
+                    border-top-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    border-bottom-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
                 }}
                 QComboBox::down-arrow {{
-                    image: url("{arrow}");
-                    width: 12px;
-                    height: 8px;
+                    image: url("{arrow}"); width: {ui_px(12)}px; height: {ui_px(8)}px;
                 }}
                 QComboBox QAbstractItemView {{
-                    background-color: #1E1E1E;
-                    color: #FFFFFF;
-                    border: 1px solid #555555;
-                    selection-background-color: #2b78e4;
-                    selection-color: #FFFFFF;
-                    outline: 0;
+                    background-color: #1A1D24; color: #E8EAED;
+                    border: 1px solid #2A2F3A;
+                    selection-background-color: {accent}; selection-color: #FFFFFF;
+                    outline: 0; border-radius: {ui_px(6)}px;
                 }}
                 QComboBox QAbstractItemView::item {{
-                    background-color: #1E1E1E;
-                    color: #FFFFFF;
-                    min-height: 26px;
-                    padding: 4px 8px;
+                    background-color: #1A1D24; color: #E8EAED;
+                    min-height: {ui_px(28)}px; padding: {ui_px(4)}px {ui_px(8)}px;
                 }}
                 QComboBox QAbstractItemView::item:selected {{
-                    background-color: #2b78e4;
-                    color: #FFFFFF;
+                    background-color: {accent}; color: #FFFFFF;
                 }}
                 QComboBox QAbstractItemView::item:hover {{
-                    background-color: #333333;
-                    color: #FFFFFF;
+                    background-color: #22262E; color: #E8EAED;
                 }}
-                QGroupBox {{ border: 1px solid #555555; margin-top: 10px; font-weight: bold; background-color: transparent; }}
-                QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 3px; }}
-                QStatusBar {{ color: #B0B0B0; }}
+                QGroupBox {{
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_CARD)}px;
+                    margin-top: {ui_px(12)}px; font-weight: 600; background-color: #1A1D24;
+                    padding-top: {ui_px(6)}px;
+                }}
+                QGroupBox::title {{ subcontrol-origin: margin; left: {ui_px(12)}px; padding: 0 {ui_px(4)}px; }}
+                QStatusBar {{
+                    color: #E8EAED; font-size: {ui_px(14)}px; min-height: {ui_px(28)}px;
+                    padding: {ui_px(2)}px {ui_px(4)}px;
+                }}
+                QCheckBox {{ spacing: {ui_px(8)}px; }}
+                QScrollBar:vertical {{
+                    background: #0F1115; width: {ui_px(10)}px; margin: 0; border: none;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: #2A2F3A; border-radius: {ui_px(5)}px; min-height: {ui_px(24)}px;
+                }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             """
         else:
             qss = f"""
-                QMainWindow, QWidget {{ background-color: #FFFFFF; color: #212121; }}
-                QLabel {{ background-color: transparent; }}
+                QMainWindow, QWidget {{ background-color: #F7F8FA; color: #1A1A1A; }}
+                QLabel {{ background-color: transparent; color: #1A1A1A; }}
                 QFrame {{ background-color: transparent; }}
-                QFrame#topBar {{ background-color: #F5F5F5; border: 1px solid #DCDCDC; border-radius: 6px; }}
-                QFrame#autoTraderBanner {{ background-color: transparent; border: 1px solid #CCCCCC; border-radius: 6px; }}
-                QTabWidget::pane {{ border: 1px solid #CCCCCC; background-color: #FFFFFF; }}
-                QTabBar::tab {{ background-color: #EEEEEE; color: #616161; padding: 8px 20px; border: 1px solid #CCCCCC; min-width: 100px; }}
-                QTabBar::tab:selected {{ background-color: #FFFFFF; color: #212121; font-weight: bold; border-bottom: 2px solid #2b78e4; }}
-                QTableWidget {{
-                    background-color: #FFFFFF; color: #212121; gridline-color: #E0E0E0;
-                    border: 1px solid #BDBDBD; alternate-background-color: #FAFAFA;
+                QFrame#topBar {{
+                    background-color: #FFFFFF; border: 1px solid #C5CAD3;
+                    border-radius: {ui_px(UI_RADIUS_FRAME)}px;
                 }}
-                QHeaderView::section {{ background-color: #EEEEEE; color: #212121; padding: 4px; border: 1px solid #BDBDBD; font-weight: bold; }}
-                QTableCornerButton::section {{ background-color: #EEEEEE; border: 1px solid #BDBDBD; }}
-                QPushButton {{ background-color: #F5F5F5; color: #212121; border: 1px solid #BDBDBD; border-radius: 4px; padding: 6px 12px; }}
-                QPushButton:hover {{ background-color: #EEEEEE; }}
+                QFrame#autoTraderBanner {{
+                    background-color: transparent; border: 1px solid #C5CAD3;
+                    border-radius: {ui_px(UI_RADIUS_FRAME)}px;
+                }}
+                QTabWidget::pane {{
+                    border: 1px solid #C5CAD3; background-color: #FFFFFF;
+                    border-radius: {ui_px(UI_RADIUS_INPUT)}px; top: -1px;
+                }}
+                QTabBar::tab {{
+                    background-color: #E8EAED; color: #3C4043;
+                    padding: {ui_px(9)}px {ui_px(18)}px; margin-right: {ui_px(3)}px;
+                    border: 1px solid #C5CAD3; border-bottom: none;
+                    border-top-left-radius: {ui_px(8)}px; border-top-right-radius: {ui_px(8)}px;
+                    min-width: {ui_px(88)}px;
+                }}
+                QTabBar::tab:selected {{
+                    background-color: #FFFFFF; color: #1A1A1A; font-weight: 600;
+                    border-bottom: 2px solid {accent};
+                }}
+                QTabBar::tab:hover:!selected {{ background-color: #F0F2F5; color: #1A1A1A; }}
+                QTableWidget {{
+                    background-color: #FFFFFF; color: #1A1A1A; gridline-color: #E8EAED;
+                    border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    alternate-background-color: #F7F8FA; outline: 0;
+                }}
+                QHeaderView::section {{
+                    background-color: #EEF0F3; color: #3C4043; padding: {ui_px(8)}px {ui_px(6)}px;
+                    border: none; border-bottom: 1px solid #C5CAD3;
+                    font-weight: 600; font-size: {ui_px(12)}px;
+                }}
+                QTableCornerButton::section {{ background-color: #EEF0F3; border: none; }}
+                QPushButton {{
+                    background-color: #FFFFFF; color: #1A1A1A;
+                    border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_BTN)}px;
+                    padding: {ui_px(7)}px {ui_px(14)}px;
+                }}
+                QPushButton:hover {{ background-color: #F0F2F5; border-color: #9AA0A6; }}
+                QPushButton:pressed {{ background-color: #E8EAED; }}
                 QLineEdit, QDoubleSpinBox, QSpinBox, QTextEdit {{
-                    background-color: #FFFFFF; color: #212121; border: 1px solid #BDBDBD;
-                    selection-background-color: #2b78e4; selection-color: #FFFFFF;
+                    background-color: #FFFFFF; color: #1A1A1A;
+                    border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    padding: {ui_px(5)}px {ui_px(8)}px;
+                    selection-background-color: {accent}; selection-color: #FFFFFF;
                 }}
                 QComboBox {{
-                    background-color: #FFFFFF; color: #212121; border: 1px solid #9E9E9E;
-                    padding: 4px 28px 4px 8px; font-weight: bold; min-height: 22px;
+                    background-color: #FFFFFF; color: #1A1A1A;
+                    border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    padding: {ui_px(5)}px {ui_px(28)}px {ui_px(5)}px {ui_px(10)}px; font-weight: 600; min-height: {ui_px(24)}px;
                 }}
-                QComboBox:hover {{ border: 1px solid #616161; }}
+                QComboBox:hover {{ border: 1px solid {accent}; }}
                 QComboBox::drop-down {{
-                    subcontrol-origin: padding;
-                    subcontrol-position: top right;
-                    width: 26px;
-                    border-left: 1px solid #BDBDBD;
-                    background-color: #F0F0F0;
+                    subcontrol-origin: padding; subcontrol-position: top right;
+                    width: {ui_px(26)}px; border-left: 1px solid #C5CAD3;
+                    background-color: #F0F2F5;
+                    border-top-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    border-bottom-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
                 }}
                 QComboBox::down-arrow {{
-                    image: url("{arrow}");
-                    width: 12px;
-                    height: 8px;
+                    image: url("{arrow}"); width: {ui_px(12)}px; height: {ui_px(8)}px;
                 }}
                 QComboBox QAbstractItemView {{
-                    background-color: #FFFFFF;
-                    color: #212121;
-                    border: 1px solid #BDBDBD;
-                    selection-background-color: #2b78e4;
-                    selection-color: #FFFFFF;
-                    outline: 0;
+                    background-color: #FFFFFF; color: #1A1A1A;
+                    border: 1px solid #C5CAD3;
+                    selection-background-color: {accent}; selection-color: #FFFFFF;
+                    outline: 0; border-radius: {ui_px(6)}px;
                 }}
                 QComboBox QAbstractItemView::item {{
-                    background-color: #FFFFFF;
-                    color: #212121;
-                    min-height: 26px;
-                    padding: 4px 8px;
+                    background-color: #FFFFFF; color: #1A1A1A;
+                    min-height: {ui_px(28)}px; padding: {ui_px(4)}px {ui_px(8)}px;
                 }}
                 QComboBox QAbstractItemView::item:selected {{
-                    background-color: #2b78e4;
-                    color: #FFFFFF;
+                    background-color: {accent}; color: #FFFFFF;
                 }}
-                QGroupBox {{ border: 1px solid #9E9E9E; margin-top: 10px; font-weight: bold; background-color: transparent; }}
-                QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 3px; }}
-                QStatusBar {{ color: #616161; }}
+                QGroupBox {{
+                    border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_CARD)}px;
+                    margin-top: {ui_px(12)}px; font-weight: 600; background-color: #FFFFFF;
+                    padding-top: {ui_px(6)}px; color: #1A1A1A;
+                }}
+                QGroupBox::title {{ subcontrol-origin: margin; left: {ui_px(12)}px; padding: 0 {ui_px(4)}px; }}
+                QStatusBar {{
+                    color: #1A1A1A; font-size: {ui_px(14)}px; min-height: {ui_px(28)}px;
+                    padding: {ui_px(2)}px {ui_px(4)}px;
+                }}
+                QCheckBox {{ spacing: {ui_px(8)}px; color: #1A1A1A; }}
+                QScrollBar:vertical {{
+                    background: #F7F8FA; width: {ui_px(10)}px; margin: 0; border: none;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: #C5CAD3; border-radius: {ui_px(5)}px; min-height: {ui_px(24)}px;
+                }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
             """
+
         QApplication.instance().setStyleSheet(qss)
         if hasattr(self, 'at_status_frame'):
             self._reset_autotrader_banner_style()
         self._style_combo_popups()
-        # Force table viewport colors (Windows can ignore QSS on empty tables)
-        table_bg = QColor("#1E1E1E" if self.dark_mode else "#FFFFFF")
-        table_fg = QColor("#E0E0E0" if self.dark_mode else "#212121")
+        self._style_home_cards()
+        if hasattr(self, "status_text"):
+            tc = theme_colors(self.dark_mode)
+            self.status_text.setStyleSheet(
+                f"font-size: {ui_px(14)}px; font-weight: 600; color: {tc['text']};"
+            )
+        if hasattr(self, "portfolio_val_lbl"):
+            self._refresh_top_bar_from_cache()
+        self.update_market_status()
+        table_bg = QColor("#1A1D24" if self.dark_mode else "#FFFFFF")
+        table_fg = QColor("#E8EAED" if self.dark_mode else "#1A1A1A")
         for table in self.findChildren(QTableWidget):
             pal = table.palette()
             pal.setColor(QPalette.Base, table_bg)
@@ -3823,16 +4759,20 @@ class MarketAdvisorGUI(QMainWindow):
             pal.setColor(QPalette.WindowText, table_fg)
             table.setPalette(pal)
             table.setAlternatingRowColors(True)
+            table.setShowGrid(False)
+            table.verticalHeader().setVisible(False)
+            table.verticalHeader().setDefaultSectionSize(ui_px(UI_ROW_HEIGHT))
             if table.viewport():
                 table.viewport().setPalette(pal)
                 table.viewport().setAutoFillBackground(True)
 
     def _style_combo_popups(self):
         """Windows Fusion often ignores QSS on QComboBox popups — paint them explicitly."""
+        tc = theme_colors(self.dark_mode)
         if self.dark_mode:
-            bg, fg, sel_bg, sel_fg = QColor("#1E1E1E"), QColor("#FFFFFF"), QColor("#2b78e4"), QColor("#FFFFFF")
+            bg, fg, sel_bg, sel_fg = QColor("#1A1D24"), QColor("#E8EAED"), QColor(tc["accent"]), QColor("#FFFFFF")
         else:
-            bg, fg, sel_bg, sel_fg = QColor("#FFFFFF"), QColor("#212121"), QColor("#2b78e4"), QColor("#FFFFFF")
+            bg, fg, sel_bg, sel_fg = QColor("#FFFFFF"), QColor("#1A1A1A"), QColor(tc["accent"]), QColor("#FFFFFF")
 
         for combo in self.findChildren(QComboBox):
             view = combo.view()
