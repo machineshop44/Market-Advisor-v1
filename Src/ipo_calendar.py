@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 CACHE_TTL_SEC = 3 * 3600  # 3 hours
 LOOKAHEAD_DAYS = 75
 YAHOO_IPO_CALENDAR_URL = "https://finance.yahoo.com/calendar/ipo"
-NASDAQ_IPO_URL = "https://www.nasdaq.com/market-activity/ipos"
 
 _cache: Dict[str, Any] = {
     "fetched_at": 0.0,
