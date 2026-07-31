@@ -87,8 +87,13 @@ RISK_PCT_PER_TRADE = 0.0075       # 0.75% of equity risked per trade
 CASH_RESERVE_PCT = 0.12           # leave 12% buying power undeployed
 MAX_CRYPTO_BOOK_FRAC = 0.40       # max crypto share of portfolio value
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
+MAX_SINGLE_NAME_EQUITY_FRAC = 0.15  # soft cap: one name ≤ ~15% of equity
 STOCK_LIMIT_FILL_TIMEOUT = 45     # cancel unfilled stock limits after N seconds
 PRICE_STALE_SECONDS = 120         # reject buys if live quote older than this (when timestamped)
+# Strong buy_rank_score may stretch slot/alloc aim (still hard-capped by risk $ / soft name / deployable)
+CONVICTION_ALLOC_MULT_MAX = 1.50  # top-ranked setup → up to 1.5× slot/alloc aim
+CONVICTION_SCORE_FLOOR = 65.0     # at/below → 1.0× (baseline)
+CONVICTION_SCORE_CEIL = 100.0     # at/above → CONVICTION_ALLOC_MULT_MAX
 
 # Practical concentration heuristics (maintainable, no quant library)
 CORRELATION_CLUSTERS = {
@@ -368,10 +373,38 @@ def get_trail_pct(broker_id, ticker=None, asset_type=""):
     return float(fees.get("ttp_trail") or 0.008)
 
 
-def calculate_risk_sizing(equity, buying_power, stop_distance_pct, alloc_ceiling_pct, min_dollars=5.0):
+def conviction_alloc_multiplier(score=None):
     """
-    Primary size = (equity * RISK_PCT) / stop_distance.
-    Caps: cash reserve, allocation_pct ceiling, available buying power, min notional.
+    Map buy_rank_score → stretch factor in [1.0, CONVICTION_ALLOC_MULT_MAX].
+    Missing/weak score keeps baseline (1.0). Strong rank may use more of BP under the
+    same hard risk $, soft name-cap, and cash-reserve caps — min_trade is never the target.
+    """
+    try:
+        s = float(score) if score is not None else 0.0
+    except (TypeError, ValueError):
+        s = 0.0
+    if s <= CONVICTION_SCORE_FLOOR:
+        return 1.0
+    span = max(1e-9, CONVICTION_SCORE_CEIL - CONVICTION_SCORE_FLOOR)
+    t = min(1.0, (s - CONVICTION_SCORE_FLOOR) / span)
+    return 1.0 + t * (CONVICTION_ALLOC_MULT_MAX - 1.0)
+
+
+def calculate_risk_sizing(equity, buying_power, stop_distance_pct, alloc_ceiling_pct,
+                          min_dollars=5.0, conviction_score=None,
+                          open_count=None, max_open_positions=None):
+    """
+    Buying-power-aware diversified sizing:
+      aim ≈ max(deployable / remaining_slots, alloc% × deployable) × conviction
+    Hard/soft caps (smallest wins): risk $ (equity × RISK_PCT / stop), soft single-name
+    equity frac, cash-reserved deployable BP, min notional floor (RH-friendly).
+
+    With few open positions and idle BP, remaining_slots is large → modest even slices.
+    With a nearly full book and idle BP, remaining_slots is small → larger slices to
+    finish deploying without dumping everything into one name (soft equity cap).
+
+    min_dollars is a hard floor / skip threshold only — never the intended size when
+    risk budget and buying power support a larger notional.
     """
     bp = float(buying_power or 0.0)
     eq = float(equity or 0.0)
@@ -383,10 +416,35 @@ def calculate_risk_sizing(equity, buying_power, stop_distance_pct, alloc_ceiling
     deployable = max(0.0, bp * (1.0 - CASH_RESERVE_PCT))
     if deployable < 1.0:
         return 0.0
+
     risk_budget = eq * RISK_PCT_PER_TRADE
     risk_size = risk_budget / stop_d
-    alloc_cap = deployable * max(0.0, float(alloc_ceiling_pct or 0.0))
-    trade = min(risk_size, alloc_cap if alloc_cap > 0 else risk_size, deployable)
+    alloc_pct = max(0.0, float(alloc_ceiling_pct or 0.0))
+    alloc_base = deployable * alloc_pct
+    mult = conviction_alloc_multiplier(conviction_score)
+
+    # Even book fill: split remaining deployable BP across remaining position slots
+    try:
+        max_open = int(max_open_positions) if max_open_positions is not None else 0
+    except (TypeError, ValueError):
+        max_open = 0
+    try:
+        open_n = max(0, int(open_count or 0))
+    except (TypeError, ValueError):
+        open_n = 0
+    if max_open > 0:
+        remaining_slots = max(1, max_open - open_n)
+        slot_target = deployable / float(remaining_slots)
+        # Prefer slot deployment; keep allocation % as a baseline floor (crypto often higher)
+        aim = max(slot_target, alloc_base) * mult
+    else:
+        # Unlimited positions — fall back to allocation % of deployable
+        aim = (alloc_base if alloc_base > 0 else risk_size) * mult
+
+    # Soft concentration: one name should not dominate equity (conviction does not lift this)
+    soft_cap = eq * MAX_SINGLE_NAME_EQUITY_FRAC
+
+    trade = min(aim, risk_size, soft_cap, deployable)
     trade = round(trade, 2)
     min_d = float(min_dollars or 5.0)
     if trade < min_d:
@@ -435,6 +493,56 @@ def concentration_blocks_buy(ticker, held_tickers, holdings_meta=None, portfolio
                 return True, f"crypto book cap ({projected*100:.0f}% > {MAX_CRYPTO_BOOK_FRAC*100:.0f}%)"
 
     return False, ""
+
+
+def portfolio_buy_rank_adjust(ticker, held_tickers, holdings_meta=None, portfolio_value=0.0,
+                              is_crypto=False):
+    """
+    Soft ranking delta so new buys prefer names that fit the *current* book.
+    Hard blocks stay in concentration_blocks_buy — this only reshuffles priority
+    among tickers that already passed BUY filters (unheld / underweight themes first).
+    """
+    clean = str(ticker or "").replace("-USD", "").upper()
+    held = {str(t).replace("-USD", "").upper() for t in (held_tickers or []) if t}
+    delta = 0.0
+
+    if clean in held:
+        return -1000.0
+
+    for _name, members in CORRELATION_CLUSTERS.items():
+        if clean not in members:
+            continue
+        overlap = held & members
+        n = len(overlap)
+        if n >= MAX_CLUSTER_POSITIONS:
+            return -1000.0
+        if n == 0:
+            delta += 10.0
+        else:
+            # One slot already used — still allowed, prefer a fresher theme when scores are close
+            delta -= 12.0
+
+    meta = holdings_meta or []
+    crypto_val = 0.0
+    for h in meta:
+        if h.get("is_crypto") or str(h.get("ticker", "")).upper() in CRYPTO_TICKERS:
+            crypto_val += float(h.get("value") or 0.0)
+    pv = float(portfolio_value or 0.0)
+    if pv > 0:
+        frac = crypto_val / pv
+        want_crypto = bool(is_crypto) or clean in CRYPTO_TICKERS
+        if want_crypto:
+            if frac >= MAX_CRYPTO_BOOK_FRAC * 0.75:  # ≥30%
+                delta -= 15.0
+            elif frac >= MAX_CRYPTO_BOOK_FRAC * 0.5:  # ≥20%
+                delta -= 6.0
+            elif frac < 0.10:
+                delta += 8.0
+        else:
+            if frac >= MAX_CRYPTO_BOOK_FRAC * 0.75:
+                delta += 10.0
+
+    return delta
 
 
 def get_protective_order(broker_id, ticker):
@@ -706,6 +814,17 @@ def buy_rank_score(ticker, is_crypto=True):
         # Sweet spot ~40–55; punish approaching overbought
         score += max(0.0, min(20.0, (RSI_CEILING - rsi)))
     return score
+
+
+def buy_rank_score_for_book(ticker, is_crypto=True, held_tickers=None, holdings_meta=None,
+                            portfolio_value=0.0):
+    """Signal quality + soft portfolio-fit adjustment for this book."""
+    base = buy_rank_score(ticker, is_crypto=is_crypto)
+    adj = portfolio_buy_rank_adjust(
+        ticker, held_tickers, holdings_meta=holdings_meta,
+        portfolio_value=portfolio_value, is_crypto=is_crypto,
+    )
+    return base + adj
 
 
 # =========================================================================

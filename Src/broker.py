@@ -1,7 +1,7 @@
 import time
 import math
 import importlib
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
 class _LazyModule:
@@ -318,22 +318,55 @@ class RobinhoodAdapter(BaseBroker):
             inc, min_qty = self._get_crypto_order_limits(ticker)
             d_inc = Decimal(str(inc))
             decimals = abs(d_inc.as_tuple().exponent)
-            d_qty = Decimal(str(trade_dollars / price)) if price > 0 else Decimal("0")
+            d_price = Decimal(str(price)) if price and price > 0 else Decimal("0")
+            d_trade = Decimal(str(trade_dollars))
+            d_qty = (d_trade / d_price) if d_price > 0 else Decimal("0")
             valid_qty_dec = (d_qty / d_inc).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_inc
             if valid_qty_dec <= 0:
                 return f"Skipped: Cannot afford 1 increment", 0.0, None
             if float(valid_qty_dec) + 1e-12 < float(min_qty):
                 return f"Skipped: Below RH min order ({min_qty} {ticker})", 0.0, None
+            # RH often 422s sub-$5 crypto notionals (esp. BTC). Qty ROUND_DOWN from an
+            # exact $5 size can land a hair under the floor while display still shows $5.00.
+            min_notional = max(
+                Decimal("5.00"),
+                (Decimal(str(min_qty)) * d_price) if d_price > 0 else Decimal("5.00"),
+            )
+            actual_spent_dec = valid_qty_dec * d_price
+            if actual_spent_dec < min_notional:
+                # Only bump when the *intended* size was already at/above the floor —
+                # ROUND_DOWN to the qty increment is what dipped us under (shows as $5.00 < $5.00).
+                if d_trade + Decimal("0.01") < min_notional:
+                    return (
+                        f"Skipped: Below RH crypto floor "
+                        f"(${float(actual_spent_dec):.2f} < ${float(min_notional):.2f})",
+                        0.0,
+                        None,
+                    )
+                need_qty = (min_notional / d_price) if d_price > 0 else Decimal("0")
+                bumped = (need_qty / d_inc).to_integral_value(rounding=ROUND_UP) * d_inc
+                if bumped < Decimal(str(min_qty)):
+                    bumped = (
+                        (Decimal(str(min_qty)) / d_inc).to_integral_value(rounding=ROUND_UP) * d_inc
+                    )
+                bumped_spent = bumped * d_price
+                # If still short (price tick / float edge), add one more increment.
+                if bumped_spent < min_notional:
+                    bumped = bumped + d_inc
+                    bumped_spent = bumped * d_price
+                max_bump = max(d_trade, min_notional) + (d_inc * d_price) + Decimal("0.02")
+                if bumped_spent <= max_bump and bumped_spent >= min_notional:
+                    valid_qty_dec = bumped
+                    actual_spent_dec = bumped_spent
+                else:
+                    return (
+                        f"Skipped: Below RH crypto floor "
+                        f"(${float(actual_spent_dec):.2f} < ${float(min_notional):.2f})",
+                        0.0,
+                        None,
+                    )
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
-            actual_spent = float(valid_qty_dec) * price
-            # RH often 422s sub-$5 crypto notionals (esp. BTC); skip cleanly instead of submitting.
-            min_notional = max(5.0, float(min_qty) * float(price) if price > 0 else 5.0)
-            if actual_spent + 1e-9 < min_notional:
-                return (
-                    f"Skipped: Below RH crypto floor (${actual_spent:.2f} < ${min_notional:.2f})",
-                    0.0,
-                    None,
-                )
+            actual_spent = float(actual_spent_dec)
             try:
                 res = r.order_buy_crypto_by_quantity(ticker, safe_qty_str)
                 if isinstance(res, dict) and 'id' in res:
@@ -596,9 +629,13 @@ class RobinhoodAdapter(BaseBroker):
             stop_d = abs(float(stop_pct or 0))
             if qty <= 0 or entry <= 0 or stop_d <= 0:
                 return False, None, "invalid qty/entry/stop"
-            # Whole-share stops are more reliable on RH; try fractional qty as-is first
-            qty_arg = qty if qty != int(qty) else int(qty)
-            trail_pct_points = round(stop_d * 100.0, 2)  # e.g. 3.5 for 3.5%
+            # RH rejects >8 decimal qty and non-integer trailing_peg percentages.
+            qty_dec = Decimal(str(qty)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+            if qty_dec <= 0:
+                return False, None, "qty rounded to 0"
+            qty_arg = int(qty_dec) if qty_dec == qty_dec.to_integral_value() else float(qty_dec)
+            # Integer percent points (ceil so trail is at least as wide as configured)
+            trail_pct_points = max(1, int(math.ceil(stop_d * 100.0 - 1e-12)))
             # 1) Trailing stop — rises with price; software TTP still handles tighter trails
             try:
                 place_trail = getattr(r, "order_sell_trailing_stop", None) or getattr(r.orders, "order_sell_trailing_stop", None)

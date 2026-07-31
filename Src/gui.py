@@ -4,6 +4,7 @@ import time
 import math
 import json
 import builtins
+import webbrowser
 import urllib.request
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -98,13 +99,13 @@ def load_settings():
         "monitor_user": "",
         "monitor_pass": "",
         "allocation_pct": 5.0,
-        "allocation_pct_crypto": 5.0,
+        "allocation_pct_crypto": 8.0,
         "allocation_pct_stock": 5.0,
         "min_trade_dollars": 5.0,
         "limit_offset_pct": 0.1,
         "daily_profit_target": 0.0,
         "daily_loss_limit": 8.0,
-        "max_open_positions": 6,
+        "max_open_positions": 20,
         "max_buys_per_cycle": 2,
         "interval_crypto": 45,
         "interval_penny": 60,
@@ -582,6 +583,8 @@ class MarketAdvisorGUI(QMainWindow):
         self.view_mode = "All"  # Dropdown: All | Robinhood | Coinbase
         self.penny_tab_index = 3
         self.core_tab_index = 4
+        self.ipo_tab_index = -1
+        self._ipo_refresh_in_flight = False
         self._last_balance_totals = {"Robinhood": {'p_val': 0.0, 'bp': 0.0}, "Coinbase": {'p_val': 0.0, 'bp': 0.0}}
         
         self.auto_trade_enabled = {"Robinhood": False, "Coinbase": False}
@@ -619,6 +622,10 @@ class MarketAdvisorGUI(QMainWindow):
         self._sell_defer_log = {}  # (broker, ticker, reason) -> session label last logged
         self._frac_ext_ineligible = set()  # RH tickers rejected for ext-hours fractionals
         self._last_equity_session_label = None
+        # Weekday RTH boundary wake-ups (once each per ET calendar day)
+        self._session_wakeup_fired = {
+            "day": None, "pre_open": False, "open": False, "pre_close": False,
+        }
         
         self.trade_locks = {}
         self._portfolio_fingerprint = ""
@@ -799,6 +806,13 @@ class MarketAdvisorGUI(QMainWindow):
                 lbl.setStyleSheet(
                     f"color: #6B7280; font-size: {ui_px(12)}px; margin-top: {ui_px(18)}px;"
                 )
+            elif lbl.objectName() in ("ipoDisclaimer", "ipoTip"):
+                lbl.setStyleSheet(
+                    f"color: {theme_colors(self.dark_mode)['muted']}; "
+                    f"font-size: {ui_px(12 if lbl.objectName() == 'ipoDisclaimer' else 11)}px;"
+                )
+            elif lbl.objectName() == "ipoStatus":
+                lbl.setStyleSheet(f"font-size: {ui_px(12)}px;")
 
         for btn in self.findChildren(QPushButton):
             kind = btn.property("uiBtnKind")
@@ -818,6 +832,10 @@ class MarketAdvisorGUI(QMainWindow):
                 btn.setFixedWidth(ui_px(120))
             elif name == "clearLogBtn":
                 btn.setFixedWidth(ui_px(100))
+            elif name == "ipoRefreshBtn":
+                btn.setFixedWidth(ui_px(130))
+            elif name == "ipoYahooBtn":
+                btn.setFixedWidth(ui_px(160))
 
     def _finish_ui_build(self):
         """Deferred scanner/portfolio/settings tabs — window + tray already visible."""
@@ -828,22 +846,31 @@ class MarketAdvisorGUI(QMainWindow):
         self.build_crypto_screen()
         self.build_penny_screen()
         self.build_core_screen()
+        self.build_ipo_screen()
         self.build_activity_log_screen()
         self.build_settings_screen()
 
         self.penny_tab_index = 3
         self.core_tab_index = 4
+        self.ipo_tab_index = -1
         for i in range(self.tabs.count()):
             title = self.tabs.tabText(i)
             if "Breakout" in title:
                 self.penny_tab_index = i
             elif "Core" in title:
                 self.core_tab_index = i
+            elif title == "IPOs":
+                self.ipo_tab_index = i
 
         self._apply_view_mode_tabs()
         # Scale once deferred tabs exist (action buttons / section headers tagged)
         self._apply_ui_scale()
         QTimer.singleShot(0, lambda: self.director_timer.start(1000))
+        # IPO calendar: first load shortly after UI settles; then every few hours
+        QTimer.singleShot(8000, lambda: self.refresh_ipo_calendar(force=False))
+        self._ipo_auto_timer = QTimer(self)
+        self._ipo_auto_timer.timeout.connect(lambda: self.refresh_ipo_calendar(force=False))
+        self._ipo_auto_timer.start(3 * 3600 * 1000)
 
         # Warm heavy libs in the background so the first score/scan doesn't hitch
         def _warm():
@@ -2076,6 +2103,79 @@ class MarketAdvisorGUI(QMainWindow):
         info = self.get_equity_session_info()
         return info["label"] in ("REGULAR", "EXTENDED")
 
+    def _enqueue_session_boundary_cycles(self, kind, now_ts):
+        """
+        Priority equity pulse at RTH open/close boundaries.
+        PORTFOLIO first (deferred sells), then CORE / BREAKOUT buys. Crypto unchanged.
+        """
+        labels = {
+            "pre_open": "Pre-open session check…",
+            "open": "Open session check…",
+            "pre_close": "Pre-close session check…",
+        }
+        self.log_event(labels.get(kind, f"Session boundary check ({kind})…"))
+
+        broker = "Robinhood"
+        if not self.auto_trade_enabled.get(broker):
+            return
+        if (
+            not self.paper_mode
+            and not self.brokers[broker].is_connected
+        ):
+            return
+
+        # Prefer front of queue so sells/buys hit ASAP vs any pending CRYPTO pulse
+        priority = []
+        for task in ("PORTFOLIO", "CORE", "PENNY"):
+            item = (broker, task)
+            if item in self.task_queue:
+                self.task_queue.remove(item)
+            priority.append(item)
+        self.task_queue = priority + self.task_queue
+
+        self.last_port_time[broker] = now_ts
+        self.last_core_time[broker] = now_ts
+        self.last_penny_time[broker] = now_ts
+        self._set_engine_banner(
+            f"🤖 ⏰ [{broker}] {labels.get(kind, 'Session check')} — queued",
+            "#00897B",
+        )
+
+    def _maybe_session_boundary_wakeup(self, now_ts):
+        """
+        Once per weekday (ET): equity cycles ~60s before 9:30 open, at/just after open,
+        and ~60s before 16:00 close. Weekends skipped; no holiday calendar (weekday RTH baseline).
+        """
+        if not self.auto_trade_enabled.get("Robinhood"):
+            return
+
+        now_et = self._now_et()
+        if now_et.weekday() >= 5:
+            return
+
+        day = now_et.date()
+        fired = self._session_wakeup_fired
+        if fired.get("day") != day:
+            self._session_wakeup_fired = {
+                "day": day, "pre_open": False, "open": False, "pre_close": False,
+            }
+            fired = self._session_wakeup_fired
+
+        sod = now_et.hour * 3600 + now_et.minute * 60 + now_et.second
+        open_s = 9 * 3600 + 30 * 60   # 09:30 ET
+        close_s = 16 * 3600           # 16:00 ET
+
+        # ~45s windows so the 1Hz director catches each once without spam
+        if not fired["pre_open"] and (open_s - 60) <= sod < (open_s - 15):
+            fired["pre_open"] = True
+            self._enqueue_session_boundary_cycles("pre_open", now_ts)
+        elif not fired["open"] and open_s <= sod < (open_s + 30):
+            fired["open"] = True
+            self._enqueue_session_boundary_cycles("open", now_ts)
+        elif not fired["pre_close"] and (close_s - 60) <= sod < (close_s - 15):
+            fired["pre_close"] = True
+            self._enqueue_session_boundary_cycles("pre_close", now_ts)
+
     def update_market_status(self):
         """Broker-aware session label. Coinbase/crypto is 24/7; equities follow US hours."""
         if not hasattr(self, "market_status_lbl"):
@@ -2322,8 +2422,12 @@ class MarketAdvisorGUI(QMainWindow):
         self.main_layout.addWidget(top_bar)
 
     def _set_stock_tabs_visible(self, visible):
-        """Show/hide Breakouts + Core tabs (Coinbase has no equities)."""
-        for idx in (getattr(self, 'penny_tab_index', 3), getattr(self, 'core_tab_index', 4)):
+        """Show/hide Breakouts + Core + IPOs tabs (Coinbase has no equities)."""
+        for idx in (
+            getattr(self, 'penny_tab_index', 3),
+            getattr(self, 'core_tab_index', 4),
+            getattr(self, 'ipo_tab_index', -1),
+        ):
             if idx < 0 or idx >= self.tabs.count():
                 continue
             # If user is sitting on a tab we're about to hide, bounce to Portfolio
@@ -2788,6 +2892,206 @@ class MarketAdvisorGUI(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Scanner: Core")
 
+    def build_ipo_screen(self):
+        """Advisory upcoming IPO calendar — research / RH IPO Access only (no auto-apply)."""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(ui_px(8))
+
+        header = QLabel("Upcoming IPOs")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
+        layout.addWidget(header)
+
+        disclaimer = QLabel(
+            "For research / RH IPO Access — bot does not apply for you. "
+            "Hints are lightweight heuristics, not financial advice."
+        )
+        disclaimer.setObjectName("ipoDisclaimer")
+        disclaimer.setWordWrap(True)
+        disclaimer.setStyleSheet(
+            f"color: {theme_colors(self.dark_mode)['muted']}; font-size: {ui_px(12)}px;"
+        )
+        self.ipo_disclaimer_lbl = disclaimer
+        layout.addWidget(disclaimer)
+
+        bar = QHBoxLayout()
+        self.ipo_status_lbl = QLabel("IPO calendar not loaded yet.")
+        self.ipo_status_lbl.setObjectName("ipoStatus")
+        self.ipo_status_lbl.setStyleSheet(f"font-size: {ui_px(12)}px;")
+        refresh_btn = QPushButton("Refresh IPOs")
+        refresh_btn.setObjectName("ipoRefreshBtn")
+        refresh_btn.setProperty("uiBtnKind", "success")
+        refresh_btn.setStyleSheet(action_btn_style("success"))
+        refresh_btn.setFixedWidth(ui_px(130))
+        refresh_btn.clicked.connect(lambda: self.refresh_ipo_calendar(force=True))
+        self.ipo_refresh_btn = refresh_btn
+        open_yf_btn = QPushButton("Yahoo IPO Calendar")
+        open_yf_btn.setObjectName("ipoYahooBtn")
+        open_yf_btn.setFixedWidth(ui_px(160))
+        open_yf_btn.clicked.connect(
+            lambda: webbrowser.open("https://finance.yahoo.com/calendar/ipo")
+        )
+        bar.addWidget(self.ipo_status_lbl, 1)
+        bar.addWidget(open_yf_btn)
+        bar.addWidget(refresh_btn)
+        layout.addLayout(bar)
+
+        self.ipo_table = QTableWidget(0, 8)
+        self.ipo_table.setHorizontalHeaderLabels([
+            "Company", "Ticker", "Expected", "Exchange", "Price Range",
+            "Status", "Consider", "Notes",
+        ])
+        self.ipo_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.ipo_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        for col in (1, 2, 3, 4, 5, 6):
+            self.ipo_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        polish_table(self.ipo_table)
+        self.ipo_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.ipo_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ipo_table.cellDoubleClicked.connect(self._on_ipo_row_open)
+        layout.addWidget(self.ipo_table, 1)
+
+        tip = QLabel("Double-click a row to open the Yahoo quote / IPO calendar in your browser.")
+        tip.setObjectName("ipoTip")
+        tip.setStyleSheet(
+            f"color: {theme_colors(self.dark_mode)['muted']}; font-size: {ui_px(11)}px;"
+        )
+        layout.addWidget(tip)
+
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "IPOs")
+
+    def refresh_ipo_calendar(self, force=False):
+        if getattr(self, "_ipo_refresh_in_flight", False):
+            return
+        if not hasattr(self, "ipo_table"):
+            return
+        self._ipo_refresh_in_flight = True
+        if hasattr(self, "ipo_status_lbl"):
+            self.ipo_status_lbl.setText("Loading upcoming IPOs…")
+        if hasattr(self, "ipo_refresh_btn"):
+            self.ipo_refresh_btn.setEnabled(False)
+
+        holding_tickers = []
+        try:
+            for name in ("Robinhood", "Coinbase"):
+                for a in self.get_broker_holdings(name) or []:
+                    t = a.get("ticker")
+                    if t:
+                        holding_tickers.append(t)
+        except Exception:
+            pass
+
+        regime_ok = True
+        try:
+            from scoring import market_regime_ok
+            ok, _reason = market_regime_ok(is_crypto=False)
+            regime_ok = bool(ok)
+        except Exception:
+            regime_ok = True
+
+        def _bg():
+            import ipo_calendar
+            return ipo_calendar.fetch_upcoming_ipos(
+                force=force,
+                holding_tickers=holding_tickers,
+                regime_ok=regime_ok,
+            )
+
+        task = BackgroundTask(_bg)
+        task.result_ready.connect(self._on_ipo_calendar_loaded)
+        task.error_occurred.connect(self._on_ipo_calendar_error)
+        self.active_threads.append(task)
+        task.start()
+
+    def _on_ipo_calendar_error(self, message):
+        self._ipo_refresh_in_flight = False
+        if hasattr(self, "ipo_refresh_btn"):
+            self.ipo_refresh_btn.setEnabled(True)
+        if hasattr(self, "ipo_status_lbl"):
+            self.ipo_status_lbl.setText(f"IPO calendar unavailable: {message}")
+        self.log_event(f"IPO calendar error: {message}")
+
+    def _on_ipo_calendar_loaded(self, result):
+        self._ipo_refresh_in_flight = False
+        if hasattr(self, "ipo_refresh_btn"):
+            self.ipo_refresh_btn.setEnabled(True)
+        result = result or {}
+        ipos = result.get("ipos") or []
+        err = result.get("error")
+        source = result.get("source") or "—"
+        fetched_at = result.get("fetched_at") or 0
+        cached = "cache" if result.get("from_cache") else "live"
+        try:
+            import ipo_calendar
+            when = ipo_calendar.format_fetched_at(fetched_at)
+        except Exception:
+            when = "—"
+
+        if err and not ipos:
+            if hasattr(self, "ipo_status_lbl"):
+                self.ipo_status_lbl.setText(f"Could not load IPOs ({err}). Try Refresh.")
+            self.log_event(f"IPO calendar failed: {err}")
+            return
+
+        self.ipo_table.setRowCount(len(ipos))
+        self._ipo_row_links = []
+        for row, ipo in enumerate(ipos):
+            vals = [
+                str(ipo.get("company") or ""),
+                str(ipo.get("ticker") or "—"),
+                str(ipo.get("date") or "—"),
+                str(ipo.get("exchange") or "—"),
+                str(ipo.get("price_range") or "—"),
+                str(ipo.get("status") or "—"),
+                str(ipo.get("hint") or "—"),
+                str(ipo.get("note") or ""),
+            ]
+            self._ipo_row_links.append(ipo.get("link") or "")
+            for col, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                if col == 6:
+                    self._apply_ipo_hint_color(item, text)
+                self.ipo_table.setItem(row, col, item)
+
+        extra = f" · {err}" if err else ""
+        if hasattr(self, "ipo_status_lbl"):
+            self.ipo_status_lbl.setText(
+                f"{len(ipos)} upcoming · source: {source} ({cached}) · updated {when}{extra}"
+            )
+        if not result.get("from_cache"):
+            self.log_event(f"IPO calendar refreshed: {len(ipos)} listings from {source}")
+
+    def _apply_ipo_hint_color(self, item, hint):
+        h = str(hint or "").lower()
+        if "worth a look" in h:
+            fg = QColor("#00E676" if self.dark_mode else "#2E7D32")
+            bg = QColor("#003816" if self.dark_mode else "#E8F5E9")
+        elif "skip" in h or "speculative" in h:
+            fg = QColor("#FF8A80" if self.dark_mode else "#C62828")
+            bg = QColor("#3A0B0B" if self.dark_mode else "#FFEBEE")
+        elif "caution" in h or "watch" in h:
+            fg = QColor("#FFD54F" if self.dark_mode else "#F57F17")
+            bg = QColor("#332A00" if self.dark_mode else "#FFFDE7")
+        else:
+            return
+        item.setForeground(fg)
+        item.setBackground(bg)
+        item.setData(Qt.ForegroundRole, fg)
+        item.setData(Qt.BackgroundRole, bg)
+
+    def _on_ipo_row_open(self, row, _col):
+        links = getattr(self, "_ipo_row_links", [])
+        url = links[row] if 0 <= row < len(links) else ""
+        if not url:
+            url = "https://finance.yahoo.com/calendar/ipo"
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self.log_event(f"Could not open IPO link: {e}")
+
     def build_activity_log_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
@@ -2976,7 +3280,7 @@ class MarketAdvisorGUI(QMainWindow):
         form_layout.addWidget(mon_hint)
 
         alloc_box = QHBoxLayout()
-        alloc_box.addWidget(QLabel("Stock/ETF Max Allocation % (risk ceiling):"))
+        alloc_box.addWidget(QLabel("Stock/ETF Allocation % (baseline floor):"))
         self.alloc_stock_spin = QDoubleSpinBox()
         self.alloc_stock_spin.setRange(0.5, 50.0)
         stock_default = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0))
@@ -2986,18 +3290,20 @@ class MarketAdvisorGUI(QMainWindow):
         form_layout.addLayout(alloc_box)
 
         alloc_crypto_box = QHBoxLayout()
-        alloc_crypto_box.addWidget(QLabel("Crypto Max Allocation % (risk ceiling):"))
+        alloc_crypto_box.addWidget(QLabel("Crypto Allocation % (baseline floor):"))
         self.alloc_crypto_spin = QDoubleSpinBox()
         self.alloc_crypto_spin.setRange(0.5, 50.0)
-        crypto_default = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 5.0))
+        crypto_default = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 8.0))
         self.alloc_crypto_spin.setValue(crypto_default)
         alloc_crypto_box.addWidget(self.alloc_crypto_spin)
         alloc_crypto_box.addStretch()
         form_layout.addLayout(alloc_crypto_box)
 
         alloc_hint = QLabel(
-            "Primary size is risk-based (~0.75% equity / hard-stop distance). "
-            "Allocation % caps notional; 12% cash reserve is always held back."
+            "Size aims to deploy buying power evenly across remaining position slots "
+            "(deployable BP / slots left). Allocation % is a per-asset baseline floor; "
+            "strong setups may stretch the aim up to 1.5×. Caps: ~0.75% equity risk per "
+            "trade, ~15% equity per name, 12% cash reserve. Min $ is a floor only."
         )
         alloc_hint.setObjectName("settingsHint")
         alloc_hint.setWordWrap(True)
@@ -3015,6 +3321,13 @@ class MarketAdvisorGUI(QMainWindow):
         min_dollar_box.addWidget(self.min_dollar_spin)
         min_dollar_box.addStretch()
         form_layout.addLayout(min_dollar_box)
+        min_hint = QLabel(
+            "Broker floor only (RH crypto needs ≥ $5). Does not force tiny trades when buying power is ample."
+        )
+        min_hint.setObjectName("settingsHint")
+        min_hint.setWordWrap(True)
+        min_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        form_layout.addWidget(min_hint)
 
         offset_box = QHBoxLayout()
         offset_box.addWidget(QLabel("Limit Order Buffer Offset %:"))
@@ -3049,7 +3362,7 @@ class MarketAdvisorGUI(QMainWindow):
         max_pos_box.addWidget(QLabel("Max Open Positions per Broker (0 = unlimited):"))
         self.max_pos_spin = QSpinBox()
         self.max_pos_spin.setRange(0, 100)
-        self.max_pos_spin.setValue(int(self.settings.get("max_open_positions", 6)))
+        self.max_pos_spin.setValue(int(self.settings.get("max_open_positions", 20)))
         max_pos_box.addWidget(self.max_pos_spin)
         max_pos_box.addStretch()
         form_layout.addLayout(max_pos_box)
@@ -3486,6 +3799,9 @@ class MarketAdvisorGUI(QMainWindow):
 
         self._maybe_send_heartbeat(now)
 
+        # Equity RTH boundary wake-ups before interval scheduling (sets last_* so no double-queue)
+        self._maybe_session_boundary_wakeup(now)
+
         for broker_name, enabled in self.auto_trade_enabled.items():
             if not enabled: continue
             if not self.brokers[broker_name].is_connected and not self.paper_mode:
@@ -3828,15 +4144,18 @@ class MarketAdvisorGUI(QMainWindow):
             self.portfolio_table.setItem(row, 6, action_item)
         self.set_working_state(False)
 
-    def calculate_order_sizing(self, current_bp, asset_type="", entry_price=0.0, equity=None):
+    def calculate_order_sizing(self, current_bp, asset_type="", entry_price=0.0, equity=None,
+                               score=None, open_count=None, max_open_positions=None):
         """
-        Risk-based primary size: (equity * 0.75%) / hard_stop_distance.
-        allocation_pct_* remains a hard ceiling; cash reserve applied inside calculate_risk_sizing.
+        BP-aware diversified size: deployable_BP / remaining_slots (vs max_open),
+        floored by allocation_pct_* baseline; conviction may stretch the aim up to 1.5×.
+        Hard/soft caps inside calculate_risk_sizing: risk $, ~15% equity name cap, cash reserve.
+        min_trade_dollars is a floor/skip only — not the target size.
         """
         from scoring import calculate_risk_sizing, get_stop_distance_pct
         is_crypto = "crypto" in str(asset_type).lower()
         if is_crypto:
-            alloc_pct = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 5.0)) / 100.0
+            alloc_pct = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 8.0)) / 100.0
         else:
             alloc_pct = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0)) / 100.0
         min_dollars = self.settings.get("min_trade_dollars", 5.0)
@@ -3848,8 +4167,19 @@ class MarketAdvisorGUI(QMainWindow):
                 eq, _ = self.get_broker_balances(self.cycle_broker_name)
             except Exception:
                 eq = float(current_bp or 0.0)
+        max_open = max_open_positions
+        if max_open is None:
+            max_open = int(self.settings.get("max_open_positions", 20))
+        open_n = open_count
+        if open_n is None:
+            try:
+                holdings = self.get_broker_holdings(self.cycle_broker_name) or []
+                open_n = len({(a.get("ticker") or "").upper() for a in holdings if a.get("ticker")})
+            except Exception:
+                open_n = 0
         return calculate_risk_sizing(
             eq, current_bp, stop_d, alloc_pct, min_dollars=min_dollars,
+            conviction_score=score, open_count=open_n, max_open_positions=max_open,
         )
 
     def _attach_protective_stop(self, broker_name, ticker, asset_type, price, spent):
@@ -4060,7 +4390,14 @@ class MarketAdvisorGUI(QMainWindow):
         if not auto_mode:
             sample_type = filtered[0].get("asset_type", "")
             equity, bp = self.get_broker_balances(self.cycle_broker_name)
-            trade_dollars = self.calculate_order_sizing(bp, sample_type, equity=equity)
+            try:
+                _h = self.get_broker_holdings(self.cycle_broker_name) or []
+                _open = len({(a.get("ticker") or "").upper() for a in _h if a.get("ticker")})
+            except Exception:
+                _open = 0
+            trade_dollars = self.calculate_order_sizing(
+                bp, sample_type, equity=equity, open_count=_open,
+            )
             if trade_dollars <= 0:
                 QMessageBox.warning(self, "Insufficient Funds", "Buying power is too low for the minimum order size.")
                 return
@@ -4080,32 +4417,17 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _bg_buy_batch(self, candidates, rank=False):
         """Place buys on a worker thread (confirm_order sleeps stay off the UI)."""
-        from scoring import concentration_blocks_buy
+        from scoring import concentration_blocks_buy, buy_rank_score_for_book
         broker_name = self.cycle_broker_name
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
         session = self.get_equity_session_info()
         use_ext = session["use_ext"]
         market_hours = session["market_hours"]
         allow_fractional = session["fractional_ok"]
-        max_positions = int(self.settings.get("max_open_positions", 6))
+        max_positions = int(self.settings.get("max_open_positions", 20))
         max_buys = int(self.settings.get("max_buys_per_cycle", 2))
         notes = []
         ranked = list(candidates or [])
-
-        if rank and len(ranked) > 1:
-            with SuppressPrints():
-                for c in ranked:
-                    ticker = c.get("ticker") or ""
-                    asset_type = c.get("asset_type") or ""
-                    is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
-                    try:
-                        from scoring import buy_rank_score
-                        c["score"] = float(buy_rank_score(ticker, is_crypto=is_crypto))
-                    except Exception:
-                        c["score"] = 0.0
-            ranked.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-            top = ", ".join(f"{c.get('ticker')}({float(c.get('score') or 0):.0f})" for c in ranked[:3])
-            notes.append(f"[{broker_name}] Ranked {len(ranked)} buys — top: {top}")
 
         equity, bp = self.get_broker_balances(broker_name)
         holdings = self.get_broker_holdings(broker_name) or []
@@ -4129,6 +4451,31 @@ class MarketAdvisorGUI(QMainWindow):
                 "value": float(a.get("shares") or 0) * px,
                 "is_crypto": is_c,
             })
+
+        # Rank against *this* book: bury already-held / full clusters; prefer underweight themes
+        if ranked:
+            with SuppressPrints():
+                for c in ranked:
+                    ticker = c.get("ticker") or ""
+                    asset_type = c.get("asset_type") or ""
+                    is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
+                    try:
+                        c["score"] = float(buy_rank_score_for_book(
+                            ticker, is_crypto=is_crypto, held_tickers=held,
+                            holdings_meta=holdings_meta, portfolio_value=equity,
+                        ))
+                    except Exception:
+                        c["score"] = float(c.get("score") or 0.0)
+            ranked.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+            # Drop names that cannot improve the book (already held / cluster full)
+            actionable = [c for c in ranked if float(c.get("score") or 0.0) > -500.0]
+            if rank or len(ranked) > 1:
+                top_src = actionable or ranked
+                top = ", ".join(
+                    f"{c.get('ticker')}({float(c.get('score') or 0):.0f})" for c in top_src[:3]
+                )
+                notes.append(f"[{broker_name}] Ranked {len(actionable)}/{len(ranked)} buys for book — top: {top}")
+            ranked = actionable
 
         fills = []
         buys_done = 0
@@ -4157,7 +4504,10 @@ class MarketAdvisorGUI(QMainWindow):
                 continue
             price = live
             # Size first so crypto-book check can use proposed dollars
-            row_dollars = self.calculate_order_sizing(bp, asset_type, entry_price=price, equity=equity)
+            row_dollars = self.calculate_order_sizing(
+                bp, asset_type, entry_price=price, equity=equity, score=c.get("score"),
+                open_count=open_count, max_open_positions=max_positions,
+            )
             if row_dollars <= 0:
                 notes.append(f"[{broker_name}] Skipping buys — buying power/risk size too low ({format_currency(bp)})")
                 break
@@ -4472,11 +4822,36 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _bg_scan_and_score(self, scan_func):
         """Discover tickers, score, and pre-rank BUY candidates in one background job."""
+        from scoring import buy_rank_score_for_book
         opps = scan_func() or []
         if not opps:
             return [], [], []
         items = [(i, o['symbol'], 0.0, 0.0, o.get('type', '')) for i, o in enumerate(opps)]
         results = self._bg_score_opportunities(items)
+
+        broker_name = self.cycle_broker_name
+        try:
+            equity, _bp = self.get_broker_balances(broker_name)
+        except Exception:
+            equity = 0.0
+        holdings = self.get_broker_holdings(broker_name) or []
+        held = {(a.get("ticker") or "").upper() for a in holdings if a.get("ticker")}
+        broker = self.brokers.get(broker_name)
+        holdings_meta = []
+        for a in holdings:
+            t = a.get("ticker") or ""
+            is_c = "crypto" in str(a.get("type") or "").lower() or str(t).upper() in KNOWN_CRYPTOS
+            px = 0.0
+            try:
+                px = float(broker.get_live_price(t) if broker else 0.0) or 0.0
+            except Exception:
+                px = 0.0
+            holdings_meta.append({
+                "ticker": t,
+                "value": float(a.get("shares") or 0) * px,
+                "is_crypto": is_c,
+            })
+
         buy_candidates = []
         with SuppressPrints():
             for row, price, action, asset_type, err in results:
@@ -4489,10 +4864,14 @@ class MarketAdvisorGUI(QMainWindow):
                 atype = asset_type or opps[row].get("type", "")
                 is_crypto = "crypto" in str(atype).lower() or ticker.upper() in KNOWN_CRYPTOS
                 try:
-                    from scoring import buy_rank_score
-                    score = float(buy_rank_score(ticker, is_crypto=is_crypto))
+                    score = float(buy_rank_score_for_book(
+                        ticker, is_crypto=is_crypto, held_tickers=held,
+                        holdings_meta=holdings_meta, portfolio_value=equity,
+                    ))
                 except Exception:
                     score = 0.0
+                if score <= -500.0:
+                    continue  # already held / cluster full — don't promote as a candidate
                 buy_candidates.append({
                     "ticker": ticker,
                     "asset_type": atype,

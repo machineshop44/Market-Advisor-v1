@@ -30,15 +30,13 @@ APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
 
-__version__ = "1.2.1"
+__version__ = "1.2.8"
 
 
 
 # Optional human note (shown in About / logs — keep short)
 
-VERSION_NOTE = "Multi-source regime: Yahoo + broker + last-good cache"
-
-
+VERSION_NOTE = "Upcoming IPO calendar (advisory — RH IPO Access is manual)"
 
 
 
@@ -50,15 +48,11 @@ def version_string():
 
 
 
-
-
 def display_name():
 
     """e.g. 'Market Advisor 1.1.0'"""
 
     return f"{APP_NAME} {__version__}"
-
-
 
 
 
@@ -70,8 +64,6 @@ def window_title():
 
 
 
-
-
 def user_agent():
 
     """HTTP User-Agent for Discord / monitor."""
@@ -80,10 +72,7 @@ def user_agent():
 
 
 
-
-
 def splash_subtitle():
 
     return f"v{__version__}"
-
 
