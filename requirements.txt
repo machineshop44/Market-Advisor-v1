@@ -4,3 +4,6 @@ pandas
 robin_stocks
 coinbase-advanced-py
 finvizfinance
+requests
+requests-oauthlib
+keyring

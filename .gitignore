@@ -4,6 +4,7 @@ Src/trade_journal.jsonl
 Src/scoring_state.json
 Src/activity_log.txt
 Src/_combo_arrow_*.png
+Src/_spin_arrow_*.png
 wants and needs.txt
 *.env
 .env.*
@@ -16,6 +17,12 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# Packaging / freeze outputs
+build/
+dist/
+*.spec
+Src/_pyinstaller_entry.py
 
 # OS / editor
 .DS_Store

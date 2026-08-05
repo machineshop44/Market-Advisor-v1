@@ -71,10 +71,12 @@ def _show_boot_tray(app, icon):
         return None
     tray = QSystemTrayIcon(icon if not icon.isNull() else QIcon(), app)
     tray.setToolTip(f"{display_name()} — starting…")
+    # Parent + strong ref so Windows right-click works during boot
     menu = QMenu()
-    quit_act = QAction("Quit", menu)
+    quit_act = QAction("Exit", menu)
     quit_act.triggered.connect(app.quit)
     menu.addAction(quit_act)
+    tray._boot_menu = menu  # noqa: SLF001 — keep alive for GC
     tray.setContextMenu(menu)
     tray.show()
     tray.showMessage(
@@ -91,6 +93,9 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("machineshop44")
+    # Helps Windows / Qt surface "Market Advisor" in switcher / some task views
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
 

@@ -10,10 +10,21 @@ Multi-broker quantitative trading desktop app (Robinhood + Coinbase Advanced) bu
    pip install -r requirements.txt
    ```
 3. Copy `Src/settings.example.json` → `Src/settings.json` and fill in your credentials locally (never commit `settings.json`).
-4. Run:
-   ```bash
-   cd Src
-   py main.py
+4. Run (preferred on Windows — branded icon + Task Manager name):
+   ```powershell
+   # Once after install / Python upgrade — copies pythonw → MarketAdvisor.exe
+   powershell -ExecutionPolicy Bypass -File .\Build-MarketAdvisor-Launcher.ps1
+   # Then use Desktop "Market Advisor" shortcut, or:
+   .\Start Market Advisor.lnk
+   ```
+   Debug / console mode: `cd Src` then `py main.py` (shows as `python.exe` in Task Manager).
+
+   **Task Manager:** Details lists `MarketAdvisor.exe` when launched via the launcher shortcuts.
+   Processes (Apps) groups under **Market Advisor** (window title + AppUserModelID).
+
+   Optional full freeze (standalone `dist\MarketAdvisor\MarketAdvisor.exe`, slower rebuild):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\Build-MarketAdvisor-PyInstaller.ps1
    ```
 
 ## Web monitor (read-only)

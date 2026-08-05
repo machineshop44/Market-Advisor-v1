@@ -1,7 +1,61 @@
+import os
 import time
 import math
+import random
+import pickle
 import importlib
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+
+
+# Coinbase Advanced REST: mirror etrade_client gap + retry (no OAuth inventing).
+_CB_MIN_REQUEST_GAP_SEC = 0.35
+_CB_MAX_RETRIES = 4
+
+
+def _as_dict(v):
+    """API leaves are often strings/None — never call .get on a non-dict."""
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v):
+    if v is None or v == "":
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        return [v]
+    return []
+
+
+def _money_value(nested, default=0.0):
+    """Extract float from Coinbase {value, currency} blobs or raw number/string."""
+    if nested is None:
+        return float(default)
+    if isinstance(nested, dict):
+        try:
+            return float(nested.get("value", default) or default)
+        except (TypeError, ValueError):
+            return float(default)
+    try:
+        return float(nested)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _cb_response_dict(res):
+    """Normalize SDK objects / odd payloads to a plain dict."""
+    if res is None:
+        return {}
+    if hasattr(res, "to_dict"):
+        try:
+            res = res.to_dict()
+        except Exception:
+            return {}
+    if isinstance(res, dict):
+        return res
+    if isinstance(res, list):
+        return {"accounts": res}
+    return {}
 
 
 class _LazyModule:
@@ -46,6 +100,15 @@ class BaseBroker:
     def __init__(self):
         self.is_connected = False
         self.broker_id = "BASE"
+        # Declarative capabilities — GUI scheduler / arming / scanners must honor these.
+        self.supports_equities = True
+        self.supports_crypto = False
+        self.supports_fractional_equities = True
+        self.supports_extended_hours = False
+        self.supports_options = False
+        self.supports_protective_stops = False
+        self.requires_daily_reauth = False
+        self.min_equity_notional = 1.0
 
     def login(self, credentials): raise NotImplementedError
     def logout(self): raise NotImplementedError
@@ -79,28 +142,116 @@ class BaseBroker:
             return True, "invalid size/price"
         return False, ""
 
+def robinhood_pickle_path(pickle_name=""):
+    """Default robin_stocks session file: ~/.tokens/robinhood.pickle"""
+    return os.path.join(os.path.expanduser("~"), ".tokens", f"robinhood{pickle_name}.pickle")
+
+
 class RobinhoodAdapter(BaseBroker):
     """The Robinhood translation layer."""
     def __init__(self):
         super().__init__()
         self.broker_id = "ROBINHOOD"
+        self.supports_equities = True
+        self.supports_crypto = True
+        self.supports_fractional_equities = True
+        self.supports_extended_hours = True
+        self.supports_protective_stops = True
+        self.min_equity_notional = 1.0
         self._crypto_inc_cache = {}
 
     def login(self, credentials):
+        """
+        Connect with email/password (may prompt SMS 2FA via patched input), or
+        restore-only with empty credentials (loads pickle — never interactive).
+
+        Important: restore must load ~/.tokens/robinhood.pickle into robin_stocks'
+        in-memory Authorization header. Calling load_account_profile() alone does
+        nothing if no session was loaded this process.
+        """
         try:
-            if credentials.get('email') and credentials.get('password'):
-                login_data = r.login(username=credentials['email'], password=credentials['password'], store_session=credentials.get('store_session', True))
-                if login_data and 'access_token' in login_data:
+            email = (credentials.get("email") or "").strip()
+            password = credentials.get("password") or ""
+            store_session = credentials.get("store_session", True)
+
+            if email and password:
+                login_data = r.login(
+                    username=email,
+                    password=password,
+                    store_session=store_session,
+                )
+                if login_data and "access_token" in login_data:
                     self.is_connected = True
                     return True, "Success"
-            
+                # Fall through: maybe tokens were set but return shape differed
+            else:
+                # Restore-only — never call r.login() without creds (it prompts
+                # username/password via input/getpass when pickle is missing/expired).
+                ok, detail = self._restore_from_pickle()
+                if ok:
+                    self.is_connected = True
+                    return True, detail
+                return False, detail
+
             profile = r.profiles.load_account_profile()
             if profile and "account_number" in profile:
                 self.is_connected = True
                 return True, "Session Verified"
             return False, "Invalid Credentials"
         except Exception as e:
+            self.is_connected = False
             return False, str(e)
+
+    def _restore_from_pickle(self, pickle_name=""):
+        """
+        Load robin_stocks pickle into the live session and verify with a cheap API call.
+        Returns (ok, detail). Never prompts for password or 2FA.
+        """
+        path = robinhood_pickle_path(pickle_name)
+        if not os.path.isfile(path):
+            return False, "no saved session"
+
+        try:
+            with open(path, "rb") as f:
+                pickle_data = pickle.load(f)
+            access_token = pickle_data["access_token"]
+            token_type = pickle_data["token_type"]
+        except Exception as e:
+            return False, f"saved session unreadable ({e})"
+
+        try:
+            from robin_stocks.robinhood.helper import (
+                set_login_state,
+                update_session,
+                request_get,
+            )
+            from robin_stocks.robinhood.urls import positions_url
+
+            set_login_state(True)
+            update_session("Authorization", f"{token_type} {access_token}")
+            # Same validity check robin_stocks.login uses when loading pickle
+            res = request_get(
+                positions_url(),
+                "pagination",
+                {"nonzero": "true"},
+                jsonify_data=False,
+            )
+            if res is None:
+                raise RuntimeError("session check returned no response")
+            res.raise_for_status()
+
+            profile = r.profiles.load_account_profile()
+            if not (isinstance(profile, dict) and profile.get("account_number")):
+                raise RuntimeError("account profile unavailable")
+            return True, "Session Verified"
+        except Exception:
+            try:
+                from robin_stocks.robinhood.helper import set_login_state, update_session
+                set_login_state(False)
+                update_session("Authorization", None)
+            except Exception:
+                pass
+            return False, "saved session expired"
 
     def logout(self):
         try: r.logout()
@@ -108,40 +259,57 @@ class RobinhoodAdapter(BaseBroker):
         self.is_connected = False
 
     def get_account_balances(self):
-        if not self.is_connected: return 0.0, 0.0
-        try:
-            acc = r.profiles.load_account_profile()
-            portfolio_value = float(acc.get('portfolio_equity', 0) or acc.get('equity', 0) or 0.0)
-            cash = max(float(acc.get('buying_power', 0)), float(acc.get('cash', 0)))
-            
-            if portfolio_value == 0.0:
-                holdings = r.build_holdings()
-                if holdings:
-                    for t, d in holdings.items():
-                        portfolio_value += float(d.get('equity', 0) or (float(d.get('quantity', 0)) * float(d.get('price', 0))))
-                portfolio_value += cash
-                
-            crypto_positions = r.crypto.get_crypto_positions()
-            if crypto_positions:
-                for pos in crypto_positions:
-                    qty = float(pos.get('quantity', 0))
-                    if qty > 0:
-                        symbol = pos['currency']['code']
-                        live_price = self.get_live_price(symbol)
-                        portfolio_value += (qty * live_price)
-            return portfolio_value, cash
-        except Exception: return 0.0, 0.0
+        if not self.is_connected:
+            raise RuntimeError("Robinhood not connected")
+        # Do NOT swallow API failures as $0,$0 — that fake-trips day-loss limits upstream.
+        acc = r.profiles.load_account_profile()
+        if not isinstance(acc, dict):
+            raise RuntimeError("Robinhood account profile unavailable")
+        portfolio_value = float(acc.get('portfolio_equity', 0) or acc.get('equity', 0) or 0.0)
+        cash = max(float(acc.get('buying_power', 0) or 0), float(acc.get('cash', 0) or 0))
+
+        if portfolio_value == 0.0:
+            holdings = r.build_holdings()
+            if isinstance(holdings, dict):
+                for t, d in holdings.items():
+                    if not isinstance(d, dict):
+                        continue
+                    portfolio_value += float(
+                        d.get('equity', 0)
+                        or (float(d.get('quantity', 0) or 0) * float(d.get('price', 0) or 0))
+                    )
+            portfolio_value += cash
+
+        crypto_positions = r.crypto.get_crypto_positions()
+        if crypto_positions:
+            for pos in crypto_positions:
+                if not isinstance(pos, dict):
+                    continue
+                qty = float(pos.get('quantity', 0) or 0)
+                if qty > 0:
+                    cur = pos.get('currency')
+                    if isinstance(cur, dict):
+                        symbol = cur.get('code') or cur.get('id') or ""
+                    else:
+                        symbol = str(cur or "")
+                    if not symbol:
+                        continue
+                    live_price = self.get_live_price(symbol)
+                    portfolio_value += (qty * live_price)
+        return portfolio_value, cash
 
     def get_current_holdings(self):
         assets = []
         if not self.is_connected: return assets
         try:
             holdings = r.build_holdings()
-            if holdings:
+            if isinstance(holdings, dict):
                 for ticker, data in holdings.items():
-                    qty = float(data.get('quantity', 0))
+                    if not isinstance(data, dict):
+                        continue
+                    qty = float(data.get('quantity', 0) or 0)
                     if qty > 0:
-                        cost = float(data.get('average_buy_price', 0))
+                        cost = float(data.get('average_buy_price', 0) or 0)
                         assets.append({'ticker': ticker, 'shares': qty, 'cost': cost, 'type': 'Ready (Stock)'})
         except Exception: pass
 
@@ -149,11 +317,19 @@ class RobinhoodAdapter(BaseBroker):
             crypto_positions = r.crypto.get_crypto_positions()
             if crypto_positions:
                 for pos in crypto_positions:
-                    qty = float(pos.get('quantity', 0))
+                    if not isinstance(pos, dict):
+                        continue
+                    qty = float(pos.get('quantity', 0) or 0)
                     if qty > 0:
-                        symbol = pos['currency']['code']
+                        cur = pos.get('currency')
+                        if isinstance(cur, dict):
+                            symbol = cur.get('code') or cur.get('id') or ""
+                        else:
+                            symbol = str(cur or "")
+                        if not symbol:
+                            continue
                         cb = pos.get('cost_bases')
-                        avg_cost = float(cb[0].get('direct_cost_basis', 0)) / qty if cb and len(cb) > 0 and qty > 0 else 0.0
+                        avg_cost = float(cb[0].get('direct_cost_basis', 0)) / qty if cb and isinstance(cb, list) and len(cb) > 0 and isinstance(cb[0], dict) and qty > 0 else 0.0
                         assets.append({'ticker': symbol, 'shares': qty, 'cost': avg_cost, 'type': 'Ready (Crypto)'})
         except Exception: pass
         return assets
@@ -164,7 +340,10 @@ class RobinhoodAdapter(BaseBroker):
         if clean in cryptos:
             try:
                 q = r.crypto.get_crypto_quote(clean)
-                if q and 'mark_price' in q and float(q['mark_price']) > 0: return float(q['mark_price'])
+                if isinstance(q, dict):
+                    mp = q.get('mark_price')
+                    if mp is not None and float(mp) > 0:
+                        return float(mp)
             except Exception: pass
             if not allow_yahoo_fallback:
                 return 0.0
@@ -192,7 +371,8 @@ class RobinhoodAdapter(BaseBroker):
         inc = self._get_crypto_qty_increment(ticker)
         min_qty = inc
         try:
-            info = r.crypto.get_crypto_info(ticker) or {}
+            raw_info = r.crypto.get_crypto_info(ticker)
+            info = raw_info if isinstance(raw_info, dict) else {}
             for key in ('min_order_size', 'crypto_min_order_size', 'min_order_quantity', 'min_order_quantity_increment'):
                 raw = info.get(key)
                 if raw is None:
@@ -679,26 +859,34 @@ class CoinbaseAdapter(BaseBroker):
     def __init__(self):
         super().__init__()
         self.broker_id = "COINBASE"
+        self.supports_equities = False
+        self.supports_crypto = True
+        self.supports_fractional_equities = False
+        self.supports_extended_hours = False
+        self.supports_protective_stops = False
+        self.min_equity_notional = 1.0
         self.client = None
+        # Kill switch (default True — CB has no sandbox; uncheck to block live orders).
+        self.live_trading_enabled = True
+        self._last_request_ts = 0.0
 
     def login(self, credentials):
         RESTClient = _get_rest_client_class()
         if not RESTClient or not COINBASE_AVAILABLE:
             return False, "coinbase-advanced-py not installed"
-        
+
         api_key = credentials.get('api_key')
         api_secret = credentials.get('api_secret')
-        
+
         if not api_key or not api_secret:
             return False, "Missing CDP API Key or Secret"
-            
+
         try:
+            self.live_trading_enabled = bool(credentials.get("live_trading_enabled", True))
             self.client = RESTClient(api_key=api_key, api_secret=api_secret)
-            # Make a test call to verify authentication
-            res = self.client.get_accounts(limit=1)
-            data = res.to_dict() if hasattr(res, 'to_dict') else res
-            
-            if data and 'accounts' in data:
+            data = self._cb_payload(self._cb_call(self.client.get_accounts, limit=1))
+
+            if data and ("accounts" in data or _as_list(data.get("accounts"))):
                 self.is_connected = True
                 return True, "Success"
             return False, "Authentication Failed"
@@ -709,18 +897,70 @@ class CoinbaseAdapter(BaseBroker):
         self.client = None
         self.is_connected = False
 
+    def _orders_allowed(self):
+        if self.live_trading_enabled:
+            return True, ""
+        return False, (
+            "Coinbase live trading is disabled. "
+            "Enable coinbase_live_trading in Settings / Coinbase login to place orders."
+        )
+
+    def _cb_throttle(self):
+        gap = _CB_MIN_REQUEST_GAP_SEC - (time.time() - self._last_request_ts)
+        if gap > 0:
+            time.sleep(gap)
+
+    def _cb_retryable(self, exc):
+        msg = str(exc or "").lower()
+        status = getattr(exc, "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+        return any(
+            tok in msg
+            for tok in (
+                "429", "500", "502", "503", "504",
+                "rate limit", "too many", "timeout", "temporar", "unavailable",
+            )
+        )
+
+    def _cb_call(self, fn, *args, **kwargs):
+        """Gap + exponential backoff on 429/5xx / transient SDK errors (ET-style)."""
+        last_err = None
+        for attempt in range(_CB_MAX_RETRIES):
+            self._cb_throttle()
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                if attempt >= _CB_MAX_RETRIES - 1 or not self._cb_retryable(e):
+                    raise
+                time.sleep(min(8.0, (0.6 * (2 ** attempt)) + random.random() * 0.3))
+            finally:
+                self._last_request_ts = time.time()
+        if last_err:
+            raise last_err
+        raise RuntimeError("Coinbase request failed after retries")
+
+    def _cb_payload(self, res):
+        return _cb_response_dict(res)
+
     def _fetch_all_accounts(self):
         """Helper to bypass Coinbase's 49-item default pagination limit."""
         all_accounts = []
         cursor = ""
         try:
             while True:
-                res = self.client.get_accounts(limit=250, cursor=cursor) if cursor else self.client.get_accounts(limit=250)
-                data = res.to_dict() if hasattr(res, 'to_dict') else res
-                all_accounts.extend(data.get('accounts', []))
-                
-                cursor = data.get('cursor', "")
-                has_next = data.get('has_next', False)
+                if cursor:
+                    res = self._cb_call(self.client.get_accounts, limit=250, cursor=cursor)
+                else:
+                    res = self._cb_call(self.client.get_accounts, limit=250)
+                data = self._cb_payload(res)
+                for acc in _as_list(data.get("accounts")):
+                    if isinstance(acc, dict):
+                        all_accounts.append(acc)
+
+                cursor = data.get("cursor", "") or ""
+                has_next = bool(data.get("has_next", False))
                 if not has_next or not cursor:
                     break
         except Exception as e:
@@ -728,57 +968,60 @@ class CoinbaseAdapter(BaseBroker):
         return all_accounts
 
     def get_account_balances(self):
-        if not self.is_connected: return 0.0, 0.0
+        if not self.is_connected:
+            raise RuntimeError("Coinbase not connected")
         try:
             total_value = 0.0
             buying_power = 0.0
-            
-            # Fetch all accounts via the pagination looper
             accounts = self._fetch_all_accounts()
-            
+
             for acc in accounts:
-                # Add available balance AND funds held in open limit orders
-                avail = float(acc.get('available_balance', {}).get('value', 0))
-                hold = float(acc.get('hold', {}).get('value', 0))
+                if not isinstance(acc, dict):
+                    continue
+                # Nested {value,currency} can be string/None — never .get-chain on non-dicts
+                avail = _money_value(acc.get("available_balance"))
+                hold = _money_value(acc.get("hold"))
                 total_qty = avail + hold
-                currency = acc.get('currency')
-                
+                currency = acc.get("currency")
+
                 if total_qty > 0:
                     if currency == "USD" or currency == "USDC":
-                        buying_power += avail  # Buying power is strictly available cash
+                        buying_power += avail
                         total_value += total_qty
                     else:
                         price = self.get_live_price(currency)
                         total_value += (total_qty * price)
-                        
+
             return total_value, buying_power
         except Exception as e:
             print(f"Coinbase get_account_balances error: {e}")
-            return 0.0, 0.0
+            raise
 
     def get_current_holdings(self):
         assets = []
-        if not self.is_connected: return assets
+        if not self.is_connected:
+            return assets
         try:
             accounts = self._fetch_all_accounts()
-            
+
             for acc in accounts:
-                # Add available balance AND funds held in open limit orders
-                avail = float(acc.get('available_balance', {}).get('value', 0))
-                hold = float(acc.get('hold', {}).get('value', 0))
+                if not isinstance(acc, dict):
+                    continue
+                avail = _money_value(acc.get("available_balance"))
+                hold = _money_value(acc.get("hold"))
                 total_qty = avail + hold
-                currency = acc.get('currency')
-                
+                currency = acc.get("currency")
+
                 if total_qty > 0 and currency not in ["USD", "USDC"]:
                     # Do NOT use live price as cost — that zeros out ROI and blocks sells.
                     # GUI overlays tracked buy cost via cost_basis_cache.
                     assets.append({
-                        'ticker': currency, 
-                        'shares': total_qty, 
-                        'cost': 0.0, 
-                        'type': 'Ready (Crypto)'
+                        "ticker": currency,
+                        "shares": total_qty,
+                        "cost": 0.0,
+                        "type": "Ready (Crypto)",
                     })
-        except Exception as e: 
+        except Exception as e:
             print(f"Coinbase get_current_holdings error: {e}")
             pass
         return assets
@@ -797,21 +1040,19 @@ class CoinbaseAdapter(BaseBroker):
         if self.is_connected and self.client:
             try:
                 product_id = f"{clean}-USD"
-                res = self.client.get_product(product_id=product_id)
-                data = res.to_dict() if hasattr(res, 'to_dict') else res
-                if data and data.get('price'):
-                    price = float(data['price'])
+                data = self._cb_payload(self._cb_call(self.client.get_product, product_id=product_id))
+                if data.get("price"):
+                    price = float(data["price"])
                     if price > 0:
                         return price
             except Exception:
                 pass
         if not allow_yahoo_fallback:
             return 0.0
-        # yfinance crypto fallback only (never treat as stock)
         try:
             df = yf.Ticker(f"{clean}-USD").history(period="1d")
             if not df.empty:
-                return float(df['Close'].iloc[-1])
+                return float(df["Close"].iloc[-1])
         except Exception:
             pass
         return 0.0
@@ -822,37 +1063,37 @@ class CoinbaseAdapter(BaseBroker):
         Cached per ticker.
         """
         clean = str(ticker).replace("-USD", "").upper()
-        if not hasattr(self, '_product_limits_cache'):
+        if not hasattr(self, "_product_limits_cache"):
             self._product_limits_cache = {}
         if clean in self._product_limits_cache:
             return self._product_limits_cache[clean]
 
         limits = {
-            'base_increment': 0.00000001,
-            'base_min_size': 0.0,
-            'quote_min_size': 1.0,  # sensible default USD floor
+            "base_increment": 0.00000001,
+            "base_min_size": 0.0,
+            "quote_min_size": 1.0,
         }
         if self.is_connected and self.client:
             try:
-                prod = self.client.get_product(product_id=f"{clean}-USD")
-                data = prod.to_dict() if hasattr(prod, 'to_dict') else prod
-                if isinstance(data, dict):
-                    for key in ('base_increment', 'base_min_size', 'quote_min_size', 'min_market_funds'):
-                        raw = data.get(key)
-                        if raw is None:
-                            continue
-                        try:
-                            val = float(raw)
-                        except Exception:
-                            continue
-                        if key == 'min_market_funds' and val > 0:
-                            limits['quote_min_size'] = max(limits['quote_min_size'], val)
-                        elif val > 0:
-                            limits[key] = val
+                data = self._cb_payload(
+                    self._cb_call(self.client.get_product, product_id=f"{clean}-USD")
+                )
+                for key in ("base_increment", "base_min_size", "quote_min_size", "min_market_funds"):
+                    raw = data.get(key)
+                    if raw is None:
+                        continue
+                    try:
+                        val = float(raw)
+                    except Exception:
+                        continue
+                    if key == "min_market_funds" and val > 0:
+                        limits["quote_min_size"] = max(limits["quote_min_size"], val)
+                    elif val > 0:
+                        limits[key] = val
             except Exception:
                 pass
-        if limits['base_min_size'] <= 0:
-            limits['base_min_size'] = limits['base_increment']
+        if limits["base_min_size"] <= 0:
+            limits["base_min_size"] = limits["base_increment"]
         self._product_limits_cache[clean] = limits
         return limits
 
@@ -867,9 +1108,9 @@ class CoinbaseAdapter(BaseBroker):
             return True, "invalid size/price"
 
         limits = self._get_product_limits(ticker)
-        inc = limits['base_increment']
-        min_base = limits['base_min_size']
-        min_quote = limits['quote_min_size']
+        inc = limits["base_increment"]
+        min_base = limits["base_min_size"]
+        min_quote = limits["quote_min_size"]
         d_inc = Decimal(str(inc))
         valid = (Decimal(str(shares)) / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
         if float(valid) <= 0:
@@ -882,29 +1123,33 @@ class CoinbaseAdapter(BaseBroker):
         return False, ""
 
     def _extract_order_id(self, data):
-        if not isinstance(data, dict):
-            return None
-        sr = data.get('success_response') or {}
-        if isinstance(sr, dict) and sr.get('order_id'):
-            return sr.get('order_id')
-        return data.get('order_id') or data.get('id')
+        data = _as_dict(data)
+        sr = _as_dict(data.get("success_response"))
+        if sr.get("order_id"):
+            return sr.get("order_id")
+        return data.get("order_id") or data.get("id")
 
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
                         market_hours="regular_hours", allow_fractional=True):
-        if not self.is_connected: return "Fail: Not connected", 0.0, None
+        if not self.is_connected:
+            return "Fail: Not connected", 0.0, None
+        ok, reason = self._orders_allowed()
+        if not ok:
+            return f"Fail: {reason}", 0.0, None
         clean = str(ticker).replace("-USD", "").upper()
         product_id = f"{clean}-USD"
 
         try:
             client_order_id = str(int(time.time() * 1000))
-            res = self.client.market_order_buy(
+            res = self._cb_call(
+                self.client.market_order_buy,
                 client_order_id=client_order_id,
                 product_id=product_id,
-                quote_size=str(round(trade_dollars, 2))
+                quote_size=str(round(trade_dollars, 2)),
             )
-            data = res.to_dict() if hasattr(res, 'to_dict') else res
+            data = self._cb_payload(res)
 
-            if data.get('success'):
+            if data.get("success"):
                 oid = self._extract_order_id(data)
                 conf, state = self.confirm_order(oid, is_crypto=True) if oid else (False, "no_id")
                 tag = "Filled" if conf else f"Pending/{state}"
@@ -915,7 +1160,11 @@ class CoinbaseAdapter(BaseBroker):
 
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
                          market_hours="regular_hours", allow_fractional=True):
-        if not self.is_connected: return "Fail: Not connected", None
+        if not self.is_connected:
+            return "Fail: Not connected", None
+        ok, reason = self._orders_allowed()
+        if not ok:
+            return f"Fail: {reason}", None
         clean = str(ticker).replace("-USD", "").upper()
         product_id = f"{clean}-USD"
 
@@ -925,25 +1174,27 @@ class CoinbaseAdapter(BaseBroker):
                 return f"Skipped: Dust ({reason})", None
 
             limits = self._get_product_limits(clean)
-            base_increment = float(limits.get('base_increment', 0.00000001))
+            base_increment = float(limits.get("base_increment", 0.00000001))
 
             d_inc = Decimal(str(base_increment))
             decimals = abs(d_inc.as_tuple().exponent)
             d_qty = Decimal(str(shares_val))
-            valid_qty_dec = (d_qty / d_inc).quantize(Decimal('1'), rounding=ROUND_DOWN) * d_inc
+            valid_qty_dec = (d_qty / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
 
-            if valid_qty_dec <= 0: return "Skipped: Quantity too small", None
+            if valid_qty_dec <= 0:
+                return "Skipped: Quantity too small", None
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
 
             client_order_id = str(int(time.time() * 1000))
-            res = self.client.market_order_sell(
+            res = self._cb_call(
+                self.client.market_order_sell,
                 client_order_id=client_order_id,
                 product_id=product_id,
-                base_size=safe_qty_str
+                base_size=safe_qty_str,
             )
-            data = res.to_dict() if hasattr(res, 'to_dict') else res
+            data = self._cb_payload(res)
 
-            if data.get('success'):
+            if data.get("success"):
                 oid = self._extract_order_id(data)
                 conf, state = self.confirm_order(oid, is_crypto=True) if oid else (False, "no_id")
                 tag = "Filled" if conf else f"Pending/{state}"
@@ -960,13 +1211,12 @@ class CoinbaseAdapter(BaseBroker):
         last_state = "unknown"
         while time.time() < deadline:
             try:
-                res = self.client.get_order(order_id)
-                data = res.to_dict() if hasattr(res, 'to_dict') else res
-                order = data.get('order') if isinstance(data, dict) else None
-                if isinstance(order, dict):
-                    last_state = str(order.get('status') or "unknown").upper()
-                elif isinstance(data, dict):
-                    last_state = str(data.get('status') or "unknown").upper()
+                data = self._cb_payload(self._cb_call(self.client.get_order, order_id))
+                order = _as_dict(data.get("order"))
+                if order:
+                    last_state = str(order.get("status") or "unknown").upper()
+                elif data:
+                    last_state = str(data.get("status") or "unknown").upper()
                 if last_state in ("FILLED", "COMPLETED"):
                     return True, last_state.lower()
                 if last_state in ("CANCELLED", "CANCELED", "EXPIRED", "FAILED", "REJECTED"):
@@ -980,8 +1230,7 @@ class CoinbaseAdapter(BaseBroker):
         if not order_id or not self.client:
             return False, "no_id"
         try:
-            res = self.client.cancel_orders([str(order_id)])
-            data = res.to_dict() if hasattr(res, "to_dict") else res
+            data = self._cb_payload(self._cb_call(self.client.cancel_orders, [str(order_id)]))
             return True, f"cancelled ({data})"
         except Exception as e:
             return False, str(e)
@@ -994,6 +1243,9 @@ class CoinbaseAdapter(BaseBroker):
         """
         if not self.is_connected or not self.client:
             return False, None, "not connected"
+        ok, reason = self._orders_allowed()
+        if not ok:
+            return False, None, reason
         try:
             clean = str(ticker).replace("-USD", "").upper()
             qty = float(quantity or 0)
@@ -1010,13 +1262,13 @@ class CoinbaseAdapter(BaseBroker):
                 return False, None, "qty below CB increment"
             stop_price = entry * (1.0 - stop_d)
             limit_price = stop_price * 0.995
-            # Format prices sensibly
             px_dec = 2 if entry >= 1.0 else 6
             stop_s = f"{stop_price:.{px_dec}f}"
             limit_s = f"{limit_price:.{px_dec}f}"
             size_s = format(float(valid), f".{decimals}f")
             client_order_id = f"prot-{int(time.time() * 1000)}"
-            res = self.client.stop_limit_order_gtc_sell(
+            res = self._cb_call(
+                self.client.stop_limit_order_gtc_sell,
                 client_order_id=client_order_id,
                 product_id=f"{clean}-USD",
                 base_size=size_s,
@@ -1024,11 +1276,11 @@ class CoinbaseAdapter(BaseBroker):
                 stop_price=stop_s,
                 stop_direction="STOP_DIRECTION_STOP_DOWN",
             )
-            data = res.to_dict() if hasattr(res, "to_dict") else res
-            if isinstance(data, dict) and data.get("success"):
+            data = self._cb_payload(res)
+            if data.get("success"):
                 oid = self._extract_order_id(data)
                 return True, oid, f"CB stop-limit @ {stop_s}/{limit_s}"
-            err = data.get("error_response") if isinstance(data, dict) else data
+            err = data.get("error_response") if data else data
             return False, None, f"CB stop-limit rejected: {err}"
         except Exception as e:
             return False, None, f"CB protective stop error: {e}"

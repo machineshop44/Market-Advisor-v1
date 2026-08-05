@@ -1,17 +1,39 @@
 # Creates Desktop + Start Menu + project-root shortcuts with custom icon AND AppUserModelID
 # so the Windows taskbar uses Market Advisor's icon instead of pythonw.exe / script.exe.
+#
+# Prefers MarketAdvisor.exe (copy of pythonw beside python3xx.dll) so Task Manager → Details
+# shows MarketAdvisor.exe. Run Build-MarketAdvisor-Launcher.ps1 once to install that copy.
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $root "Src"
 $main = Join-Path $src "main.py"
 $ico = Join-Path $src "app_icon.ico"
-$pythonw = "C:\Users\machi\AppData\Local\Programs\Python\Python312\pythonw.exe"
-if (-not (Test-Path $pythonw)) {
-    $cmd = Get-Command pythonw.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd) { $pythonw = $cmd.Source }
+
+function Resolve-PythonHost {
+    $candidates = @(
+        "C:\Users\machi\AppData\Local\Programs\Python\Python312\pythonw.exe",
+        "C:\Python314\pythonw.exe"
+    )
+    $pythonw = $null
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $pythonw = (Resolve-Path $c).Path; break }
+    }
+    if (-not $pythonw) {
+        $cmd = Get-Command pythonw.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) { $pythonw = $cmd.Source }
+    }
+    if (-not $pythonw) { throw "pythonw.exe not found" }
+
+    $launcher = Join-Path (Split-Path -Parent $pythonw) "MarketAdvisor.exe"
+    if (Test-Path $launcher) {
+        return @{ Exe = $launcher; Kind = "MarketAdvisor.exe (Task Manager friendly)" }
+    }
+    return @{ Exe = $pythonw; Kind = "pythonw.exe (run Build-MarketAdvisor-Launcher.ps1 to rename process)" }
 }
-if (-not (Test-Path $pythonw)) { throw "pythonw.exe not found" }
+
+$hostInfo = Resolve-PythonHost
+$appExe = $hostInfo.Exe
 if (-not (Test-Path $main)) { throw "main.py not found: $main" }
 if (-not (Test-Path $ico)) { throw "app_icon.ico not found: $ico - run Src\generate_app_icon.py first" }
 
@@ -23,7 +45,7 @@ New-Item -ItemType Directory -Force -Path $startDir | Out-Null
 function New-MaShortcut([string]$lnkPath) {
     $w = New-Object -ComObject WScript.Shell
     $sc = $w.CreateShortcut($lnkPath)
-    $sc.TargetPath = $pythonw
+    $sc.TargetPath = $appExe
     $sc.Arguments = "`"$main`""
     $sc.WorkingDirectory = $src
     $sc.WindowStyle = 1
@@ -113,11 +135,12 @@ New-MaShortcut $rootLnk
 # Keep VBS as a silent launcher (no window). Prefer the .lnk for a branded icon.
 $vbs = @"
 ' Market Advisor silent launcher (no CMD). For the branded icon, use Start Market Advisor.lnk
+' Process name in Task Manager Details: $(Split-Path -Leaf $appExe)
 Option Explicit
 Dim sh
 Set sh = CreateObject("WScript.Shell")
 sh.CurrentDirectory = "$src"
-sh.Run """$pythonw"" ""$main""", 0, False
+sh.Run """$appExe"" ""$main""", 0, False
 "@
 Set-Content -Path (Join-Path $root "Start Market Advisor.vbs") -Value $vbs -Encoding ASCII
 
@@ -125,7 +148,8 @@ Write-Host "Desktop shortcut: $desktopLnk"
 Write-Host "Start Menu shortcut: $startLnk"
 Write-Host "Project start shortcut: $rootLnk"
 Write-Host "Silent VBS (no custom icon): $(Join-Path $root 'Start Market Advisor.vbs')"
-Write-Host "Target: $pythonw"
+Write-Host "Target: $appExe"
+Write-Host "Host kind: $($hostInfo.Kind)"
 Write-Host "Icon: $ico"
 Write-Host "AppUserModelID: $appId"
 Write-Host "Quit any running Market Advisor, then start from the Desktop or project .lnk."

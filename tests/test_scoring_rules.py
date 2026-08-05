@@ -1,0 +1,77 @@
+"""Scoring: hard-stop cooldown, loss-streak pause, ATR sizing widen."""
+import os
+import sys
+import time
+import unittest
+from unittest.mock import patch
+
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+
+class TestHardStopCooldown(unittest.TestCase):
+    def setUp(self):
+        import scoring
+        for bid in scoring._KNOWN_BROKER_IDS:
+            scoring._cooldown_memory[bid] = {}
+            scoring._portfolio_memory[bid] = {}
+            scoring._loss_streak[bid] = {"events": [], "pause_until": 0.0}
+
+    def test_hard_stop_doubles_lockout(self):
+        import scoring
+        scoring._apply_cooldown("ROBINHOOD", "AAPL", sell_price=100.0, reason="hard_stop")
+        allowed, reason = scoring._check_hysteresis("AAPL", 101.0, is_crypto=False, broker_id="ROBINHOOD")
+        self.assertFalse(allowed)
+        self.assertIn("Cooldown", reason)
+        # Normal stock cooldown is 20m; hard-stop uses 2x → still locked at ~1m elapsed
+        self.assertGreaterEqual(scoring.STOCK_COOLDOWN * scoring.HARD_STOP_COOLDOWN_MULT, 30 * 60)
+
+    def test_loss_streak_pauses_new_buys(self):
+        import scoring
+        now = time.time()
+        with patch("scoring.time.time", return_value=now):
+            for _ in range(scoring.LOSS_STREAK_TRIGGER):
+                scoring._record_hard_stop_streak("COINBASE")
+            allowed, reason = scoring._loss_streak_block("COINBASE")
+            self.assertFalse(allowed)
+            self.assertIn("Loss-streak", reason)
+            # Entry path also blocked
+            ok, msg = scoring._check_hysteresis("BTC", 50000.0, is_crypto=True, broker_id="COINBASE")
+            self.assertFalse(ok)
+            self.assertIn("Loss-streak", msg)
+
+
+class TestAtrSizingStop(unittest.TestCase):
+    def test_sizing_widens_toward_atr(self):
+        import scoring
+        base = scoring.get_stop_distance_pct("ROBINHOOD", ticker="SPY", asset_type="stock")
+        with patch("scoring._atr_pct", return_value=0.04):
+            widened = scoring.get_stop_distance_pct(
+                "ROBINHOOD", ticker="SPY", asset_type="stock", for_sizing=True
+            )
+        self.assertGreater(widened, base)
+        self.assertLessEqual(widened, base * scoring.ATR_SIZING_CAP_MULT)
+        # Exit hard-stop distance unchanged when for_sizing=False
+        with patch("scoring._atr_pct", return_value=0.04):
+            exit_d = scoring.get_stop_distance_pct("ROBINHOOD", ticker="SPY", asset_type="stock")
+        self.assertAlmostEqual(exit_d, base)
+
+    def test_evaluate_holding_tags_hard_stop(self):
+        import scoring
+        for bid in scoring._KNOWN_BROKER_IDS:
+            scoring._cooldown_memory[bid] = {}
+            scoring._portfolio_memory[bid] = {}
+            scoring._loss_streak[bid] = {"events": [], "pause_until": 0.0}
+        with patch("scoring.save_state"):
+            action = scoring.evaluate_holding(
+                "META", avg_cost=100.0, broker_id="ROBINHOOD",
+                asset_type="stock", live_price=96.0,  # -4% < -3.5% hard stop
+            )
+        self.assertIn("Hard Stop", action)
+        cool = scoring._cooldown_memory["ROBINHOOD"].get("META") or {}
+        self.assertEqual(cool.get("reason"), "hard_stop")
+
+
+if __name__ == "__main__":
+    unittest.main()

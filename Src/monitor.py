@@ -24,17 +24,18 @@ _status = {
     "version": APP_VERSION,
     "mode": "LIVE",
     "market": "Unknown",
-    "auto_trader": {"Robinhood": False, "Coinbase": False},
+    "auto_trader": {"Robinhood": False, "Coinbase": False, "E*TRADE": False},
     "banner": "Offline",
     "balances": {
         "Robinhood": {"equity": 0.0, "cash": 0.0, "day_pnl": 0.0},
         "Coinbase": {"equity": 0.0, "cash": 0.0, "day_pnl": 0.0},
+        "E*TRADE": {"equity": 0.0, "cash": 0.0, "day_pnl": 0.0},
         "combined": {"equity": 0.0, "cash": 0.0, "day_pnl": 0.0},
     },
     "queue": [],
     "recent_trades": [],
     "recent_log": [],
-    "holdings_count": {"Robinhood": 0, "Coinbase": 0},
+    "holdings_count": {"Robinhood": 0, "Coinbase": 0, "E*TRADE": 0},
 }
 
 _auth_user = ""
@@ -96,6 +97,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .grid { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
   .grid.metrics { grid-template-columns: 1fr; }
   .grid.brokers { grid-template-columns: 1fr; }
+  .grid.autos { grid-template-columns: 1fr; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
   }
@@ -121,14 +123,14 @@ HTML_PAGE = """<!DOCTYPE html>
          max-height: 200px; overflow: auto; white-space: pre-wrap; }
   a { color: var(--blue); }
 
-  /* Tablet+ */
   @media (min-width: 640px) {
     body { padding: 20px; }
     h1 { font-size: 1.35rem; }
     .sub { font-size: 0.9rem; margin-bottom: 18px; }
     .grid { gap: 14px; grid-template-columns: repeat(4, 1fr); }
     .grid.metrics { grid-template-columns: repeat(3, 1fr); }
-    .grid.brokers { grid-template-columns: 1fr 1fr; }
+    .grid.brokers { grid-template-columns: 1fr 1fr 1fr; }
+    .grid.autos { grid-template-columns: repeat(3, 1fr); }
     .card { padding: 14px 16px; }
     .value { font-size: 1.45rem; }
     .value.sm { font-size: 1.05rem; }
@@ -144,9 +146,8 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="grid">
     <div class="card"><div class="label">Mode</div><div class="value sm" id="mode">—</div></div>
     <div class="card"><div class="label">Market</div><div class="value sm" id="market">—</div></div>
-    <div class="card"><div class="label">Robinhood Auto</div><div class="value sm" id="rh_auto">—</div></div>
-    <div class="card"><div class="label">Coinbase Auto</div><div class="value sm" id="cb_auto">—</div></div>
   </div>
+  <div class="grid autos" id="auto_cards" style="margin-top:10px"></div>
 
   <div class="banner" id="banner">Waiting for app…</div>
 
@@ -165,16 +166,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="grid brokers" style="margin-top:14px">
-    <div class="card">
-      <div class="label">Robinhood</div>
-      <div class="value sm" id="rh_line">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Coinbase</div>
-      <div class="value sm" id="cb_line">—</div>
-    </div>
-  </div>
+  <div class="grid brokers" id="broker_cards" style="margin-top:14px"></div>
 
   <div class="card" style="margin-top:14px">
     <div class="label">Recent Trades</div>
@@ -198,6 +190,12 @@ function money(n){
 }
 function pnlClass(n){ const x=Number(n||0); return x>0.001?'pos':(x<-0.001?'neg':'neu'); }
 function pill(on){ return on ? '<span class="pill on">ON</span>' : '<span class="pill off">OFF</span>'; }
+function brokerNames(d){
+  const bal = d.balances || {};
+  const names = Object.keys(bal).filter(k => k !== 'combined');
+  if(names.length) return names;
+  return Object.keys(d.auto_trader || {});
+}
 
 async function refresh(){
   try{
@@ -208,8 +206,6 @@ async function refresh(){
     document.getElementById('updated').textContent = 'Updated ' + (d.updated_at || '—');
     document.getElementById('mode').textContent = d.mode || '—';
     document.getElementById('market').textContent = d.market || '—';
-    document.getElementById('rh_auto').innerHTML = pill(!!(d.auto_trader||{}).Robinhood);
-    document.getElementById('cb_auto').innerHTML = pill(!!(d.auto_trader||{}).Coinbase);
     document.getElementById('banner').textContent = d.banner || '—';
     const c = (d.balances||{}).combined || {};
     document.getElementById('eq').textContent = money(c.equity);
@@ -217,14 +213,29 @@ async function refresh(){
     const p = document.getElementById('pnl');
     p.textContent = money(c.day_pnl);
     p.className = 'value ' + pnlClass(c.day_pnl);
-    const rh = (d.balances||{}).Robinhood || {};
-    const cb = (d.balances||{}).Coinbase || {};
-    document.getElementById('rh_line').innerHTML =
-      money(rh.equity) + ' · cash ' + money(rh.cash) +
-      ' · <span class="'+pnlClass(rh.day_pnl)+'">' + money(rh.day_pnl) + '</span>';
-    document.getElementById('cb_line').innerHTML =
-      money(cb.equity) + ' · cash ' + money(cb.cash) +
-      ' · <span class="'+pnlClass(cb.day_pnl)+'">' + money(cb.day_pnl) + '</span>';
+
+    const names = brokerNames(d);
+    const autoHost = document.getElementById('auto_cards');
+    autoHost.innerHTML = '';
+    names.forEach(n=>{
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = '<div class="label">'+n+' Auto</div><div class="value sm">'+
+        pill(!!(d.auto_trader||{})[n])+'</div>';
+      autoHost.appendChild(card);
+    });
+    const bHost = document.getElementById('broker_cards');
+    bHost.innerHTML = '';
+    names.forEach(n=>{
+      const b = (d.balances||{})[n] || {};
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = '<div class="label">'+n+'</div><div class="value sm">'+
+        money(b.equity)+' · cash '+money(b.cash)+
+        ' · <span class="'+pnlClass(b.day_pnl)+'">'+money(b.day_pnl)+'</span></div>';
+      bHost.appendChild(card);
+    });
+
     const tb = document.getElementById('trades');
     tb.innerHTML = '';
     (d.recent_trades||[]).slice().reverse().forEach(t=>{

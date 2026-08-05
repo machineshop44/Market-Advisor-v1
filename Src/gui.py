@@ -14,15 +14,24 @@ from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBo
                              QLabel, QTableWidget, QTableWidgetItem, QHeaderView, 
                              QPushButton, QMessageBox, QInputDialog, QLineEdit, 
                              QApplication, QStatusBar, QFrame, QCheckBox, QComboBox,
-                             QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog, QDialog, QFormLayout, QGroupBox,
+                             QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog, QDialog, QDialogButtonBox,
+                             QFormLayout, QGroupBox,
                              QSystemTrayIcon, QMenu, QAction, QScrollArea, QSizePolicy)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QEventLoop, QPoint, QSize
-from PyQt5.QtGui import QPainter, QPen, QColor, QPalette, QPixmap, QPolygon, QIcon
+from PyQt5.QtGui import QPainter, QPen, QColor, QPalette, QPixmap, QPolygon, QIcon, QCursor
 import threading
 
 import journal
 import monitor
+from balance_guard import (
+    balance_reading_is_suspicious,
+    decide_suspicious_equity,
+    is_near_zero_wipe,
+    reference_equity,
+    NEAR_ZERO_EQUITY,
+)
 from broker import RobinhoodAdapter, CoinbaseAdapter
+from etrade_broker import ETradeAdapter
 from version import (
     APP_NAME,
     APP_NAME_COMPACT,
@@ -54,6 +63,30 @@ def _get_overview_class():
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 ACTIVITY_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activity_log.txt")
 KNOWN_CRYPTOS = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
+BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
+
+
+def _blank_broker_map(default=None):
+    """Per-broker dict seed for the three adapters."""
+    if callable(default):
+        return {n: default() for n in BROKER_NAMES}
+    return {n: default for n in BROKER_NAMES}
+
+
+def _is_manual_auth_failure(detail):
+    """True when reconnect cannot succeed without user OAuth / credentials."""
+    text = str(detail or "").lower()
+    needles = (
+        "no access token",
+        "reauthorization required",
+        "authorize in browser",
+        "verification code",
+        "missing e*trade consumer",
+        "missing saved credentials",
+        "missing saved api keys",
+        "access token expired at midnight",
+    )
+    return any(n in text for n in needles)
 
 
 class SuppressPrints:
@@ -102,10 +135,21 @@ def load_settings():
         "allocation_pct_crypto": 8.0,
         "allocation_pct_stock": 5.0,
         "min_trade_dollars": 5.0,
+        "risk_posture": "balanced",
+        "target_bp_utilization_pct": 88.0,
+        "sizing_focus_slots": 6,
+        "max_single_name_equity_pct": 15.0,
+        "conviction_alloc_mult_max": 1.50,
+        "allow_scale_in": True,
+        "scale_in_max_adds": 1,
+        "scale_in_size_frac": 0.50,
+        "exit_roi_scale": 1.0,
+        "exit_time_scale": 1.0,
+        "ttp_arm_scale": 1.0,
         "limit_offset_pct": 0.1,
         "daily_profit_target": 0.0,
         "daily_loss_limit": 8.0,
-        "max_open_positions": 20,
+        "max_open_positions": 8,
         "max_buys_per_cycle": 2,
         "interval_crypto": 45,
         "interval_penny": 60,
@@ -115,7 +159,13 @@ def load_settings():
         "rh_email": "",
         "rh_password": "",
         "cb_api_key": "",
-        "cb_api_secret": ""
+        "cb_api_secret": "",
+        "coinbase_live_trading": True,
+        "etrade_environment": "sandbox",
+        "etrade_consumer_key": "",
+        "etrade_account_id_key": "",
+        "etrade_token_expires_at": 0.0,
+        "etrade_live_trading": False,
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -300,6 +350,178 @@ def polish_table(table):
     table.verticalHeader().setDefaultSectionSize(ui_px(UI_ROW_HEIGHT))
 
 
+class BrokerArmDialog(QDialog):
+    """Checkbox picker to arm / update Auto-Trader per broker."""
+
+    def __init__(self, parent, broker_rows, dark_mode=True, managing=False):
+        """
+        broker_rows: list of dicts with keys:
+          name, label, enabled (checkbox enabled), checked (initial)
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Manage Armed Brokers" if managing else "Arm Auto-Trader")
+        self.setModal(True)
+        self.setMinimumWidth(ui_px(420))
+        tc = theme_colors(dark_mode)
+        if dark_mode:
+            self.setStyleSheet(
+                f"""
+                QDialog {{ background-color: #151820; color: {tc['text']}; }}
+                QLabel {{ color: {tc['text']}; background: transparent; }}
+                QCheckBox {{ color: {tc['text']}; spacing: {ui_px(8)}px; }}
+                QCheckBox::indicator {{
+                    width: {ui_px(16)}px; height: {ui_px(16)}px;
+                    border: 1px solid #3A4150; border-radius: 3px; background: #1A1D24;
+                }}
+                QCheckBox::indicator:checked {{
+                    background-color: {UI_ACCENT}; border-color: {UI_ACCENT};
+                }}
+                QCheckBox::indicator:disabled {{
+                    background-color: #22262E; border-color: #2A2F3A;
+                }}
+                QPushButton {{
+                    background-color: #22262E; color: {tc['text']};
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_BTN)}px;
+                    padding: {ui_px(7)}px {ui_px(14)}px; min-height: {ui_px(28)}px;
+                }}
+                QPushButton:hover {{ background-color: #2A303A; border-color: #3A4150; }}
+                """
+            )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(ui_px(16), ui_px(14), ui_px(16), ui_px(14))
+        root.setSpacing(ui_px(10))
+
+        hint = QLabel(
+            "Choose which brokers Auto-Trader should run on. "
+            "Uncheck a broker to leave it disarmed (or disarm it if already on)."
+            if managing else
+            "Select one or more connected brokers to arm. Use Select All for every eligible broker."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {tc['muted']}; font-size: {ui_px(12)}px;")
+        root.addWidget(hint)
+
+        self._checks = {}
+        for row in broker_rows:
+            name = row["name"]
+            chk = QCheckBox(row["label"])
+            chk.setEnabled(bool(row.get("enabled", True)))
+            chk.setChecked(bool(row.get("checked", False)) and chk.isEnabled())
+            if not chk.isEnabled():
+                chk.setToolTip(row.get("disabled_tip") or "Connect this broker in Settings (or enable Paper Mode).")
+            self._checks[name] = chk
+            root.addWidget(chk)
+
+        sel_row = QHBoxLayout()
+        sel_row.setSpacing(ui_px(8))
+        select_all_btn = QPushButton("Select All")
+        clear_btn = QPushButton("Clear")
+        select_all_btn.clicked.connect(self._select_all_eligible)
+        clear_btn.clicked.connect(self._clear_all)
+        sel_row.addWidget(select_all_btn)
+        sel_row.addWidget(clear_btn)
+        sel_row.addStretch(1)
+        root.addLayout(sel_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_btn = buttons.button(QDialogButtonBox.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+        if ok_btn:
+            ok_btn.setText("OK")
+            ok_btn.setProperty("uiBtnKind", "primary")
+            ok_btn.setStyleSheet(action_btn_style("primary"))
+        if cancel_btn:
+            cancel_btn.setText("Cancel")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _select_all_eligible(self):
+        for chk in self._checks.values():
+            if chk.isEnabled():
+                chk.setChecked(True)
+
+    def _clear_all(self):
+        for chk in self._checks.values():
+            chk.setChecked(False)
+
+    def selected_brokers(self):
+        return [name for name, chk in self._checks.items() if chk.isChecked() and chk.isEnabled()]
+
+
+class AutoTraderOffDialog(QDialog):
+    """When Auto-Trader is ON: turn everything off, or open the broker picker."""
+
+    OFF_ALL = 1
+    MANAGE = 2
+
+    def __init__(self, parent, armed_brokers, dark_mode=True):
+        super().__init__(parent)
+        self.setWindowTitle("Auto-Trader")
+        self.setModal(True)
+        self.setMinimumWidth(ui_px(420))
+        self.choice = None
+        tc = theme_colors(dark_mode)
+        if dark_mode:
+            self.setStyleSheet(
+                f"""
+                QDialog {{ background-color: #151820; color: {tc['text']}; }}
+                QLabel {{ color: {tc['text']}; background: transparent; }}
+                QPushButton {{
+                    background-color: #22262E; color: {tc['text']};
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_BTN)}px;
+                    padding: {ui_px(7)}px {ui_px(14)}px; min-height: {ui_px(28)}px;
+                }}
+                QPushButton:hover {{ background-color: #2A303A; border-color: #3A4150; }}
+                """
+            )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(ui_px(16), ui_px(14), ui_px(16), ui_px(14))
+        root.setSpacing(ui_px(10))
+
+        title = QLabel("Turn off Auto-Trader for all brokers?")
+        title.setStyleSheet(f"font-size: {ui_px(14)}px; font-weight: 600; color: {tc['text']};")
+        root.addWidget(title)
+
+        armed = ", ".join(armed_brokers) if armed_brokers else "none"
+        hint = QLabel(
+            f"Currently armed: {armed}.\n\n"
+            "Turn off all disarms every broker immediately. "
+            "Change brokers opens the picker to add or remove individual brokers."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {tc['muted']}; font-size: {ui_px(12)}px;")
+        root.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(ui_px(8))
+        cancel_btn = QPushButton("Cancel")
+        manage_btn = QPushButton("Change brokers…")
+        off_btn = QPushButton("Turn off all")
+        off_btn.setProperty("uiBtnKind", "primary")
+        off_btn.setStyleSheet(action_btn_style("danger"))
+        cancel_btn.clicked.connect(self.reject)
+        manage_btn.clicked.connect(self._choose_manage)
+        off_btn.clicked.connect(self._choose_off_all)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(manage_btn)
+        btn_row.addWidget(off_btn)
+        root.addLayout(btn_row)
+        off_btn.setDefault(True)
+        off_btn.setFocus()
+
+    def _choose_off_all(self):
+        self.choice = self.OFF_ALL
+        self.accept()
+
+    def _choose_manage(self):
+        self.choice = self.MANAGE
+        self.accept()
+
+
 def _write_combo_arrow_png(path, fill_hex):
     """Tiny triangle PNG so QComboBox::down-arrow stays visible on Windows Fusion."""
     pm = QPixmap(14, 10)
@@ -322,6 +544,37 @@ def combo_arrow_path(dark_mode):
     except Exception as e:
         print(f"combo arrow write failed: {e}")
     return path.replace("\\", "/")
+
+
+def _write_spin_arrow_png(path, fill_hex, pointing_up):
+    """Tiny triangle PNG so QSpinBox up/down arrows stay visible on Windows Fusion."""
+    pm = QPixmap(12, 8)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor(fill_hex))
+    painter.setPen(Qt.NoPen)
+    if pointing_up:
+        painter.drawPolygon(QPolygon([QPoint(1, 7), QPoint(11, 7), QPoint(6, 1)]))
+    else:
+        painter.drawPolygon(QPolygon([QPoint(1, 1), QPoint(11, 1), QPoint(6, 7)]))
+    painter.end()
+    pm.save(path, "PNG")
+
+
+def spin_arrow_paths(dark_mode):
+    """Return (up_arrow_url, down_arrow_url) for themed QSpinBox / QDoubleSpinBox."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    suffix = "dark" if dark_mode else "light"
+    up_path = os.path.join(base, f"_spin_arrow_up_{suffix}.png")
+    down_path = os.path.join(base, f"_spin_arrow_down_{suffix}.png")
+    fill = "#E0E0E0" if dark_mode else "#212121"
+    try:
+        _write_spin_arrow_png(up_path, fill, pointing_up=True)
+        _write_spin_arrow_png(down_path, fill, pointing_up=False)
+    except Exception as e:
+        print(f"spin arrow write failed: {e}")
+    return up_path.replace("\\", "/"), down_path.replace("\\", "/")
 
 
 def format_quantity(value):
@@ -543,12 +796,19 @@ class BackgroundTask(QThread):
             res = self.target_func(*self.args, **self.kwargs)
             self.result_ready.emit(res)
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            try:
+                import traceback
+                detail = f"{e}\n{traceback.format_exc()}"
+            except Exception:
+                detail = str(e)
+            self.error_occurred.emit(detail)
 
 
 class MarketAdvisorGUI(QMainWindow):
     _launch_discord_finished = pyqtSignal(bool, str)
     _log_line_ready = pyqtSignal(str)
+    # Worker thread → main: request SMS/2FA without blocking the event loop
+    _rh_sms_prompt = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -561,7 +821,13 @@ class MarketAdvisorGUI(QMainWindow):
         self._scale_timer.timeout.connect(self._on_scale_timer)
         self._launch_discord_finished.connect(self._on_launch_discord_finished)
         self._log_line_ready.connect(self._append_log_line_ui)
-        
+        self._rh_sms_prompt.connect(self._on_rh_sms_prompt)
+        self._rh_sms_event = threading.Event()
+        self._rh_sms_code = ""
+        self._rh_sms_dialog = None
+        self._rh_login_in_flight = False
+        self._cb_login_in_flight = False
+
         self.settings = load_settings()
         self.dark_mode = self.settings.get("dark_mode", False)
         self.paper_mode = self.settings.get("paper_mode", False)
@@ -569,43 +835,55 @@ class MarketAdvisorGUI(QMainWindow):
         # Initialize Broker Adapters
         self.brokers = {
             "Robinhood": RobinhoodAdapter(),
-            "Coinbase": CoinbaseAdapter()
+            "Coinbase": CoinbaseAdapter(),
+            "E*TRADE": ETradeAdapter(),
         }
         try:
             from scoring import register_regime_brokers
             register_regime_brokers(
                 robinhood=self.brokers["Robinhood"],
                 coinbase=self.brokers["Coinbase"],
+                etrade=self.brokers["E*TRADE"],
             )
         except Exception:
             pass
         self.active_broker_name = "Robinhood"
-        self.view_mode = "All"  # Dropdown: All | Robinhood | Coinbase
+        self.view_mode = "All"  # Dropdown: All | Robinhood | Coinbase | E*TRADE
         self.penny_tab_index = 3
         self.core_tab_index = 4
         self.ipo_tab_index = -1
         self._ipo_refresh_in_flight = False
-        self._last_balance_totals = {"Robinhood": {'p_val': 0.0, 'bp': 0.0}, "Coinbase": {'p_val': 0.0, 'bp': 0.0}}
+        self._last_balance_totals = _blank_broker_map(lambda: {'p_val': 0.0, 'bp': 0.0})
         
-        self.auto_trade_enabled = {"Robinhood": False, "Coinbase": False}
+        self.auto_trade_enabled = _blank_broker_map(False)
         self.task_queue = []
         self.is_processing_queue = False
         self._cycle_broker = None  # Broker locked for the in-flight auto-trade cycle
         self._queue_started_at = None
         self._stall_alerted = False
-        self._reconnect_cooldown = {"Robinhood": 0.0, "Coinbase": 0.0}
-        self._reconnect_fail_streak = {"Robinhood": 0, "Coinbase": 0}
-        self._reconnect_in_flight = {"Robinhood": False, "Coinbase": False}
-        self._holdings_count_cache = {"Robinhood": 0, "Coinbase": 0}
-        self._balance_bad_streak = {"Robinhood": 0, "Coinbase": 0}
+        self._reconnect_cooldown = _blank_broker_map(0.0)
+        self._reconnect_fail_streak = _blank_broker_map(0)
+        self._reconnect_in_flight = _blank_broker_map(False)
+        self._holdings_count_cache = _blank_broker_map(0)
+        self._balance_bad_streak = _blank_broker_map(0)
+        # Last non-glitch equity per broker (survives rejected $0 reads)
+        self._last_trusted_equity = _blank_broker_map(None)
+        # Log "disconnected" / unreliable-zero skip once per stretch (avoids ~60s spam)
+        self._balance_disconnected_warned = _blank_broker_map(False)
+        self._balance_zero_glitch_warned = _blank_broker_map(False)
+        # Rate-limit identical cycle Discord alerts: {key: (last_sent_ts, suppressed_count)}
+        self._cycle_error_discord_cooldown = {}
+        # Manual OAuth / missing token — do not auto-reconnect-loop
+        self._broker_manual_auth_needed = _blank_broker_map(False)
         self._balances_refresh_in_flight = False
         self._last_idle_balance_refresh = 0.0
-        self.cost_basis_cache = {"Robinhood": {}, "Coinbase": {}}
+        self._startup_connect_finished = False
+        self.cost_basis_cache = _blank_broker_map(lambda: {})
         self._scoring_state_loaded = False
-        self.last_crypto_time = {"Robinhood": 0, "Coinbase": 0}
-        self.last_penny_time = {"Robinhood": 0, "Coinbase": 0}
-        self.last_core_time = {"Robinhood": 0, "Coinbase": 0}
-        self.last_port_time = {"Robinhood": 0, "Coinbase": 0}
+        self.last_crypto_time = _blank_broker_map(0)
+        self.last_penny_time = _blank_broker_map(0)
+        self.last_core_time = _blank_broker_map(0)
+        self.last_port_time = _blank_broker_map(0)
         
         self.last_heartbeat_time = time.time()
         self._last_heartbeat_slot = None
@@ -629,14 +907,11 @@ class MarketAdvisorGUI(QMainWindow):
         
         self.trade_locks = {}
         self._portfolio_fingerprint = ""
-        self.sandbox_cash = {"Robinhood": 10000.00, "Coinbase": 10000.00}
-        self.sandbox_holdings = {"Robinhood": {}, "Coinbase": {}}  # {ticker: {'shares':, 'cost':, 'type':}}
+        self.sandbox_cash = _blank_broker_map(10000.00)
+        self.sandbox_holdings = _blank_broker_map(lambda: {})  # {ticker: {'shares':, 'cost':, 'type':}}
         
         # Track P&L Independently per broker
-        self.session_starts = {
-            "Robinhood": None,
-            "Coinbase": None
-        }
+        self.session_starts = _blank_broker_map(None)
         self._restore_session_baselines()
         
         self.active_threads = []
@@ -963,29 +1238,34 @@ class MarketAdvisorGUI(QMainWindow):
 
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.tray_icon = None
+            self._tray_menu = None
             self.log_event("System tray unavailable — close will exit the app.")
             return
 
         self.tray_icon = QSystemTrayIcon(self.app_icon, self)
         self.tray_icon.setToolTip(display_name())
 
-        menu = QMenu()
+        # Keep a strong, parented menu ref — unparented QMenu can GC on Windows
+        # and right-click then shows nothing.
+        self._tray_menu = QMenu(self)
         show_act = QAction(f"Open {APP_NAME}", self)
         show_act.triggered.connect(self.show_from_tray)
-        menu.addAction(show_act)
-        menu.addSeparator()
-        quit_act = QAction("Quit", self)
+        self._tray_menu.addAction(show_act)
+        self._tray_menu.addSeparator()
+        quit_act = QAction("Exit", self)
         quit_act.triggered.connect(self.quit_from_tray)
-        menu.addAction(quit_act)
+        self._tray_menu.addAction(quit_act)
 
-        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.setContextMenu(self._tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
 
     def _on_tray_activated(self, reason):
-        # Double-click or single left-click restores the window
+        # Left / double-click restores; Context is a fallback if OS ignores setContextMenu
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.show_from_tray()
+        elif reason == QSystemTrayIcon.Context and getattr(self, "_tray_menu", None) is not None:
+            self._tray_menu.popup(QCursor.pos())
 
     def show_from_tray(self):
         self.showNormal()
@@ -993,8 +1273,30 @@ class MarketAdvisorGUI(QMainWindow):
         self.activateWindow()
 
     def quit_from_tray(self):
+        """Hard exit from tray — skip minimize-to-tray prompt."""
         self._force_quit = True
-        self.close()
+        # Unblock any RH worker waiting on SMS/2FA so threads can wind down
+        try:
+            self._rh_sms_code = ""
+            if getattr(self, "_rh_sms_event", None) is not None:
+                self._rh_sms_event.set()
+            dlg = getattr(self, "_rh_sms_dialog", None)
+            if dlg is not None:
+                dlg.reject()
+        except Exception:
+            pass
+        try:
+            monitor.stop_monitor()
+        except Exception:
+            pass
+        try:
+            from scoring import flush_state
+            flush_state()
+        except Exception:
+            pass
+        if self.tray_icon:
+            self.tray_icon.hide()
+        QApplication.instance().quit()
 
     def closeEvent(self, event):
         # X / Alt+F4 → ask: tray vs quit (tray keeps auto-trader + web monitor alive)
@@ -1034,6 +1336,17 @@ class MarketAdvisorGUI(QMainWindow):
             # Quit app — fall through to full shutdown
             self._force_quit = True
 
+        # Unblock RH worker waiting on SMS if we're actually exiting
+        try:
+            self._rh_sms_code = ""
+            if getattr(self, "_rh_sms_event", None) is not None:
+                self._rh_sms_event.set()
+            dlg = getattr(self, "_rh_sms_dialog", None)
+            if dlg is not None:
+                dlg.reject()
+        except Exception:
+            pass
+
         try:
             monitor.stop_monitor()
         except Exception:
@@ -1049,11 +1362,72 @@ class MarketAdvisorGUI(QMainWindow):
         QApplication.instance().quit()
 
     # ---------------------------------------------------------
-    #  GUI INPUT INTERCEPTOR FOR 2FA
+    #  ROBINHOOD 2FA — worker waits; main thread shows non-blocking dialog
     # ---------------------------------------------------------
-    def _gui_input_prompt(self, prompt):
-        code, ok = QInputDialog.getText(self, "2FA Required", f"{prompt}\n\nEnter the SMS code sent to your phone:")
-        return code if ok else ""
+    def _worker_rh_input_prompt(self, prompt):
+        """
+        Called from the RH login worker thread (via builtins.input patch).
+        Must not touch Qt widgets — emit to main and wait on a threading.Event.
+        """
+        self._rh_sms_code = ""
+        self._rh_sms_event.clear()
+        self._rh_sms_prompt.emit(str(prompt or "Enter the verification code"))
+        if not self._rh_sms_event.wait(timeout=600):
+            return ""
+        return self._rh_sms_code or ""
+
+    def _on_rh_sms_prompt(self, prompt):
+        """Main thread: open SMS dialog with open() — never exec_/getText (keeps tray alive)."""
+        self._set_broker_status(
+            "Robinhood",
+            "🟡 Waiting for Robinhood 2FA — check phone/SMS or authenticator…",
+            "color: #FFD54F; font-weight: bold;",
+        )
+        self.set_working_state(
+            True, "Waiting for Robinhood 2FA — check phone/SMS or authenticator…"
+        )
+        self.log_event(
+            "Robinhood: waiting for 2FA — check your phone/SMS or authenticator app…"
+        )
+
+        old = getattr(self, "_rh_sms_dialog", None)
+        if old is not None:
+            try:
+                old.finished.disconnect()
+            except Exception:
+                pass
+            try:
+                old.reject()
+            except Exception:
+                pass
+            self._rh_sms_dialog = None
+
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("Robinhood 2FA")
+        dlg.setLabelText(
+            f"{prompt}\n\n"
+            "Check your phone for Robinhood's SMS or authenticator code, then enter it here:"
+        )
+        dlg.setInputMode(QInputDialog.TextInput)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setModal(True)
+
+        def _finished(result):
+            try:
+                if result == QDialog.Accepted:
+                    self._rh_sms_code = (dlg.textValue() or "").strip()
+                else:
+                    self._rh_sms_code = ""
+            except Exception:
+                self._rh_sms_code = ""
+            self._rh_sms_event.set()
+            if getattr(self, "_rh_sms_dialog", None) is dlg:
+                self._rh_sms_dialog = None
+            dlg.deleteLater()
+
+        dlg.finished.connect(_finished)
+        self._rh_sms_dialog = dlg
+        dlg.open()  # non-blocking; Qt event loop (tray Exit) keeps running
 
     # ---------------------------------------------------------
     #  SYNCHRONIZATION & DISCORD
@@ -1076,6 +1450,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["pnl_baseline_date"] = str(datetime.now().date())
         self.settings["pnl_baseline_rh"] = self.session_starts.get("Robinhood")
         self.settings["pnl_baseline_cb"] = self.session_starts.get("Coinbase")
+        self.settings["pnl_baseline_et"] = self.session_starts.get("E*TRADE")
         save_settings(self.settings)
 
     def _restore_session_baselines(self):
@@ -1084,10 +1459,31 @@ class MarketAdvisorGUI(QMainWindow):
             return
         rh = self.settings.get("pnl_baseline_rh")
         cb = self.settings.get("pnl_baseline_cb")
+        et = self.settings.get("pnl_baseline_et")
         if isinstance(rh, (int, float)) and rh > 0:
             self.session_starts["Robinhood"] = float(rh)
         if isinstance(cb, (int, float)) and cb > 0:
             self.session_starts["Coinbase"] = float(cb)
+        if isinstance(et, (int, float)) and et > 0:
+            self.session_starts["E*TRADE"] = float(et)
+        # Mirror into last-trusted so Home keep-paths don't paint $0 over a known baseline
+        if not hasattr(self, "_last_trusted_equity"):
+            self._last_trusted_equity = _blank_broker_map(None)
+        for name in BROKER_NAMES:
+            start = self.session_starts.get(name)
+            try:
+                if start is not None and float(start) > NEAR_ZERO_EQUITY:
+                    if not self._last_trusted_equity.get(name):
+                        self._last_trusted_equity[name] = float(start)
+            except (TypeError, ValueError):
+                pass
+
+    def _broker_supports(self, broker_name, attr):
+        b = self.brokers.get(broker_name)
+        return bool(b and getattr(b, attr, False))
+
+    def _iter_broker_names(self):
+        return list(self.brokers.keys())
 
     # ---------------------------------------------------------
     #  PAPER TRADING ENGINE (routes here whenever self.paper_mode is True,
@@ -1105,8 +1501,16 @@ class MarketAdvisorGUI(QMainWindow):
             return (cash + holdings_val), cash
         broker = self.brokers.get(broker_name)
         if not broker or not broker.is_connected:
-            return 0.0, 0.0
-        return broker.get_account_balances()
+            # Prefer last-good cache over inventing a $0 wipe for sizing / UI
+            cached = (getattr(self, "_last_balance_totals", {}) or {}).get(broker_name) or {}
+            return float(cached.get("p_val") or 0.0), float(cached.get("bp") or 0.0)
+        try:
+            return broker.get_account_balances()
+        except Exception:
+            cached = (getattr(self, "_last_balance_totals", {}) or {}).get(broker_name) or {}
+            if float(cached.get("p_val") or 0.0) > 0 or float(cached.get("bp") or 0.0) > 0:
+                return float(cached.get("p_val") or 0.0), float(cached.get("bp") or 0.0)
+            raise
 
     def get_broker_holdings(self, broker_name=None):
         """Returns a list of holding dicts for either the sandbox or the real broker."""
@@ -1121,17 +1525,32 @@ class MarketAdvisorGUI(QMainWindow):
         if not broker or not broker.is_connected:
             return []
         assets = broker.get_current_holdings()
+        # E*TRADE historically returned {SYM: {...}}; RH/CB return list[dict].
+        if isinstance(assets, dict):
+            normalized = []
+            for sym, pos in assets.items():
+                if not isinstance(pos, dict):
+                    continue
+                row = dict(pos)
+                row.setdefault("ticker", str(sym).upper())
+                normalized.append(row)
+            assets = normalized
+        elif not isinstance(assets, list):
+            assets = list(assets) if assets else []
         # Coinbase API has no reliable avg cost — overlay tracked buys; else seed live price
         cache = self.cost_basis_cache.get(broker_name, {})
         for a in assets:
-            if a['ticker'] in cache and cache[a['ticker']] > 0:
-                a['cost'] = cache[a['ticker']]
+            if not isinstance(a, dict):
+                continue
+            ticker = a.get("ticker")
+            if ticker in cache and cache[ticker] > 0:
+                a['cost'] = cache[ticker]
             elif broker_name == "Coinbase" and (not a.get('cost') or a['cost'] <= 0):
-                live = broker.get_live_price(a['ticker']) if broker else 0.0
+                live = broker.get_live_price(ticker) if broker else 0.0
                 a['cost'] = live if live and live > 0 else 0.0
                 if a['cost'] > 0:
-                    cache[a['ticker']] = a['cost']
-        return assets
+                    cache[ticker] = a['cost']
+        return [a for a in assets if isinstance(a, dict) and a.get("ticker")]
 
     def _record_buy_cost(self, broker_name, ticker, price, shares_bought):
         if shares_bought <= 0 or price <= 0:
@@ -1409,7 +1828,7 @@ class MarketAdvisorGUI(QMainWindow):
         any_down = False
 
         # Always show both brokers (armed or not) so a false loss-halt doesn't "erase" RH from Discord
-        for name in ("Robinhood", "Coinbase"):
+        for name in BROKER_NAMES:
             connected = self.brokers[name].is_connected or self.paper_mode
             armed = bool(self.auto_trade_enabled.get(name))
             if not connected:
@@ -1507,7 +1926,7 @@ class MarketAdvisorGUI(QMainWindow):
         totals = getattr(self, "_last_balance_totals", {}) or {}
         total_eq = 0.0
         lines = []
-        for name in ("Robinhood", "Coinbase"):
+        for name in BROKER_NAMES:
             connected = self.brokers[name].is_connected or self.paper_mode
             p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
             bp = float(totals.get(name, {}).get("bp", 0.0) or 0.0)
@@ -1569,7 +1988,7 @@ class MarketAdvisorGUI(QMainWindow):
         totals = totals if totals is not None else (getattr(self, "_last_balance_totals", {}) or {})
         return sum(
             float((totals.get(n) or {}).get("p_val", 0) or 0)
-            for n in ("Robinhood", "Coinbase")
+            for n in BROKER_NAMES
         )
 
     def _launch_checkin_should_upgrade(self):
@@ -1590,7 +2009,7 @@ class MarketAdvisorGUI(QMainWindow):
         today = datetime.now().date()
         if today > self.current_trading_day:
             self.current_trading_day = today
-            self.session_starts = {"Robinhood": None, "Coinbase": None}
+            self.session_starts = _blank_broker_map(None)
             self._persist_session_baselines()
             self.log_event("🌅 Midnight reached. Daily P&L Tracker reset for the new day.")
 
@@ -1623,16 +2042,74 @@ class MarketAdvisorGUI(QMainWindow):
         totals = {}
         for name, broker in self.brokers.items():
             try:
-                if self.paper_mode or broker.is_connected:
+                if self.paper_mode:
                     p_val, bp = self.get_broker_balances(name)
                     totals[name] = {
                         "p_val": float(p_val or 0.0),
                         "bp": float(bp or 0.0),
                         "ok": True,
+                        "holdings_count": int(
+                            (getattr(self, "_holdings_count_cache", {}) or {}).get(name, 0) or 0
+                        ),
                     }
-                else:
+                    continue
+                if not broker.is_connected:
                     # Disconnected — do not invent $0 equity (that fake-trips day-loss limits)
                     totals[name] = {"ok": False, "reason": "disconnected"}
+                    continue
+                # Call adapter directly so API failures stay ok:False (not cache-masked).
+                p_val, bp = broker.get_account_balances()
+                p_val = float(p_val or 0.0)
+                bp = float(bp or 0.0)
+                holdings_count = int(
+                    (getattr(self, "_holdings_count_cache", {}) or {}).get(name, 0) or 0
+                )
+                last_trusted = (getattr(self, "_last_trusted_equity", {}) or {}).get(name)
+                baseline = (getattr(self, "session_starts", {}) or {}).get(name)
+                prev_p = float(
+                    ((getattr(self, "_last_balance_totals", {}) or {}).get(name) or {}).get(
+                        "p_val", 0.0
+                    )
+                    or 0.0
+                )
+                if is_near_zero_wipe(p_val, prev_p, baseline, last_trusted):
+                    try:
+                        holdings = self.get_broker_holdings(name) or []
+                        holdings_count = len(
+                            {
+                                (a.get("ticker") or "").upper()
+                                for a in holdings
+                                if isinstance(a, dict) and a.get("ticker")
+                            }
+                        )
+                        self._holdings_count_cache[name] = holdings_count
+                    except Exception:
+                        pass
+                    if holdings_count > 0:
+                        totals[name] = {
+                            "ok": False,
+                            "reason": f"zero equity with {holdings_count} holding(s) still present",
+                            "p_val": p_val,
+                            "bp": bp,
+                            "holdings_count": holdings_count,
+                        }
+                        continue
+                    # Empty book + $0 while we had real equity: treat like a dead session,
+                    # not a realized −100% day (avoids false MAX DAILY LOSS).
+                    totals[name] = {
+                        "ok": False,
+                        "reason": "zero_equity_unreliable",
+                        "p_val": p_val,
+                        "bp": bp,
+                        "holdings_count": 0,
+                    }
+                    continue
+                totals[name] = {
+                    "p_val": p_val,
+                    "bp": bp,
+                    "ok": True,
+                    "holdings_count": holdings_count,
+                }
             except Exception as e:
                 totals[name] = {"ok": False, "reason": str(e)}
                 try:
@@ -1643,74 +2120,158 @@ class MarketAdvisorGUI(QMainWindow):
         return totals
 
     def _balance_reading_is_suspicious(self, broker_name, new_p, old_p, baseline):
-        """
-        True when a new equity print looks like a failed API read, not a real wipe.
-        Classic bug: overnight RH glitch → $0 equity → Day P&L ≈ −entire account → false loss halt.
-        """
-        new_p = float(new_p or 0.0)
-        old_p = float(old_p or 0.0)
-        baseline = float(baseline or 0.0) if baseline else 0.0
+        """True when a new equity print looks like a failed API read, not a real wipe."""
+        last_trusted = (getattr(self, "_last_trusted_equity", {}) or {}).get(broker_name)
+        loss_limit = float(self.settings.get("daily_loss_limit", 0.0) or 0.0)
+        return balance_reading_is_suspicious(
+            new_p, old_p, baseline, last_trusted, loss_limit=loss_limit
+        )
 
-        # Near-zero when we recently had real money
-        if new_p <= 0.50 and old_p >= 5.0:
-            return True
-        if new_p <= 0.50 and baseline >= 5.0:
-            return True
-
-        # Sudden collapse vs last good reading (keep real large moves after 2 confirms)
-        if old_p >= 20.0 and new_p < old_p * 0.35 and (old_p - new_p) >= 15.0:
-            return True
-
-        return False
+    def _keep_equity_floor(self, broker_name, old_p=0.0, last_trusted=None):
+        """Best non-zero equity to paint while rejecting a glitch wipe."""
+        baseline = (getattr(self, "session_starts", {}) or {}).get(broker_name)
+        if last_trusted is None:
+            last_trusted = (getattr(self, "_last_trusted_equity", {}) or {}).get(broker_name)
+        return float(reference_equity(old_p, baseline, last_trusted) or 0.0)
 
     def _merge_balance_totals(self, incoming):
         """Keep last-good equity when a broker fetch fails or returns a suspicious wipe."""
         prev = getattr(self, "_last_balance_totals", {}) or {}
         if not hasattr(self, "_balance_bad_streak"):
-            self._balance_bad_streak = {"Robinhood": 0, "Coinbase": 0}
+            self._balance_bad_streak = _blank_broker_map(0)
+        if not hasattr(self, "_last_trusted_equity"):
+            self._last_trusted_equity = _blank_broker_map(None)
+        if not hasattr(self, "_balance_zero_glitch_warned"):
+            self._balance_zero_glitch_warned = _blank_broker_map(False)
 
         merged = {}
-        trusted = {"Robinhood": False, "Coinbase": False}
+        trusted = _blank_broker_map(False)
 
-        for name in ("Robinhood", "Coinbase"):
+        for name in BROKER_NAMES:
             raw = incoming.get(name) if isinstance(incoming, dict) else None
             old = prev.get(name) or {}
             old_p = float(old.get("p_val", 0.0) or 0.0)
             old_bp = float(old.get("bp", 0.0) or 0.0)
             baseline = self.session_starts.get(name)
+            last_trusted = self._last_trusted_equity.get(name)
+            if last_trusted is None:
+                # Prefer prior painted equity, else day baseline — never leave last_trusted empty
+                # when we already know the account had money today.
+                seed = old_p if old_p > NEAR_ZERO_EQUITY else None
+                if seed is None:
+                    try:
+                        seed = float(baseline) if baseline and float(baseline) > NEAR_ZERO_EQUITY else None
+                    except (TypeError, ValueError):
+                        seed = None
+                if seed is not None:
+                    last_trusted = seed
+                    self._last_trusted_equity[name] = seed
 
             if not isinstance(raw, dict) or raw.get("ok") is False:
                 reason = (raw or {}).get("reason", "fetch failed") if isinstance(raw, dict) else "missing"
                 self._balance_bad_streak[name] = self._balance_bad_streak.get(name, 0) + 1
-                self.log_event(f"[{name}] Balance fetch unreliable ({reason}) — keeping last good equity {format_money(old_p)}")
-                merged[name] = {"p_val": old_p, "bp": old_bp}
+                keep_p = self._keep_equity_floor(name, old_p=old_p, last_trusted=last_trusted)
+                keep_bp = old_bp
+                # No session / unreliable $0: keep last equity quietly (log once per stretch).
+                if reason in ("disconnected", "zero_equity_unreliable") or str(reason).startswith(
+                    "zero equity with"
+                ):
+                    warned_map = (
+                        self._balance_disconnected_warned
+                        if reason == "disconnected"
+                        else self._balance_zero_glitch_warned
+                    )
+                    if not warned_map.get(name):
+                        warned_map[name] = True
+                        if reason == "disconnected":
+                            self.log_event(
+                                f"[{name}] Balance polling paused (disconnected) — "
+                                f"keeping last good equity {format_money(keep_p)}"
+                            )
+                        else:
+                            self.log_event(
+                                f"[{name}] Unreliable $0 equity read ({reason}) — "
+                                f"keeping last good equity {format_money(keep_p)} "
+                                f"(not treating as day loss)"
+                            )
+                else:
+                    self.log_event(
+                        f"[{name}] Balance fetch unreliable ({reason}) — "
+                        f"keeping last good equity {format_money(keep_p)}"
+                    )
+                merged[name] = {"p_val": keep_p, "bp": keep_bp}
                 trusted[name] = False
                 continue
 
             new_p = float(raw.get("p_val", 0.0) or 0.0)
             new_bp = float(raw.get("bp", 0.0) or 0.0)
+            holdings_count = int(
+                raw.get("holdings_count")
+                if raw.get("holdings_count") is not None
+                else (getattr(self, "_holdings_count_cache", {}) or {}).get(name, 0)
+                or 0
+            )
 
-            if self._balance_reading_is_suspicious(name, new_p, old_p, baseline):
-                streak = self._balance_bad_streak.get(name, 0) + 1
-                self._balance_bad_streak[name] = streak
-                if streak < 2:
-                    self.log_event(
-                        f"[{name}] Ignoring suspicious equity {format_money(new_p)} "
-                        f"(was {format_money(old_p)}; baseline {format_money(baseline or 0)}) "
-                        f"— need another confirming read before trusting it"
+            loss_limit = float(self.settings.get("daily_loss_limit", 0.0) or 0.0)
+
+            # Healthy non-zero read always wins — clear glitch state and repaint Home.
+            if new_p > NEAR_ZERO_EQUITY:
+                # Still run collapse / day-loss-trip guard for sudden drops from last trusted
+                if self._balance_reading_is_suspicious(name, new_p, old_p, baseline):
+                    decision = decide_suspicious_equity(
+                        new_p,
+                        old_p,
+                        baseline,
+                        last_trusted=last_trusted,
+                        holdings_count=holdings_count,
+                        bad_streak=self._balance_bad_streak.get(name, 0),
+                        loss_limit=loss_limit,
                     )
-                    merged[name] = {"p_val": old_p, "bp": old_bp}
+                    self._balance_bad_streak[name] = int(decision.get("streak") or 0)
+                    self.log_event(f"[{name}] {decision.get('reason')}")
+                    if decision.get("action") != "accept":
+                        keep_p = self._keep_equity_floor(name, old_p=old_p, last_trusted=last_trusted)
+                        merged[name] = {"p_val": keep_p, "bp": old_bp}
+                        trusted[name] = False
+                        continue
+                self._balance_bad_streak[name] = 0
+                if getattr(self, "_balance_disconnected_warned", None) is not None:
+                    self._balance_disconnected_warned[name] = False
+                if getattr(self, "_balance_zero_glitch_warned", None) is not None:
+                    self._balance_zero_glitch_warned[name] = False
+                merged[name] = {"p_val": new_p, "bp": new_bp}
+                trusted[name] = True
+                self._last_trusted_equity[name] = new_p
+                continue
+
+            # Near-zero / zero path
+            if self._balance_reading_is_suspicious(name, new_p, old_p, baseline):
+                decision = decide_suspicious_equity(
+                    new_p,
+                    old_p,
+                    baseline,
+                    last_trusted=last_trusted,
+                    holdings_count=holdings_count,
+                    bad_streak=self._balance_bad_streak.get(name, 0),
+                    loss_limit=loss_limit,
+                )
+                self._balance_bad_streak[name] = int(decision.get("streak") or 0)
+                self.log_event(f"[{name}] {decision.get('reason')}")
+                if decision.get("action") != "accept":
+                    keep_p = self._keep_equity_floor(name, old_p=old_p, last_trusted=last_trusted)
+                    merged[name] = {"p_val": keep_p, "bp": old_bp if old_bp > 0 else new_bp}
                     trusted[name] = False
                     continue
-                # Second consecutive collapse — accept (could be real)
-                self.log_event(
-                    f"[{name}] Equity collapse confirmed on 2nd read "
-                    f"({format_money(old_p)} → {format_money(new_p)}); accepting"
-                )
 
             self._balance_bad_streak[name] = 0
+            if getattr(self, "_balance_disconnected_warned", None) is not None:
+                self._balance_disconnected_warned[name] = False
+            if getattr(self, "_balance_zero_glitch_warned", None) is not None:
+                self._balance_zero_glitch_warned[name] = False
             merged[name] = {"p_val": new_p, "bp": new_bp}
             trusted[name] = True
+            if new_p > NEAR_ZERO_EQUITY:
+                self._last_trusted_equity[name] = new_p
 
         return merged, trusted
 
@@ -1727,7 +2288,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         combined_pl = 0.0
         tc = theme_colors(self.dark_mode)
-        for broker_name in ("Robinhood", "Coinbase"):
+        for broker_name in BROKER_NAMES:
             p_val = float((merged.get(broker_name) or {}).get("p_val", 0.0) or 0.0)
             bp = float((merged.get(broker_name) or {}).get("bp", 0.0) or 0.0)
             pl_val = 0.0
@@ -1750,6 +2311,11 @@ class MarketAdvisorGUI(QMainWindow):
                 self.home_cb_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
                 self.home_cb_pl_lbl.setText(f"Day P&L: {pl_display}")
                 self.home_cb_pl_lbl.setStyleSheet(metric_label_style(color, 15))
+            elif broker_name == "E*TRADE" and hasattr(self, "home_et_val_lbl"):
+                self.home_et_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
+                self.home_et_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
+                self.home_et_pl_lbl.setText(f"Day P&L: {pl_display}")
+                self.home_et_pl_lbl.setStyleSheet(metric_label_style(color, 15))
 
         if hasattr(self, "home_master_pl_lbl"):
             cpl_str = format_money(abs(combined_pl))
@@ -1777,7 +2343,7 @@ class MarketAdvisorGUI(QMainWindow):
         combined_pl = 0.0
 
         # Process Each Broker
-        for broker_name in ["Robinhood", "Coinbase"]:
+        for broker_name in BROKER_NAMES:
             p_val = float((merged.get(broker_name) or {}).get("p_val", 0.0) or 0.0)
             bp = float((merged.get(broker_name) or {}).get("bp", 0.0) or 0.0)
             
@@ -1811,6 +2377,11 @@ class MarketAdvisorGUI(QMainWindow):
                     self.home_cb_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
                     self.home_cb_pl_lbl.setText(f"Day P&L: {pl_display}")
                     self.home_cb_pl_lbl.setStyleSheet(metric_label_style(color, 15))
+                elif broker_name == "E*TRADE" and hasattr(self, "home_et_val_lbl"):
+                    self.home_et_val_lbl.setText(f"Portfolio: {format_money(p_val)}")
+                    self.home_et_bp_lbl.setText(f"Buying Power: {format_money(bp)}")
+                    self.home_et_pl_lbl.setText(f"Day P&L: {pl_display}")
+                    self.home_et_pl_lbl.setStyleSheet(metric_label_style(color, 15))
 
             # Profit/loss limits only on trusted balance reads (never on a glitch $0)
             if self.auto_trade_enabled.get(broker_name) and trusted.get(broker_name):
@@ -1895,7 +2466,7 @@ class MarketAdvisorGUI(QMainWindow):
             balances = {}
             combined_eq = combined_cash = combined_pnl = 0.0
             holdings_count = {}
-            for name in ("Robinhood", "Coinbase"):
+            for name in BROKER_NAMES:
                 p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
                 bp = float(totals.get(name, {}).get("bp", 0.0) or 0.0)
                 start = self.session_starts.get(name)
@@ -1935,8 +2506,8 @@ class MarketAdvisorGUI(QMainWindow):
                 "mode": "PAPER" if self.paper_mode else "LIVE",
                 "market": market,
                 "auto_trader": {
-                    "Robinhood": bool(self.auto_trade_enabled.get("Robinhood")),
-                    "Coinbase": bool(self.auto_trade_enabled.get("Coinbase")),
+                    name: bool(self.auto_trade_enabled.get(name))
+                    for name in BROKER_NAMES
                 },
                 "banner": (
                     self.at_status_lbl.text()
@@ -2206,7 +2777,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         if view == "Coinbase":
             text, color = "Crypto: OPEN 24/7", open_color
-        elif view == "Robinhood":
+        elif view in ("Robinhood", "E*TRADE"):
             text, color = f"Equities: {equity_text}", equity_color
         else:
             text = f"Equities: {equity_text}  ·  Crypto: 24/7"
@@ -2218,7 +2789,7 @@ class MarketAdvisorGUI(QMainWindow):
             f"padding: {ui_px(2)}px {ui_px(10)}px {ui_px(2)}px {ui_px(8)}px;"
         )
         self.market_status_lbl.setToolTip(
-            "Robinhood equities (ET):\n"
+            "Robinhood / E*TRADE equities (ET):\n"
             "• Regular 9:30am–4pm — fractionals OK\n"
             "• Extended 7–9:30am & 4–8pm — fractionals until ~7:30pm after-hours\n"
             "• Overnight 8pm–7am — whole shares only (no fractionals)\n"
@@ -2235,11 +2806,30 @@ class MarketAdvisorGUI(QMainWindow):
         task = BackgroundTask(target_func, *args)
 
         def _on_error(e):
-            fname = getattr(target_func, '__name__', 'unknown')
-            self.log_event(f"Thread Error in {fname}: {e}")
+            fname = getattr(target_func, "__name__", "unknown")
+            # Lambdas hide the real worker — unwrap common cycle wrappers
+            if fname == "<lambda>":
+                try:
+                    closed = getattr(target_func, "__closure__", None) or ()
+                    for cell in closed:
+                        try:
+                            val = cell.cell_contents
+                        except Exception:
+                            continue
+                        if callable(val) and getattr(val, "__name__", "").startswith("_bg"):
+                            fname = val.__name__
+                            break
+                except Exception:
+                    pass
+            err_text = str(e or "")
+            summary = err_text.splitlines()[0] if err_text else "unknown error"
+            self.log_event(f"Thread Error in {fname}: {summary}")
+            for line in err_text.splitlines()[1:12]:
+                if line.strip():
+                    self.log_event(f"  {line}")
             self.set_working_state(False)
             if unlock_queue_on_error:
-                self.send_discord_alert(f"🚨 Cycle thread error in {fname}: {e}")
+                self._send_cycle_error_discord(fname, summary)
                 self.cycle_finished()
 
         task.result_ready.connect(on_success_callback)
@@ -2247,6 +2837,23 @@ class MarketAdvisorGUI(QMainWindow):
         task.finished.connect(lambda: self.active_threads.remove(task) if task in self.active_threads else None)
         self.active_threads.append(task)
         task.start()
+
+    def _send_cycle_error_discord(self, fname, err):
+        """Discord identical cycle errors at most once per 10 minutes (log always)."""
+        key = f"{self.cycle_broker_name}|{fname}|{err}"
+        now = time.time()
+        cool = getattr(self, "_cycle_error_discord_cooldown", None)
+        if cool is None:
+            self._cycle_error_discord_cooldown = {}
+            cool = self._cycle_error_discord_cooldown
+        prev = cool.get(key)
+        if prev and (now - float(prev[0])) < 600:
+            cool[key] = (prev[0], int(prev[1]) + 1)
+            return
+        suppressed = int(prev[1]) if prev else 0
+        cool[key] = (now, 0)
+        extra = f" (×{suppressed + 1} since last alert)" if suppressed else ""
+        self.send_discord_alert(f"🚨 Cycle thread error in {fname}: {err}{extra}")
 
     def run_cycle_thread(self, target_func, on_success_callback, *args):
         """Background work for auto-trade cycles — unlocks the queue if the worker crashes."""
@@ -2364,7 +2971,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         self.broker_dropdown = QComboBox()
         self.broker_dropdown.setObjectName("brokerDropdown")
-        self.broker_dropdown.addItems(["All", "Robinhood", "Coinbase"])
+        self.broker_dropdown.addItems(["All", "Robinhood", "Coinbase", "E*TRADE"])
         self.broker_dropdown.setCurrentText("All")
         self.broker_dropdown.setFixedWidth(ui_px(120))
         self.broker_dropdown.setMaxVisibleItems(5)
@@ -2400,6 +3007,10 @@ class MarketAdvisorGUI(QMainWindow):
         self.auto_trade_btn.setMinimumHeight(ui_px(34))
         self.auto_trade_btn.setMinimumWidth(ui_px(138))
         self.auto_trade_btn.setStyleSheet(top_bar_btn_style("#424242"))
+        self.auto_trade_btn.setToolTip(
+            "When OFF: open the broker picker to arm Auto-Trader. "
+            "When ON: turn off all brokers, or choose Change brokers… to manage individually."
+        )
         self.auto_trade_btn.clicked.connect(self.toggle_auto_trade)
 
         broker_lbl = QLabel("Broker")
@@ -2439,12 +3050,12 @@ class MarketAdvisorGUI(QMainWindow):
                 self.tabs.setTabEnabled(idx, visible)
 
     def _apply_view_mode_tabs(self):
-        # Coinbase-only: hide equity scanners. All / Robinhood: show them.
+        # Coinbase-only: hide equity scanners. E*TRADE / All / Robinhood: show them.
         self._set_stock_tabs_visible(self.view_mode != "Coinbase")
 
     def on_broker_switch(self, broker_name):
         self.view_mode = broker_name
-        if broker_name in ("Robinhood", "Coinbase"):
+        if broker_name in self.brokers:
             self.active_broker_name = broker_name
         self.log_event(f"Switched view to: {broker_name}")
         self._apply_view_mode_tabs()
@@ -2459,7 +3070,7 @@ class MarketAdvisorGUI(QMainWindow):
             p_val = sum(d.get('p_val', 0.0) for d in totals.values())
             bp = sum(d.get('bp', 0.0) for d in totals.values())
             pl_val = 0.0
-            for name in ("Robinhood", "Coinbase"):
+            for name in BROKER_NAMES:
                 start = self.session_starts.get(name)
                 cur = totals.get(name, {}).get('p_val', 0.0)
                 if start is not None and start > 0:
@@ -2526,6 +3137,8 @@ class MarketAdvisorGUI(QMainWindow):
             self.rh_card.setStyleSheet(broker)
         if hasattr(self, "cb_card"):
             self.cb_card.setStyleSheet(broker)
+        if hasattr(self, "et_card"):
+            self.et_card.setStyleSheet(broker)
         if hasattr(self, "home_master_val_lbl"):
             self.home_master_val_lbl.setStyleSheet(metric_label_style(tc["accent"], 36))
             # Stylesheet fonts don't inflate sizeHint — pin height so $120 isn't clipped
@@ -2538,6 +3151,7 @@ class MarketAdvisorGUI(QMainWindow):
         for name in (
             "home_rh_val_lbl", "home_rh_bp_lbl",
             "home_cb_val_lbl", "home_cb_bp_lbl",
+            "home_et_val_lbl", "home_et_bp_lbl",
         ):
             lbl = getattr(self, name, None)
             if lbl is not None:
@@ -2545,7 +3159,7 @@ class MarketAdvisorGUI(QMainWindow):
                     f"font-size: {ui_px(14)}px; font-weight: 600; padding: {ui_px(4)}px 2px;"
                 )
                 lbl.setMinimumHeight(ui_px(24))
-        for name in ("home_rh_pl_lbl", "home_cb_pl_lbl"):
+        for name in ("home_rh_pl_lbl", "home_cb_pl_lbl", "home_et_pl_lbl"):
             lbl = getattr(self, name, None)
             if lbl is not None:
                 lbl.setMinimumHeight(ui_px(24))
@@ -2664,6 +3278,29 @@ class MarketAdvisorGUI(QMainWindow):
         )
         self.cb_card.setLayout(cb_layout)
         brokers_layout.addWidget(self.cb_card)
+
+        # E*TRADE Line Item
+        self.et_card = QGroupBox("E*TRADE · Equities & ETFs")
+        self.et_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        et_layout = QHBoxLayout()
+        et_layout.setContentsMargins(ui_px(16), ui_px(12), ui_px(16), ui_px(12))
+        et_layout.setSpacing(ui_px(28))
+        self._et_card_layout = et_layout
+
+        self.home_et_val_lbl = QLabel("Portfolio: $0.00")
+        self.home_et_val_lbl.setObjectName("homeBrokerMetric")
+        self.home_et_val_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
+        self.home_et_bp_lbl = QLabel("Buying Power: $0.00")
+        self.home_et_bp_lbl.setObjectName("homeBrokerMetric")
+        self.home_et_bp_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
+        self.home_et_pl_lbl = QLabel("Day P&L: $0.00")
+        self.home_et_pl_lbl.setStyleSheet(f"font-size: {ui_px(14)}px;")
+        _pack_broker_metrics(
+            et_layout,
+            (self.home_et_val_lbl, self.home_et_bp_lbl, self.home_et_pl_lbl),
+        )
+        self.et_card.setLayout(et_layout)
+        brokers_layout.addWidget(self.et_card)
 
         layout.addLayout(brokers_layout)
 
@@ -2976,7 +3613,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         holding_tickers = []
         try:
-            for name in ("Robinhood", "Coinbase"):
+            for name in BROKER_NAMES:
                 for a in self.get_broker_holdings(name) or []:
                     t = a.get("ticker")
                     if t:
@@ -3153,47 +3790,82 @@ class MarketAdvisorGUI(QMainWindow):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        # Connections Manager Section
-        conn_group = QGroupBox("Broker Connection Manager")
-        conn_layout = QFormLayout()
+        # Brokers — status summary here; credentials live in per-broker dialogs
+        brokers_group = QGroupBox("Brokers")
+        brokers_outer = QVBoxLayout()
+        brokers_outer.setSpacing(ui_px(8))
+        brokers_hint = QLabel("Open a broker to enter login credentials and connect.")
+        brokers_hint.setObjectName("settingsHint")
+        brokers_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        brokers_outer.addWidget(brokers_hint)
 
-        # Robinhood Login Fields
+        rh_row = QHBoxLayout()
+        rh_row.setSpacing(ui_px(10))
+        rh_name = QLabel("Robinhood")
+        rh_name.setMinimumWidth(ui_px(100))
+        rh_row.addWidget(rh_name)
         self.rh_status_lbl = QLabel("🔴 Disconnected")
-        self.rh_email_input = QLineEdit(self.settings.get("rh_email", ""))
-        self.rh_pass_input = QLineEdit(self.settings.get("rh_password", ""))
-        self.rh_pass_input.setEchoMode(QLineEdit.Password)
-        self.rh_connect_btn = QPushButton("Connect Robinhood")
-        self.rh_connect_btn.clicked.connect(self.connect_robinhood)
+        self.rh_status_lbl.setMinimumWidth(ui_px(130))
+        rh_row.addWidget(self.rh_status_lbl)
+        rh_row.addStretch(1)
+        self.rh_manage_btn = QPushButton("Login…")
+        self.rh_manage_btn.setToolTip("Email / password and Connect for Robinhood")
+        self.rh_manage_btn.clicked.connect(self._open_robinhood_login_dialog)
+        rh_row.addWidget(self.rh_manage_btn)
+        brokers_outer.addLayout(rh_row)
 
-        conn_layout.addRow("Robinhood Status:", self.rh_status_lbl)
-        conn_layout.addRow("RH Email:", self.rh_email_input)
-        conn_layout.addRow("RH Password:", self.rh_pass_input)
-        conn_layout.addRow("", self.rh_connect_btn)
-
-        # Coinbase CDP API Fields
+        cb_row = QHBoxLayout()
+        cb_row.setSpacing(ui_px(10))
+        cb_name = QLabel("Coinbase")
+        cb_name.setMinimumWidth(ui_px(100))
+        cb_row.addWidget(cb_name)
         self.cb_status_lbl = QLabel("🔴 Disconnected")
-        self.cb_key_input = QLineEdit(self.settings.get("cb_api_key", ""))
-        self.cb_secret_input = QLineEdit(self.settings.get("cb_api_secret", ""))
-        self.cb_secret_input.setEchoMode(QLineEdit.Password)
-        self.cb_connect_btn = QPushButton("Connect Coinbase Advanced")
-        self.cb_connect_btn.clicked.connect(self.connect_coinbase)
+        self.cb_status_lbl.setMinimumWidth(ui_px(130))
+        cb_row.addWidget(self.cb_status_lbl)
+        cb_row.addStretch(1)
+        self.cb_manage_btn = QPushButton("Login…")
+        self.cb_manage_btn.setToolTip("CDP API key / secret and Connect for Coinbase Advanced")
+        self.cb_manage_btn.clicked.connect(self._open_coinbase_login_dialog)
+        cb_row.addWidget(self.cb_manage_btn)
+        brokers_outer.addLayout(cb_row)
 
-        conn_layout.addRow("Coinbase Status:", self.cb_status_lbl)
-        conn_layout.addRow("CDP API Key:", self.cb_key_input)
-        conn_layout.addRow("CDP API Secret:", self.cb_secret_input)
-        conn_layout.addRow("", self.cb_connect_btn)
+        et_row = QHBoxLayout()
+        et_row.setSpacing(ui_px(10))
+        et_name = QLabel("E*TRADE")
+        et_name.setMinimumWidth(ui_px(100))
+        et_row.addWidget(et_name)
+        self.et_status_lbl = QLabel("🔴 Disconnected")
+        self.et_status_lbl.setMinimumWidth(ui_px(130))
+        et_row.addWidget(self.et_status_lbl)
+        et_row.addStretch(1)
+        self.et_manage_btn = QPushButton("Login…")
+        self.et_manage_btn.setToolTip("OAuth consumer key / authorize / account picker for E*TRADE")
+        self.et_manage_btn.clicked.connect(self._open_etrade_login_dialog)
+        et_row.addWidget(self.et_manage_btn)
+        brokers_outer.addLayout(et_row)
 
-        conn_group.setLayout(conn_layout)
-        layout.addWidget(conn_group)
+        brokers_group.setLayout(brokers_outer)
+        layout.addWidget(brokers_group)
+
+        self._build_broker_login_dialogs()
+        self._build_discord_webhook_dialog()
 
         # Config Form
         form_layout = QVBoxLayout()
 
-        discord_box = QHBoxLayout()
-        discord_box.addWidget(QLabel("Discord Webhook URL:"))
-        self.discord_input = QLineEdit(self.settings.get("discord_webhook", ""))
-        discord_box.addWidget(self.discord_input)
-        form_layout.addLayout(discord_box)
+        discord_wh_box = QHBoxLayout()
+        discord_wh_box.setSpacing(ui_px(10))
+        discord_wh_box.addWidget(QLabel("Discord Webhook:"))
+        self.discord_webhook_status_lbl = QLabel("Not set")
+        self.discord_webhook_status_lbl.setMinimumWidth(ui_px(140))
+        discord_wh_box.addWidget(self.discord_webhook_status_lbl)
+        discord_wh_box.addStretch(1)
+        self.discord_webhook_btn = QPushButton("Webhook…")
+        self.discord_webhook_btn.setToolTip("Edit Discord webhook URL (kept off the main Settings form)")
+        self.discord_webhook_btn.clicked.connect(self._open_discord_webhook_dialog)
+        discord_wh_box.addWidget(self.discord_webhook_btn)
+        form_layout.addLayout(discord_wh_box)
+        self._update_discord_webhook_status()
 
         discord_lvl_box = QHBoxLayout()
         discord_lvl_box.addWidget(QLabel("Discord Notification Level:"))
@@ -3279,6 +3951,56 @@ class MarketAdvisorGUI(QMainWindow):
         mon_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
         form_layout.addWidget(mon_hint)
 
+        # Risk Posture — one control that retunes util / slots / name cap / exit patience
+        from scoring import RISK_POSTURE_PROFILES, normalize_risk_posture, get_risk_posture_profile
+        posture_box = QHBoxLayout()
+        posture_box.addWidget(QLabel("Risk Posture:"))
+        self.risk_posture_combo = QComboBox()
+        self._risk_posture_keys = ["safer", "balanced", "aggressive"]
+        for key in self._risk_posture_keys:
+            prof = RISK_POSTURE_PROFILES[key]
+            self.risk_posture_combo.addItem(prof["label"], key)
+        saved_posture = normalize_risk_posture(self.settings.get("risk_posture", "balanced"))
+        posture_idx = self._risk_posture_keys.index(saved_posture)
+        self.risk_posture_combo.setCurrentIndex(posture_idx)
+        self.risk_posture_combo.setToolTip(
+            "Safer: diversify & bank sooner  ·  Balanced: current defaults  ·  "
+            "Aggressive: concentrate into fewer larger tickets"
+        )
+        self.risk_posture_combo.currentIndexChanged.connect(self._on_risk_posture_changed)
+        posture_box.addWidget(self.risk_posture_combo)
+        posture_box.addStretch()
+        form_layout.addLayout(posture_box)
+        self.risk_posture_hint = QLabel(get_risk_posture_profile(saved_posture).get("hint", ""))
+        self.risk_posture_hint.setObjectName("settingsHint")
+        self.risk_posture_hint.setWordWrap(True)
+        self.risk_posture_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        form_layout.addWidget(self.risk_posture_hint)
+
+        scale_box = QHBoxLayout()
+        self.allow_scale_in_chk = QCheckBox("Allow scale-in (add near support on held names)")
+        # Default from settings; posture change retunes when user switches profile
+        _si_default = get_risk_posture_profile(saved_posture).get("allow_scale_in", True)
+        if "allow_scale_in" in self.settings and self.settings.get("allow_scale_in") is not None:
+            _si_default = bool(self.settings.get("allow_scale_in"))
+        self.allow_scale_in_chk.setChecked(bool(_si_default))
+        self.allow_scale_in_chk.setToolTip(
+            "When ON, already-held tickers may get a smaller add if price is near a "
+            "6‑month revisit / cost-basis zone, ROI is in the posture add band, score "
+            "is constructive, and max adds / name cap still bind. Not blind DCA."
+        )
+        scale_box.addWidget(self.allow_scale_in_chk)
+        scale_box.addStretch()
+        form_layout.addLayout(scale_box)
+        self.scale_in_hint = QLabel(
+            "Scale-in: average in only near support — Safer defaults OFF; "
+            "Balanced/Aggressive ON with stricter/wider ROI bands."
+        )
+        self.scale_in_hint.setObjectName("settingsHint")
+        self.scale_in_hint.setWordWrap(True)
+        self.scale_in_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        form_layout.addWidget(self.scale_in_hint)
+
         alloc_box = QHBoxLayout()
         alloc_box.addWidget(QLabel("Stock/ETF Allocation % (baseline floor):"))
         self.alloc_stock_spin = QDoubleSpinBox()
@@ -3299,11 +4021,51 @@ class MarketAdvisorGUI(QMainWindow):
         alloc_crypto_box.addStretch()
         form_layout.addLayout(alloc_crypto_box)
 
+        util_box = QHBoxLayout()
+        util_box.addWidget(QLabel("Target Buying-Power Utilization %:"))
+        self.bp_util_spin = QDoubleSpinBox()
+        self.bp_util_spin.setRange(50.0, 99.0)
+        self.bp_util_spin.setSingleStep(1.0)
+        self.bp_util_spin.setValue(float(self.settings.get("target_bp_utilization_pct", 88.0)))
+        util_box.addWidget(self.bp_util_spin)
+        util_box.addStretch()
+        form_layout.addLayout(util_box)
+
+        focus_box = QHBoxLayout()
+        focus_box.addWidget(QLabel("Sizing Focus Slots (fewer = larger tickets):"))
+        self.sizing_focus_spin = QSpinBox()
+        self.sizing_focus_spin.setRange(1, 20)
+        self.sizing_focus_spin.setValue(int(self.settings.get("sizing_focus_slots", 6)))
+        focus_box.addWidget(self.sizing_focus_spin)
+        focus_box.addStretch()
+        form_layout.addLayout(focus_box)
+
+        name_cap_box = QHBoxLayout()
+        name_cap_box.addWidget(QLabel("Max Single-Name Equity % (soft cap):"))
+        self.name_cap_spin = QDoubleSpinBox()
+        self.name_cap_spin.setRange(5.0, 40.0)
+        self.name_cap_spin.setSingleStep(1.0)
+        self.name_cap_spin.setValue(float(self.settings.get("max_single_name_equity_pct", 15.0)))
+        name_cap_box.addWidget(self.name_cap_spin)
+        name_cap_box.addStretch()
+        form_layout.addLayout(name_cap_box)
+
+        conv_box = QHBoxLayout()
+        conv_box.addWidget(QLabel("Conviction Stretch Max (high-score aim ×):"))
+        self.conviction_mult_spin = QDoubleSpinBox()
+        self.conviction_mult_spin.setRange(1.0, 2.5)
+        self.conviction_mult_spin.setSingleStep(0.05)
+        self.conviction_mult_spin.setDecimals(2)
+        self.conviction_mult_spin.setValue(float(self.settings.get("conviction_alloc_mult_max", 1.50)))
+        conv_box.addWidget(self.conviction_mult_spin)
+        conv_box.addStretch()
+        form_layout.addLayout(conv_box)
+
         alloc_hint = QLabel(
-            "Size aims to deploy buying power evenly across remaining position slots "
-            "(deployable BP / slots left). Allocation % is a per-asset baseline floor; "
-            "strong setups may stretch the aim up to 1.5×. Caps: ~0.75% equity risk per "
-            "trade, ~15% equity per name, 12% cash reserve. Min $ is a floor only."
+            "Risk Posture sets util / focus slots / max open / name cap / conviction stretch / "
+            "exit patience / scale-in defaults together — you can still fine-tune the knobs after. "
+            "Size deploys usable BP into Focus Slots (not every Max Open slot). Caps: ~0.75% equity "
+            "risk per trade; cluster / hard-stop rails stay on in every posture. Min $ is a floor only."
         )
         alloc_hint.setObjectName("settingsHint")
         alloc_hint.setWordWrap(True)
@@ -3362,7 +4124,7 @@ class MarketAdvisorGUI(QMainWindow):
         max_pos_box.addWidget(QLabel("Max Open Positions per Broker (0 = unlimited):"))
         self.max_pos_spin = QSpinBox()
         self.max_pos_spin.setRange(0, 100)
-        self.max_pos_spin.setValue(int(self.settings.get("max_open_positions", 20)))
+        self.max_pos_spin.setValue(int(self.settings.get("max_open_positions", 8)))
         max_pos_box.addWidget(self.max_pos_spin)
         max_pos_box.addStretch()
         form_layout.addLayout(max_pos_box)
@@ -3451,62 +4213,577 @@ class MarketAdvisorGUI(QMainWindow):
         outer.addWidget(scroll)
         self.tabs.addTab(tab, "Settings")
 
+    def _build_broker_login_dialogs(self):
+        """Credential fields live in per-broker dialogs so Settings stays trading-focused."""
+        # Robinhood — non-modal show() so Connect never nests a blocking exec loop
+        self._rh_login_dialog = QDialog(self)
+        self._rh_login_dialog.setWindowTitle("Robinhood Login")
+        self._rh_login_dialog.setWindowModality(Qt.WindowModal)
+        self._rh_login_dialog.setModal(True)
+        self._rh_login_dialog.setMinimumWidth(ui_px(380))
+        rh_form = QFormLayout(self._rh_login_dialog)
+        rh_form.setContentsMargins(ui_px(14), ui_px(12), ui_px(14), ui_px(12))
+        rh_form.setSpacing(ui_px(8))
+        self.rh_dialog_status_lbl = QLabel("🔴 Disconnected")
+        self.rh_email_input = QLineEdit(self.settings.get("rh_email", ""))
+        self.rh_pass_input = QLineEdit(self.settings.get("rh_password", ""))
+        self.rh_pass_input.setEchoMode(QLineEdit.Password)
+        self.rh_connect_btn = QPushButton("Connect Robinhood")
+        self.rh_connect_btn.setProperty("uiBtnKind", "primary")
+        self.rh_connect_btn.setStyleSheet(action_btn_style("primary"))
+        self.rh_connect_btn.clicked.connect(self.connect_robinhood)
+        rh_form.addRow("Status:", self.rh_dialog_status_lbl)
+        rh_form.addRow("Email:", self.rh_email_input)
+        rh_form.addRow("Password:", self.rh_pass_input)
+        rh_form.addRow("", self.rh_connect_btn)
+
+        # Coinbase Advanced (CDP)
+        self._cb_login_dialog = QDialog(self)
+        self._cb_login_dialog.setWindowTitle("Coinbase Advanced Login")
+        self._cb_login_dialog.setModal(True)
+        self._cb_login_dialog.setMinimumWidth(ui_px(420))
+        cb_form = QFormLayout(self._cb_login_dialog)
+        cb_form.setContentsMargins(ui_px(14), ui_px(12), ui_px(14), ui_px(12))
+        cb_form.setSpacing(ui_px(8))
+        self.cb_dialog_status_lbl = QLabel("🔴 Disconnected")
+        self.cb_key_input = QLineEdit(self.settings.get("cb_api_key", ""))
+        self.cb_secret_input = QLineEdit(self.settings.get("cb_api_secret", ""))
+        self.cb_secret_input.setEchoMode(QLineEdit.Password)
+        self.cb_live_trading_chk = QCheckBox("Enable live order placement (kill switch)")
+        self.cb_live_trading_chk.setChecked(bool(self.settings.get("coinbase_live_trading", True)))
+        self.cb_live_trading_chk.setToolTip(
+            "When unchecked, Coinbase stays connected for balances/holdings but will not place orders."
+        )
+        tc_cb = theme_colors(self.dark_mode)
+        self.cb_live_trading_chk.setStyleSheet(
+            f"QCheckBox {{ color: {tc_cb['text']}; spacing: {ui_px(8)}px; }}"
+        )
+        self.cb_connect_btn = QPushButton("Connect Coinbase Advanced")
+        self.cb_connect_btn.setProperty("uiBtnKind", "primary")
+        self.cb_connect_btn.setStyleSheet(action_btn_style("primary"))
+        self.cb_connect_btn.clicked.connect(self.connect_coinbase)
+        cb_form.addRow("Status:", self.cb_dialog_status_lbl)
+        cb_form.addRow("CDP API Key:", self.cb_key_input)
+        cb_form.addRow("CDP API Secret:", self.cb_secret_input)
+        cb_form.addRow("", self.cb_live_trading_chk)
+        cb_form.addRow("", self.cb_connect_btn)
+
+        # E*TRADE OAuth
+        self._et_login_dialog = QDialog(self)
+        self._et_login_dialog.setWindowTitle("E*TRADE Login")
+        self._et_login_dialog.setModal(True)
+        self._et_login_dialog.setMinimumWidth(ui_px(460))
+        et_form = QFormLayout(self._et_login_dialog)
+        et_form.setContentsMargins(ui_px(14), ui_px(12), ui_px(14), ui_px(12))
+        et_form.setSpacing(ui_px(8))
+        self.et_dialog_status_lbl = QLabel("🔴 Disconnected")
+        self.et_env_combo = QComboBox()
+        self.et_env_combo.addItems(["sandbox", "live"])
+        env_saved = self.settings.get("etrade_environment", "sandbox")
+        idx = self.et_env_combo.findText(env_saved)
+        if idx >= 0:
+            self.et_env_combo.setCurrentIndex(idx)
+        self.et_key_input = QLineEdit(self.settings.get("etrade_consumer_key", ""))
+        self.et_secret_input = QLineEdit("")
+        self.et_secret_input.setEchoMode(QLineEdit.Password)
+        self.et_secret_input.setPlaceholderText("Stored in Windows Credential Manager")
+        self.et_verifier_input = QLineEdit("")
+        self.et_verifier_input.setPlaceholderText("Paste verification code after browser auth")
+        self.et_account_combo = QComboBox()
+        self.et_account_combo.setMinimumWidth(ui_px(280))
+        self.et_live_trading_chk = QCheckBox("Enable live order placement (off until validated)")
+        self.et_live_trading_chk.setChecked(bool(self.settings.get("etrade_live_trading", False)))
+        self.et_live_trading_chk.setToolTip(
+            "Sandbox-first guard. Leave unchecked until read-only live validation passes."
+        )
+        # Explicit contrast so the control stays readable in dark dialogs (Fusion).
+        tc = theme_colors(self.dark_mode)
+        self.et_live_trading_chk.setStyleSheet(
+            f"QCheckBox {{ color: {tc['text']}; spacing: {ui_px(8)}px; }}"
+        )
+        et_btn_row = QHBoxLayout()
+        self.et_auth_btn = QPushButton("Authorize in Browser")
+        self.et_auth_btn.clicked.connect(self._etrade_start_oauth)
+        self.et_connect_btn = QPushButton("Complete Connection")
+        self.et_connect_btn.setProperty("uiBtnKind", "primary")
+        self.et_connect_btn.setStyleSheet(action_btn_style("primary"))
+        self.et_connect_btn.clicked.connect(self.connect_etrade)
+        self.et_disconnect_btn = QPushButton("Disconnect")
+        self.et_disconnect_btn.clicked.connect(self.disconnect_etrade)
+        et_btn_row.addWidget(self.et_auth_btn)
+        et_btn_row.addWidget(self.et_connect_btn)
+        et_btn_row.addWidget(self.et_disconnect_btn)
+        et_form.addRow("Status:", self.et_dialog_status_lbl)
+        et_form.addRow("Environment:", self.et_env_combo)
+        et_form.addRow("Consumer Key:", self.et_key_input)
+        et_form.addRow("Consumer Secret:", self.et_secret_input)
+        et_form.addRow("Verifier Code:", self.et_verifier_input)
+        et_form.addRow("Account:", self.et_account_combo)
+        et_form.addRow("", self.et_live_trading_chk)
+        et_form.addRow("", et_btn_row)
+        hint = QLabel(
+            "1) Authorize in Browser → 2) paste the NEW code → 3) Complete Connection. "
+            "Do not change Environment mid-flow. Tokens expire at midnight ET; "
+            "secrets use Windows Credential Manager when available."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        et_form.addRow(hint)
+
+    def _build_discord_webhook_dialog(self):
+        """Webhook URL lives in a dialog so Settings does not expose it inline."""
+        self._discord_webhook_dialog = QDialog(self)
+        self._discord_webhook_dialog.setWindowTitle("Discord Webhook")
+        self._discord_webhook_dialog.setModal(True)
+        self._discord_webhook_dialog.setMinimumWidth(ui_px(460))
+        form = QFormLayout(self._discord_webhook_dialog)
+        form.setContentsMargins(ui_px(14), ui_px(12), ui_px(14), ui_px(12))
+        form.setSpacing(ui_px(8))
+
+        self.discord_input = QLineEdit(self.settings.get("discord_webhook", ""))
+        self.discord_input.setPlaceholderText("https://discord.com/api/webhooks/…")
+        self.discord_input.setEchoMode(QLineEdit.Password)
+        form.addRow("Webhook URL:", self.discord_input)
+
+        self.discord_webhook_show_chk = QCheckBox("Show URL")
+        self.discord_webhook_show_chk.setToolTip("Reveal the webhook URL for paste / edit")
+        self.discord_webhook_show_chk.toggled.connect(self._on_discord_webhook_show_toggled)
+        form.addRow("", self.discord_webhook_show_chk)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self._discord_webhook_dialog.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("uiBtnKind", "primary")
+        save_btn.setStyleSheet(action_btn_style("primary"))
+        save_btn.clicked.connect(self._save_discord_webhook_dialog)
+        btn_row.addWidget(save_btn)
+        form.addRow(btn_row)
+
+    def _on_discord_webhook_show_toggled(self, checked):
+        if not hasattr(self, "discord_input"):
+            return
+        self.discord_input.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+
+    def _update_discord_webhook_status(self):
+        if not hasattr(self, "discord_webhook_status_lbl"):
+            return
+        configured = bool((self.settings.get("discord_webhook") or "").strip())
+        tc = theme_colors(self.dark_mode)
+        if configured:
+            self.discord_webhook_status_lbl.setText("Webhook configured")
+            self.discord_webhook_status_lbl.setStyleSheet(
+                f"color: {tc['success']}; font-weight: 600; font-size: {ui_px(12)}px;"
+            )
+        else:
+            self.discord_webhook_status_lbl.setText("Not set")
+            self.discord_webhook_status_lbl.setStyleSheet(
+                f"color: {tc['muted']}; font-size: {ui_px(12)}px;"
+            )
+
+    def _open_discord_webhook_dialog(self):
+        if not hasattr(self, "_discord_webhook_dialog"):
+            return
+        self.discord_input.setText(self.settings.get("discord_webhook", ""))
+        if hasattr(self, "discord_webhook_show_chk"):
+            self.discord_webhook_show_chk.setChecked(False)
+        self.discord_input.setEchoMode(QLineEdit.Password)
+        self._discord_webhook_dialog.exec_()
+
+    def _save_discord_webhook_dialog(self):
+        url = self.discord_input.text().strip()
+        self.settings["discord_webhook"] = url
+        save_settings(self.settings)
+        self._update_discord_webhook_status()
+        if hasattr(self, "_discord_webhook_dialog"):
+            self._discord_webhook_dialog.accept()
+
+    def _sync_broker_dialog_status(self, broker):
+        """Mirror summary status into the matching login dialog label."""
+        if broker == "Robinhood" and hasattr(self, "rh_dialog_status_lbl") and hasattr(self, "rh_status_lbl"):
+            self.rh_dialog_status_lbl.setText(self.rh_status_lbl.text())
+            self.rh_dialog_status_lbl.setStyleSheet(self.rh_status_lbl.styleSheet())
+        elif broker == "Coinbase" and hasattr(self, "cb_dialog_status_lbl") and hasattr(self, "cb_status_lbl"):
+            self.cb_dialog_status_lbl.setText(self.cb_status_lbl.text())
+            self.cb_dialog_status_lbl.setStyleSheet(self.cb_status_lbl.styleSheet())
+        elif broker == "E*TRADE" and hasattr(self, "et_dialog_status_lbl") and hasattr(self, "et_status_lbl"):
+            self.et_dialog_status_lbl.setText(self.et_status_lbl.text())
+            self.et_dialog_status_lbl.setStyleSheet(self.et_status_lbl.styleSheet())
+
+    def _set_broker_status(self, broker, text, style=""):
+        """Update Settings summary + dialog status for one broker."""
+        if broker == "Robinhood" and hasattr(self, "rh_status_lbl"):
+            self.rh_status_lbl.setText(text)
+            self.rh_status_lbl.setStyleSheet(style)
+            self._sync_broker_dialog_status("Robinhood")
+        elif broker == "Coinbase" and hasattr(self, "cb_status_lbl"):
+            self.cb_status_lbl.setText(text)
+            self.cb_status_lbl.setStyleSheet(style)
+            self._sync_broker_dialog_status("Coinbase")
+        elif broker == "E*TRADE" and hasattr(self, "et_status_lbl"):
+            self.et_status_lbl.setText(text)
+            self.et_status_lbl.setStyleSheet(style)
+            self._sync_broker_dialog_status("E*TRADE")
+
+    def _open_robinhood_login_dialog(self):
+        if not hasattr(self, "_rh_login_dialog"):
+            return
+        self._sync_broker_dialog_status("Robinhood")
+        # show() — not exec_() — keeps the main event loop free (tray Exit stays usable)
+        self._rh_login_dialog.show()
+        self._rh_login_dialog.raise_()
+        self._rh_login_dialog.activateWindow()
+
+    def _open_coinbase_login_dialog(self):
+        if not hasattr(self, "_cb_login_dialog"):
+            return
+        self._sync_broker_dialog_status("Coinbase")
+        self._cb_login_dialog.show()
+        self._cb_login_dialog.raise_()
+        self._cb_login_dialog.activateWindow()
+
+    def _open_etrade_login_dialog(self):
+        if not hasattr(self, "_et_login_dialog"):
+            return
+        # Refresh non-secret fields from settings (secrets stay in Credential Manager)
+        if hasattr(self, "et_key_input"):
+            env = self.et_env_combo.currentText() if hasattr(self, "et_env_combo") else "sandbox"
+            key = self.settings.get("etrade_consumer_key", "")
+            if env == "live":
+                key = self.settings.get("etrade_prod_consumer_key_pending") or key
+            if key and not self.et_key_input.text().strip():
+                self.et_key_input.setText(key)
+            elif key:
+                self.et_key_input.setText(key)
+        if hasattr(self, "et_secret_input"):
+            self.et_secret_input.clear()
+            self.et_secret_input.setPlaceholderText("Leave blank if saved in Credential Manager")
+        if hasattr(self, "et_env_combo"):
+            env_saved = self.settings.get("etrade_environment", "sandbox")
+            idx = self.et_env_combo.findText(env_saved)
+            if idx >= 0:
+                self.et_env_combo.setCurrentIndex(idx)
+        self._sync_broker_dialog_status("E*TRADE")
+        self._populate_etrade_account_combo()
+        self._et_login_dialog.show()
+        self._et_login_dialog.raise_()
+        self._et_login_dialog.activateWindow()
+
+    def _populate_etrade_account_combo(self):
+        if not hasattr(self, "et_account_combo"):
+            return
+        combo = self.et_account_combo
+        combo.clear()
+        et = self.brokers.get("E*TRADE")
+        choices = et.list_account_choices() if et and hasattr(et, "list_account_choices") else []
+        saved = self.settings.get("etrade_account_id_key", "")
+        sel_idx = 0
+        for i, (key, label, is_ira) in enumerate(choices):
+            combo.addItem(label, key)
+            if key and key == saved:
+                sel_idx = i
+        if not choices and saved:
+            combo.addItem(f"Saved · {saved}", saved)
+        if combo.count():
+            combo.setCurrentIndex(sel_idx)
+
+    def _etrade_creds_base(self):
+        env = self.et_env_combo.currentText() if hasattr(self, "et_env_combo") else "sandbox"
+        key = self.et_key_input.text().strip() if hasattr(self, "et_key_input") else ""
+        secret = self.et_secret_input.text().strip() if hasattr(self, "et_secret_input") else ""
+        if not key:
+            key = (self.settings.get("etrade_consumer_key") or "").strip()
+            if env == "live":
+                key = key or (self.settings.get("etrade_prod_consumer_key_pending") or "").strip()
+        if not secret:
+            try:
+                from etrade_broker import load_etrade_secret
+                secret = (load_etrade_secret("consumer_secret", env) or "").strip()
+            except Exception:
+                secret = ""
+        return {
+            "environment": env,
+            "consumer_key": key,
+            "consumer_secret": secret,
+            "live_trading_enabled": bool(
+                self.et_live_trading_chk.isChecked()
+                if hasattr(self, "et_live_trading_chk")
+                else self.settings.get("etrade_live_trading", False)
+            ),
+            "account_id_key": (
+                self.et_account_combo.currentData()
+                if hasattr(self, "et_account_combo") and self.et_account_combo.count()
+                else self.settings.get("etrade_account_id_key", "")
+            ),
+            "token_expires_at": self.settings.get("etrade_token_expires_at", 0),
+        }
+
+    def _etrade_start_oauth(self):
+        creds = self._etrade_creds_base()
+        creds["start_oauth"] = True
+        if not creds.get("consumer_key") and not creds.get("consumer_secret"):
+            QMessageBox.warning(self, "E*TRADE", "Enter consumer key and secret first.")
+            return
+        if not creds.get("consumer_key"):
+            QMessageBox.warning(self, "E*TRADE", "Enter the consumer key first.")
+            return
+        if not creds.get("consumer_secret"):
+            QMessageBox.warning(
+                self, "E*TRADE",
+                "Consumer secret not found.\n\n"
+                "Paste it in the Consumer Secret field once "
+                "(it will be saved to Windows Credential Manager), then try again."
+            )
+            return
+        try:
+            from etrade_broker import store_etrade_secret
+            if self.et_secret_input.text().strip():
+                store_etrade_secret("consumer_secret", creds["environment"], creds["consumer_secret"])
+        except Exception:
+            pass
+        ok, msg = self.brokers["E*TRADE"].login(creds)
+        if ok and str(msg).startswith("AUTH_URL::"):
+            url = str(msg).split("AUTH_URL::", 1)[1]
+            webbrowser.open(url)
+            self._set_broker_status("E*TRADE", "🟡 Authorize in browser…", "color: #FFD54F; font-weight: bold;")
+            QMessageBox.information(
+                self, "E*TRADE",
+                "Browser opened for E*TRADE authorization.\n\n"
+                "After approving, paste that verification code here and click "
+                "Complete Connection (same dialog session).\n\n"
+                "If you click Authorize again, use only the newest code."
+            )
+        else:
+            QMessageBox.warning(self, "E*TRADE", f"Could not start OAuth: {msg}")
+
+    def connect_etrade(self):
+        creds = self._etrade_creds_base()
+        verifier = self.et_verifier_input.text().strip() if hasattr(self, "et_verifier_input") else ""
+        if verifier:
+            creds["verifier"] = verifier
+        if not creds.get("consumer_key"):
+            QMessageBox.warning(self, "E*TRADE", "Enter the consumer key first.")
+            return
+        if not creds.get("consumer_secret"):
+            QMessageBox.warning(
+                self, "E*TRADE",
+                "Consumer secret not found. Paste it in Consumer Secret once, then connect."
+            )
+            return
+        try:
+            from etrade_broker import store_etrade_secret
+            if self.et_secret_input.text().strip():
+                store_etrade_secret("consumer_secret", creds["environment"], creds["consumer_secret"])
+        except Exception:
+            pass
+        ok, msg = self.brokers["E*TRADE"].login(creds)
+        if ok:
+            et = self.brokers["E*TRADE"]
+            self._broker_manual_auth_needed["E*TRADE"] = False
+            self._set_broker_status("E*TRADE", "🟢 Connected", "color: #00E676; font-weight: bold;")
+            self.settings["etrade_environment"] = et.environment
+            self.settings["etrade_consumer_key"] = self.et_key_input.text().strip()
+            self.settings["etrade_account_id_key"] = et.account_id_key or ""
+            self.settings["etrade_token_expires_at"] = float(et.token_expires_at or 0)
+            self.settings["etrade_live_trading"] = bool(self.et_live_trading_chk.isChecked())
+            et.live_trading_enabled = bool(self.settings["etrade_live_trading"])
+            save_settings(self.settings)
+            self._populate_etrade_account_combo()
+            if hasattr(self, "et_verifier_input"):
+                self.et_verifier_input.clear()
+            if hasattr(self, "et_secret_input"):
+                self.et_secret_input.clear()
+            self.refresh_account_balances()
+            self.log_event(f"[E*TRADE] Connected ({et.environment}) account={et.account_id_key}")
+        else:
+            if _is_manual_auth_failure(msg):
+                self._broker_manual_auth_needed["E*TRADE"] = True
+            QMessageBox.warning(self, "Connection Failed", f"E*TRADE: {msg}")
+
+    def disconnect_etrade(self):
+        try:
+            self.brokers["E*TRADE"].logout()
+        except Exception:
+            pass
+        self._broker_manual_auth_needed["E*TRADE"] = True
+        self._set_broker_status("E*TRADE", "🔴 Disconnected", "")
+        self.log_event("[E*TRADE] Disconnected / token revoked.")
+
     def connect_robinhood(self):
+        """Start RH password/2FA login on a worker thread — never block the Qt UI thread."""
+        if getattr(self, "_rh_login_in_flight", False):
+            self.log_event("Robinhood: login already in progress.")
+            return
         email = self.rh_email_input.text().strip()
         password = self.rh_pass_input.text().strip()
-        
-        # Patch input to elegantly handle 2FA SMS popups
-        original_input = builtins.input
-        builtins.input = self._gui_input_prompt
-        
-        try:
-            success, msg = self.brokers["Robinhood"].login({'email': email, 'password': password})
-            if success:
-                self.rh_status_lbl.setText("🟢 Connected")
-                self.rh_status_lbl.setStyleSheet("color: #00E676; font-weight: bold;")
-                self.settings["rh_email"] = email
-                self.settings["rh_password"] = password
-                save_settings(self.settings)
-                self.refresh_account_balances()
-            else:
-                QMessageBox.warning(self, "Connection Failed", f"Robinhood: {msg}")
-        finally:
-            builtins.input = original_input
+        if not email or not password:
+            QMessageBox.warning(self, "Robinhood", "Enter email and password.")
+            return
 
-    def connect_coinbase(self):
-        key = self.cb_key_input.text().strip()
-        secret = self.cb_secret_input.text().strip()
-        success, msg = self.brokers["Coinbase"].login({'api_key': key, 'api_secret': secret})
-        if success:
-            self.cb_status_lbl.setText("🟢 Connected")
-            self.cb_status_lbl.setStyleSheet("color: #00E676; font-weight: bold;")
-            self.settings["cb_api_key"] = key
-            self.settings["cb_api_secret"] = secret
+        self._rh_login_in_flight = True
+        if hasattr(self, "rh_connect_btn"):
+            self.rh_connect_btn.setEnabled(False)
+        self._set_broker_status("Robinhood", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
+        self.set_working_state(True, "Connecting Robinhood…")
+        self.log_event("Robinhood: connecting in background (UI stays responsive)…")
+
+        def _bg():
+            original_input = builtins.input
+            builtins.input = self._worker_rh_input_prompt
+            try:
+                ok, msg = self.brokers["Robinhood"].login({
+                    "email": email,
+                    "password": password,
+                    "store_session": True,
+                })
+                return {"ok": bool(ok), "msg": msg, "email": email, "password": password}
+            finally:
+                builtins.input = original_input
+
+        task = BackgroundTask(_bg)
+        task.result_ready.connect(
+            lambda res: QTimer.singleShot(0, lambda: self._on_rh_connect_finished(res))
+        )
+        task.error_occurred.connect(
+            lambda e: QTimer.singleShot(
+                0,
+                lambda: self._on_rh_connect_finished(
+                    {"ok": False, "msg": str(e), "email": email, "password": password}
+                ),
+            )
+        )
+        task.finished.connect(lambda: self.active_threads.remove(task) if task in self.active_threads else None)
+        self.active_threads.append(task)
+        task.start()
+
+    def _on_rh_connect_finished(self, result):
+        self._rh_login_in_flight = False
+        if hasattr(self, "rh_connect_btn"):
+            self.rh_connect_btn.setEnabled(True)
+        result = result or {}
+        ok = bool(result.get("ok"))
+        msg = result.get("msg") or ""
+        email = result.get("email") or ""
+        password = result.get("password") or ""
+        if ok:
+            self._set_broker_status("Robinhood", "🟢 Connected", "color: #00E676; font-weight: bold;")
+            self.settings["rh_email"] = email
+            self.settings["rh_password"] = password
             save_settings(self.settings)
+            # Confirm robin_stocks wrote/kept ~/.tokens/robinhood.pickle for next launch
+            try:
+                from broker import robinhood_pickle_path
+                pickle_ok = os.path.isfile(robinhood_pickle_path())
+            except Exception:
+                pickle_ok = False
+            self.set_working_state(False, "Robinhood connected")
+            if pickle_ok:
+                self.log_event("Robinhood connected (password / 2FA path) — session saved for next launch.")
+            else:
+                self.log_event(
+                    "Robinhood connected, but no session pickle found — next launch may require Connect again."
+                )
             self.refresh_account_balances()
         else:
-            QMessageBox.warning(self, "Connection Failed", f"Coinbase: {msg}")
+            self._set_broker_status("Robinhood", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
+            self.set_working_state(False)
+            self.log_event(f"Robinhood login failed: {msg}")
+            QMessageBox.warning(self, "Connection Failed", f"Robinhood: {msg}")
+
+    def connect_coinbase(self):
+        """Coinbase CDP login on a worker thread (network must not freeze UI)."""
+        if getattr(self, "_cb_login_in_flight", False):
+            self.log_event("Coinbase: login already in progress.")
+            return
+        key = self.cb_key_input.text().strip()
+        secret = self.cb_secret_input.text().strip()
+        if not key or not secret:
+            QMessageBox.warning(self, "Coinbase", "Enter API key and secret.")
+            return
+
+        self._cb_login_in_flight = True
+        if hasattr(self, "cb_connect_btn"):
+            self.cb_connect_btn.setEnabled(False)
+        self._set_broker_status("Coinbase", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
+        self.set_working_state(True, "Connecting Coinbase…")
+
+        def _bg():
+            live = bool(
+                self.cb_live_trading_chk.isChecked()
+                if hasattr(self, "cb_live_trading_chk")
+                else self.settings.get("coinbase_live_trading", True)
+            )
+            ok, msg = self.brokers["Coinbase"].login({
+                "api_key": key,
+                "api_secret": secret,
+                "live_trading_enabled": live,
+            })
+            return {"ok": bool(ok), "msg": msg, "key": key, "secret": secret, "live": live}
+
+        task = BackgroundTask(_bg)
+        task.result_ready.connect(
+            lambda res: QTimer.singleShot(0, lambda: self._on_cb_connect_finished(res))
+        )
+        task.error_occurred.connect(
+            lambda e: QTimer.singleShot(
+                0,
+                lambda: self._on_cb_connect_finished(
+                    {"ok": False, "msg": str(e), "key": key, "secret": secret}
+                ),
+            )
+        )
+        task.finished.connect(lambda: self.active_threads.remove(task) if task in self.active_threads else None)
+        self.active_threads.append(task)
+        task.start()
+
+    def _on_cb_connect_finished(self, result):
+        self._cb_login_in_flight = False
+        if hasattr(self, "cb_connect_btn"):
+            self.cb_connect_btn.setEnabled(True)
+        result = result or {}
+        if result.get("ok"):
+            self._set_broker_status("Coinbase", "🟢 Connected", "color: #00E676; font-weight: bold;")
+            self.settings["cb_api_key"] = result.get("key") or ""
+            self.settings["cb_api_secret"] = result.get("secret") or ""
+            if "live" in result:
+                self.settings["coinbase_live_trading"] = bool(result.get("live"))
+            elif hasattr(self, "cb_live_trading_chk"):
+                self.settings["coinbase_live_trading"] = bool(self.cb_live_trading_chk.isChecked())
+            cb = self.brokers.get("Coinbase")
+            if cb is not None:
+                cb.live_trading_enabled = bool(self.settings.get("coinbase_live_trading", True))
+            save_settings(self.settings)
+            self.set_working_state(False, "Coinbase connected")
+            self.log_event("Coinbase connected.")
+            self.refresh_account_balances()
+        else:
+            self._set_broker_status("Coinbase", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
+            self.set_working_state(False)
+            QMessageBox.warning(self, "Connection Failed", f"Coinbase: {result.get('msg')}")
 
     def run_startup_sequence(self):
         """Show UI immediately; connect brokers off the main thread (avoids freeze on open)."""
         self.log_event("Connecting brokers in background...")
-        if hasattr(self, "rh_status_lbl"):
-            self.rh_status_lbl.setText("🟡 Connecting…")
-            self.rh_status_lbl.setStyleSheet("color: #FFD54F; font-weight: bold;")
-        if hasattr(self, "cb_status_lbl"):
-            self.cb_status_lbl.setText("🟡 Connecting…")
-            self.cb_status_lbl.setStyleSheet("color: #FFD54F; font-weight: bold;")
+        self._set_broker_status("Robinhood", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
+        self._set_broker_status("Coinbase", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
+        self._set_broker_status("E*TRADE", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
         self.set_working_state(True, "Connecting brokers…")
         task = BackgroundTask(self._bg_startup_connect)
         task.result_ready.connect(self._on_startup_connected)
-        task.error_occurred.connect(lambda e: self._on_startup_connected({"rh_ok": False, "cb_ok": False, "error": str(e)}))
+        task.error_occurred.connect(
+            lambda e: self._on_startup_connected(
+                {"rh_ok": False, "cb_ok": False, "et_ok": False, "error": str(e)}
+            )
+        )
         task.finished.connect(lambda: self.active_threads.remove(task) if task in self.active_threads else None)
         self.active_threads.append(task)
         task.start()
 
     def _bg_startup_connect(self):
         """Network logins only — never call QInputDialog from this thread."""
-        result = {"rh_ok": False, "cb_ok": False, "rh_needs_password": False}
+        result = {"rh_ok": False, "cb_ok": False, "et_ok": False, "rh_needs_password": False}
         # Prefer saved Robinhood session (fast, no 2FA UI)
         try:
             ok, _ = self.brokers["Robinhood"].login({})
@@ -3522,63 +4799,99 @@ class MarketAdvisorGUI(QMainWindow):
                 ok, _ = self.brokers["Coinbase"].login({
                     "api_key": self.settings["cb_api_key"],
                     "api_secret": self.settings["cb_api_secret"],
+                    "live_trading_enabled": bool(self.settings.get("coinbase_live_trading", True)),
                 })
                 result["cb_ok"] = bool(ok)
             except Exception:
                 result["cb_ok"] = False
+
+        # E*TRADE: restore same-day token quietly (no browser)
+        if self.settings.get("etrade_consumer_key"):
+            try:
+                ok, msg = self.brokers["E*TRADE"].login({
+                    "environment": self.settings.get("etrade_environment", "sandbox"),
+                    "consumer_key": self.settings.get("etrade_consumer_key", ""),
+                    "account_id_key": self.settings.get("etrade_account_id_key", ""),
+                    "token_expires_at": self.settings.get("etrade_token_expires_at", 0),
+                    "live_trading_enabled": bool(self.settings.get("etrade_live_trading", False)),
+                })
+                result["et_ok"] = bool(ok)
+                result["et_msg"] = msg
+            except Exception as e:
+                result["et_ok"] = False
+                result["et_msg"] = str(e)
         return result
 
     def _startup_rh_password_login(self):
-        """Main-thread RH login so SMS 2FA dialogs stay safe."""
-        original_input = builtins.input
-        builtins.input = self._gui_input_prompt
-        try:
-            rh_ok, msg = self.brokers["Robinhood"].login({
-                "email": self.settings.get("rh_email", ""),
-                "password": self.settings.get("rh_password", ""),
-                "store_session": True,
-            })
-            if rh_ok:
-                self.rh_status_lbl.setText("🟢 Connected")
-                self.rh_status_lbl.setStyleSheet("color: #00E676; font-weight: bold;")
-                self.log_event("Robinhood connected (password / 2FA path).")
-            else:
-                self.rh_status_lbl.setText("🔴 Disconnected")
-                self.rh_status_lbl.setStyleSheet("color: #FF5252; font-weight: bold;")
-                self.log_event(f"Robinhood login failed: {msg}")
-        finally:
-            builtins.input = original_input
+        """
+        Explicit password/2FA path — always async (same as Settings → Connect).
+        Never call this from automatic startup.
+        """
+        if hasattr(self, "rh_email_input"):
+            email = self.rh_email_input.text().strip() or self.settings.get("rh_email", "")
+            password = self.rh_pass_input.text().strip() or self.settings.get("rh_password", "")
+            self.rh_email_input.setText(email)
+            self.rh_pass_input.setText(password)
+        self.connect_robinhood()
 
     def _on_startup_connected(self, result):
         result = result or {}
-        if result.get("cb_ok"):
-            self.cb_status_lbl.setText("🟢 Connected")
-            self.cb_status_lbl.setStyleSheet("color: #00E676; font-weight: bold;")
-            self.log_event("Coinbase connected.")
-        elif self.settings.get("cb_api_key"):
-            self.cb_status_lbl.setText("🔴 Disconnected")
-            self.cb_status_lbl.setStyleSheet("color: #FF5252; font-weight: bold;")
-            self.log_event("Coinbase login failed.")
-        else:
-            self.cb_status_lbl.setText("🔴 Disconnected")
+        try:
+            if result.get("cb_ok"):
+                self._set_broker_status("Coinbase", "🟢 Connected", "color: #00E676; font-weight: bold;")
+                self.log_event("Coinbase connected.")
+            elif self.settings.get("cb_api_key"):
+                self._set_broker_status("Coinbase", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
+                self.log_event("Coinbase login failed.")
+            else:
+                self._set_broker_status("Coinbase", "🔴 Disconnected")
 
-        if result.get("rh_ok"):
-            self.rh_status_lbl.setText("🟢 Connected")
-            self.rh_status_lbl.setStyleSheet("color: #00E676; font-weight: bold;")
-            self.log_event("Robinhood connected (saved session).")
-        elif result.get("rh_needs_password"):
-            self._startup_rh_password_login()
-        else:
-            self.rh_status_lbl.setText("🔴 Disconnected")
-            self.rh_status_lbl.setStyleSheet("color: #FF5252; font-weight: bold;")
+            if result.get("rh_ok"):
+                self._set_broker_status("Robinhood", "🟢 Connected", "color: #00E676; font-weight: bold;")
+                self.log_event("Robinhood connected (saved session).")
+            elif result.get("rh_needs_password"):
+                # Do NOT auto password/2FA here — that freezes the whole UI (and tray menu).
+                # Restore already tried pickle on a background thread; only Connect when that failed.
+                self._set_broker_status(
+                    "Robinhood", "🔴 Sign-in needed", "color: #FF5252; font-weight: bold;"
+                )
+                self.log_event(
+                    "Robinhood saved session missing or expired — open Settings → Connect Robinhood. "
+                    "SMS 2FA only if Robinhood challenges; auto password-login is skipped so the UI stays responsive."
+                )
+            else:
+                self._set_broker_status("Robinhood", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
 
-        self.set_working_state(False)
-        if result.get("error"):
-            self.log_event(f"Startup connect error: {result.get('error')}")
-        # Balances + holdings; Discord launch ping is already armed from _post_show_init
-        self.refresh_account_balances()
-        self.manual_portfolio_reload(and_score=False, force=True)
-        QTimer.singleShot(800, self._startup_score_portfolio_if_ready)
+            if result.get("et_ok"):
+                self._set_broker_status("E*TRADE", "🟢 Connected", "color: #00E676; font-weight: bold;")
+                self.log_event("E*TRADE connected (saved token).")
+                self._broker_manual_auth_needed["E*TRADE"] = False
+                et = self.brokers.get("E*TRADE")
+                if et and getattr(et, "token_expires_at", None):
+                    self.settings["etrade_token_expires_at"] = float(et.token_expires_at)
+                    self.settings["etrade_account_id_key"] = et.account_id_key or self.settings.get(
+                        "etrade_account_id_key", ""
+                    )
+                    save_settings(self.settings)
+            elif self.settings.get("etrade_consumer_key"):
+                detail = result.get("et_msg") or "reauth required"
+                self._set_broker_status("E*TRADE", "🔴 Reauth needed", "color: #FF5252; font-weight: bold;")
+                self.log_event(f"E*TRADE not restored: {detail}")
+                if _is_manual_auth_failure(detail):
+                    self._broker_manual_auth_needed["E*TRADE"] = True
+            else:
+                self._set_broker_status("E*TRADE", "🔴 Disconnected")
+                self._broker_manual_auth_needed["E*TRADE"] = False
+
+            if result.get("error"):
+                self.log_event(f"Startup connect error: {result.get('error')}")
+        finally:
+            self._startup_connect_finished = True
+            self.set_working_state(False)
+            # Balances + holdings; Discord launch ping is already armed from _post_show_init
+            self.refresh_account_balances()
+            self.manual_portfolio_reload(and_score=False, force=True)
+            QTimer.singleShot(800, self._startup_score_portfolio_if_ready)
 
     def _launch_checkin_failsafe(self):
         if getattr(self, "_launch_checkin_sent", False):
@@ -3651,7 +4964,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.auto_trade_btn.setText("Auto-Trader: ON")
             self.auto_trade_btn.setStyleSheet(top_bar_btn_style(UI_DANGER))
             self.at_status_frame.setVisible(True)
-            self._set_engine_banner("Auto-Trader Armed")
+            self._set_engine_banner(f"Auto-Trader Armed — {', '.join(active)}")
         else:
             self.auto_trade_btn.setText("Auto-Trader: OFF")
             self.auto_trade_btn.setStyleSheet(top_bar_btn_style("#424242"))
@@ -3660,64 +4973,95 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _disarm_broker(self, broker_name, notify_discord=False):
         self.auto_trade_enabled[broker_name] = False
+        self.task_queue = [
+            item for item in self.task_queue
+            if not (isinstance(item, (tuple, list)) and item and item[0] == broker_name)
+        ]
         self.log_event(f"Auto-Trader disabled for {broker_name}.")
         self._update_autotrade_ui()
         if notify_discord:
             self.send_discord_alert(f"🛑 Auto-Trader **DISARMED** for **{broker_name}**.")
 
-    def toggle_auto_trade(self):
-        # If anything is currently running, this button acts as a single kill switch.
-        if any(self.auto_trade_enabled.values()):
-            was = [b for b, on in self.auto_trade_enabled.items() if on]
-            for broker_name in list(self.auto_trade_enabled.keys()):
-                self.auto_trade_enabled[broker_name] = False
-            self.task_queue.clear()
-            self._cycle_broker = None
-            self.is_processing_queue = False
-            self._queue_started_at = None
-            self._stall_alerted = False
-            self.log_event("Auto-Trader disabled for all brokers.")
-            self._update_autotrade_ui()
-            mode = "PAPER" if self.paper_mode else "LIVE"
-            self.send_discord_alert(
-                f"🛑 Auto-Trader **DISARMED** ({mode}) — stopped: {', '.join(was) or 'none'}."
-            )
-            return
-
-        # Nothing running yet -> ask which broker(s) to arm.
-        choices = ["Robinhood Only", "Coinbase Only", "Both Robinhood + Coinbase"]
-        choice, ok = QInputDialog.getItem(self, "Select Broker(s)", "Run Auto-Trader on:", choices, 2, False)
-        if not ok:
-            return
-
-        targets = []
-        if choice == "Robinhood Only":
-            targets = ["Robinhood"]
-        elif choice == "Coinbase Only":
-            targets = ["Coinbase"]
+    def _broker_arm_capability_label(self, broker_name):
+        b = self.brokers[broker_name]
+        caps = []
+        if getattr(b, "supports_equities", False):
+            caps.append("equities")
+        if getattr(b, "supports_crypto", False):
+            caps.append("crypto")
+        cap_txt = " + ".join(caps) or "n/a"
+        connected = bool(getattr(b, "is_connected", False)) or self.paper_mode
+        if self.paper_mode:
+            status = "Paper"
+        elif connected:
+            status = "Connected"
         else:
-            targets = ["Robinhood", "Coinbase"]
+            status = "Disconnected"
+        return f"{broker_name} ({cap_txt}) — {status}"
 
-        armed = []
-        for broker_name in targets:
-            if not self.brokers[broker_name].is_connected and not self.paper_mode:
+    def _broker_is_arm_eligible(self, broker_name, *, warn=False):
+        """Return True if this broker can be armed right now."""
+        if not self.brokers[broker_name].is_connected and not self.paper_mode:
+            if warn:
                 QMessageBox.warning(
                     self, "Broker Disconnected",
                     f"Skipping {broker_name}: please connect it in Settings first (or enable Paper Mode)."
                 )
-                continue
-            if self.session_starts[broker_name] is None:
-                # Prefer cached equity baseline; never lock in $0 before balances arrive
-                if self.paper_mode:
-                    self.session_starts[broker_name] = 10000.00
-                else:
-                    cached = float(
-                        (self._last_balance_totals.get(broker_name) or {}).get("p_val", 0.0) or 0.0
+            return False
+        if broker_name == "Coinbase" and not self.paper_mode:
+            if not bool(self.settings.get("coinbase_live_trading", True)):
+                if warn:
+                    QMessageBox.warning(
+                        self, "Coinbase Live Trading Disabled",
+                        "Coinbase live order placement is off (kill switch). "
+                        "Enable Live Trading in the Coinbase login dialog, or use Paper Mode."
                     )
-                    if cached > 0:
-                        self.session_starts[broker_name] = cached
-                        self._persist_session_baselines()
-                    # else leave None — first balance fetch will seed Day P&L baseline
+                return False
+        if broker_name == "E*TRADE" and not self.paper_mode:
+            et = self.brokers["E*TRADE"]
+            if getattr(et, "environment", "sandbox") == "live" and not bool(
+                self.settings.get("etrade_live_trading", False)
+            ):
+                if warn:
+                    QMessageBox.warning(
+                        self, "E*TRADE Live Trading Disabled",
+                        "E*TRADE live order placement is off (sandbox-first). "
+                        "Connect in Sandbox, or enable Live Trading in the E*TRADE login dialog after validation."
+                    )
+                return False
+            exp = getattr(et, "token_expires_at", None) or self.settings.get("etrade_token_expires_at") or 0
+            try:
+                exp = float(exp)
+            except Exception:
+                exp = 0.0
+            if warn and exp and exp - time.time() < 3600:
+                QMessageBox.information(
+                    self, "E*TRADE Reauth Soon",
+                    "E*TRADE access tokens expire at midnight ET. "
+                    "You may need to reauthorize before the session ends."
+                )
+        return True
+
+    def _seed_session_start_for_arm(self, broker_name):
+        if self.session_starts[broker_name] is not None:
+            return
+        if self.paper_mode:
+            self.session_starts[broker_name] = 10000.00
+            return
+        cached = float(
+            (self._last_balance_totals.get(broker_name) or {}).get("p_val", 0.0) or 0.0
+        )
+        if cached > 0:
+            self.session_starts[broker_name] = cached
+            self._persist_session_baselines()
+
+    def _arm_broker_engines(self, broker_names, *, warn=True):
+        """Enable auto-trade for eligible brokers. Returns list successfully armed."""
+        armed = []
+        for broker_name in broker_names:
+            if not self._broker_is_arm_eligible(broker_name, warn=warn):
+                continue
+            self._seed_session_start_for_arm(broker_name)
             self.auto_trade_enabled[broker_name] = True
             # Force an immediate first pulse for this broker (don't wait a full interval)
             self.last_crypto_time[broker_name] = 0
@@ -3725,18 +5069,29 @@ class MarketAdvisorGUI(QMainWindow):
             self.last_penny_time[broker_name] = 0
             self.last_core_time[broker_name] = 0
             armed.append(broker_name)
+        return armed
 
-        if not armed:
-            self.log_event("Auto-Trader arm failed — no eligible brokers.")
-            self._update_autotrade_ui()
-            return
-
-        # Instant UI feedback — never block the click on live balance API calls
+    def _disarm_all_engines(self, was=None, *, notify_discord=True):
+        was = list(was) if was is not None else [b for b, on in self.auto_trade_enabled.items() if on]
+        for broker_name in list(self.auto_trade_enabled.keys()):
+            self.auto_trade_enabled[broker_name] = False
+        self.task_queue.clear()
+        self._cycle_broker = None
+        self.is_processing_queue = False
+        self._queue_started_at = None
+        self._stall_alerted = False
+        stopped = ", ".join(was) if was else "none"
+        mode = "PAPER" if self.paper_mode else "LIVE"
+        self.log_event(f"Auto-Trader DISARMED ({mode}) for all brokers — stopped: {stopped}.")
+        for broker_name in was:
+            self.log_event(f"[{broker_name}] Auto-Trader disabled.")
         self._update_autotrade_ui()
-        self._set_engine_banner("🤖 ⚡ Auto-Trader Armed — spinning up…")
-        QTimer.singleShot(0, self.director_tick)
+        if notify_discord:
+            self.send_discord_alert(
+                f"🛑 Auto-Trader **DISARMED** ({mode}) — stopped: {stopped}."
+            )
 
-        # Logs / Discord use cached buying power (refresh in background for accuracy)
+    def _log_armed_brokers(self, armed):
         totals = getattr(self, "_last_balance_totals", {}) or {}
         mode = "PAPER" if self.paper_mode else "LIVE"
         bp_lines = []
@@ -3763,8 +5118,97 @@ class MarketAdvisorGUI(QMainWindow):
             f"⚔️ Auto-Trader **ARMED** ({mode}) on {', '.join(armed)}.\n"
             + "\n".join(bp_lines)
         )
-        # Refresh balances off the UI thread; does not delay the armed state
-        self.refresh_account_balances()
+
+    def toggle_auto_trade(self):
+        """When OFF: open arm picker. When ON: confirm full-off or open manage picker."""
+        currently_on = [b for b, on in self.auto_trade_enabled.items() if on]
+        if currently_on:
+            dlg = AutoTraderOffDialog(self, currently_on, dark_mode=self.dark_mode)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            if dlg.choice == AutoTraderOffDialog.OFF_ALL:
+                self._disarm_all_engines(was=currently_on)
+                return
+            if dlg.choice != AutoTraderOffDialog.MANAGE:
+                return
+            # Fall through to checkbox picker (manage)
+        self._open_broker_arm_picker(currently_on)
+
+    def _open_broker_arm_picker(self, currently_on=None):
+        """Checkbox picker to arm, update, or disarm brokers independently."""
+        currently_on = list(currently_on) if currently_on is not None else [
+            b for b, on in self.auto_trade_enabled.items() if on
+        ]
+        managing = bool(currently_on)
+
+        rows = []
+        for name in BROKER_NAMES:
+            eligible = self._broker_is_arm_eligible(name, warn=False)
+            # Already-armed brokers stay selectable so they can be unchecked to disarm
+            enabled = eligible or bool(self.auto_trade_enabled.get(name))
+            tip = None
+            if not enabled:
+                tip = "Connect this broker in Settings first (or enable Paper Mode)."
+                if name == "E*TRADE" and self.brokers[name].is_connected and not self.paper_mode:
+                    tip = (
+                        "E*TRADE live order placement is off. "
+                        "Use Sandbox or enable Live Trading in the E*TRADE login dialog."
+                    )
+            rows.append({
+                "name": name,
+                "label": self._broker_arm_capability_label(name),
+                "enabled": enabled,
+                "checked": bool(self.auto_trade_enabled.get(name)) if managing else eligible,
+                "disabled_tip": tip,
+            })
+
+        dlg = BrokerArmDialog(self, rows, dark_mode=self.dark_mode, managing=managing)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        selected = dlg.selected_brokers()
+        previously = set(currently_on)
+        wanted = set(selected)
+
+        to_disarm = [b for b in BROKER_NAMES if b in previously and b not in wanted]
+        to_arm = [b for b in BROKER_NAMES if b in wanted and b not in previously]
+
+        if not wanted:
+            if previously:
+                self._disarm_all_engines(was=currently_on)
+            else:
+                self.log_event("Auto-Trader arm cancelled — no brokers selected.")
+            return
+
+        for broker_name in to_disarm:
+            self._disarm_broker(broker_name, notify_discord=True)
+
+        newly_armed = self._arm_broker_engines(to_arm, warn=True) if to_arm else []
+
+        # Keep previously armed brokers that remain selected
+        still_armed = [b for b in BROKER_NAMES if self.auto_trade_enabled.get(b)]
+        if not still_armed:
+            self.log_event("Auto-Trader arm failed — no eligible brokers.")
+            self._update_autotrade_ui()
+            return
+
+        self._update_autotrade_ui()
+        if newly_armed:
+            self._set_engine_banner("🤖 ⚡ Auto-Trader Armed — spinning up…")
+            QTimer.singleShot(0, self.director_tick)
+            self._log_armed_brokers(newly_armed)
+            self.refresh_account_balances()
+        elif to_disarm:
+            remaining = ", ".join(still_armed)
+            self.log_event(f"Multi-Engine Auto-Trader still ENABLED for {remaining}")
+            mode = "PAPER" if self.paper_mode else "LIVE"
+            self.send_discord_alert(
+                f"⚔️ Auto-Trader **UPDATED** ({mode}) — still armed: {remaining}."
+            )
+        else:
+            self.log_event(
+                f"Multi-Engine Auto-Trader selection unchanged: {', '.join(still_armed)}"
+            )
 
     def _set_trading_context(self, broker_name):
         """Locks trading to a broker for one auto cycle without yanking the user off All view."""
@@ -3814,18 +5258,19 @@ class MarketAdvisorGUI(QMainWindow):
                     continue
 
             if now - self.last_crypto_time[broker_name] >= self.settings.get("interval_crypto", 45):
-                task = (broker_name, "CRYPTO")
-                if task not in self.task_queue: self.task_queue.append(task)
+                if self._broker_supports(broker_name, "supports_crypto"):
+                    task = (broker_name, "CRYPTO")
+                    if task not in self.task_queue: self.task_queue.append(task)
                 self.last_crypto_time[broker_name] = now
 
-            # Portfolio / sell checks: both brokers, 24/7 (crypto holdings don't care about equity hours)
+            # Portfolio / sell checks: all armed brokers, 24/7
             if now - self.last_port_time[broker_name] >= self.settings.get("interval_portfolio", 45):
                 task = (broker_name, "PORTFOLIO")
                 if task not in self.task_queue: self.task_queue.append(task)
                 self.last_port_time[broker_name] = now
 
-            # Stocks: Robinhood only — run in regular AND extended (not weekend/closed night)
-            if broker_name != "Coinbase" and self.is_equity_session_active():
+            # Equities: capability-driven (RH + E*TRADE; not Coinbase)
+            if self._broker_supports(broker_name, "supports_equities") and self.is_equity_session_active():
                 if now - self.last_penny_time[broker_name] >= self.settings.get("interval_penny", 60):
                     task = (broker_name, "PENNY")
                     if task not in self.task_queue: self.task_queue.append(task)
@@ -3838,12 +5283,14 @@ class MarketAdvisorGUI(QMainWindow):
 
         self.process_queue()
 
-        # Quiet idle balance poll — keeps top-bar equity/P&L fresh even when auto-trader is off
-        bal_every = int(self.settings.get("interval_balance_refresh", 60) or 60)
-        bal_every = max(30, bal_every)
-        if now - getattr(self, "_last_idle_balance_refresh", 0.0) >= bal_every:
-            self._last_idle_balance_refresh = now
-            self.refresh_account_balances(quiet=True)
+        # Quiet idle balance poll — keeps top-bar equity/P&L fresh even when auto-trader is off.
+        # Skip until startup connect finishes so we don't Discord/$0-paint before brokers attach.
+        if getattr(self, "_startup_connect_finished", False):
+            bal_every = int(self.settings.get("interval_balance_refresh", 60) or 60)
+            bal_every = max(30, bal_every)
+            if now - getattr(self, "_last_idle_balance_refresh", 0.0) >= bal_every:
+                self._last_idle_balance_refresh = now
+                self.refresh_account_balances(quiet=True)
 
         # Throttle monitor publish (~every 3s) so the phone page stays fresh
         last_pub = getattr(self, "_monitor_last_publish", 0.0)
@@ -3855,6 +5302,9 @@ class MarketAdvisorGUI(QMainWindow):
         """Kick off silent re-login on a worker thread (never block director_tick)."""
         now = time.time()
         if self._reconnect_in_flight.get(broker_name):
+            return
+        # Needs browser OAuth / missing creds — silent retry cannot succeed
+        if getattr(self, "_broker_manual_auth_needed", {}).get(broker_name):
             return
         if now - self._reconnect_cooldown.get(broker_name, 0) < 90:
             return
@@ -3870,23 +5320,31 @@ class MarketAdvisorGUI(QMainWindow):
         def _bg():
             try:
                 if broker_name == "Robinhood":
-                    # Prefer saved session (no MFA). Password fallback is best-effort only.
+                    # Prefer saved session (no MFA). Never password/2FA on a worker thread.
                     ok, detail = self.brokers["Robinhood"].login({})
                     if ok:
                         return True, "session restored"
-                    if email and password:
-                        ok, detail = self.brokers["Robinhood"].login({
-                            "email": email, "password": password, "store_session": True
-                        })
-                        return bool(ok), detail
-                    return False, detail or "missing saved credentials"
+                    return False, detail or "saved session expired — Connect from Settings"
                 if broker_name == "Coinbase":
                     if cb_key and cb_secret:
                         ok, detail = self.brokers["Coinbase"].login({
-                            "api_key": cb_key, "api_secret": cb_secret
+                            "api_key": cb_key,
+                            "api_secret": cb_secret,
+                            "live_trading_enabled": bool(
+                                self.settings.get("coinbase_live_trading", True)
+                            ),
                         })
                         return bool(ok), detail
                     return False, "missing saved API keys"
+                if broker_name == "E*TRADE":
+                    ok, detail = self.brokers["E*TRADE"].login({
+                        "environment": self.settings.get("etrade_environment", "sandbox"),
+                        "consumer_key": self.settings.get("etrade_consumer_key", ""),
+                        "account_id_key": self.settings.get("etrade_account_id_key", ""),
+                        "token_expires_at": self.settings.get("etrade_token_expires_at", 0),
+                        "live_trading_enabled": bool(self.settings.get("etrade_live_trading", False)),
+                    })
+                    return bool(ok), detail
                 return False, "unknown broker"
             except Exception as e:
                 return False, str(e)
@@ -3898,17 +5356,24 @@ class MarketAdvisorGUI(QMainWindow):
                 ok, detail = bool(result[0]), result[1]
             if ok:
                 self._reconnect_fail_streak[broker_name] = 0
+                self._broker_manual_auth_needed[broker_name] = False
                 self.log_event(f"[{broker_name}] Reconnected successfully.")
                 self.send_discord_alert(f"✅ [{broker_name}] Session restored after drop.")
                 self.refresh_account_balances()
             else:
                 streak = self._reconnect_fail_streak.get(broker_name, 0) + 1
                 self._reconnect_fail_streak[broker_name] = streak
-                self.log_event(f"[{broker_name}] Reconnect failed ({streak}x): {detail}")
-                if streak >= 2:
-                    self.send_discord_alert(
-                        f"🚨 [{broker_name}] Reconnect failed {streak}x — auto cycles paused until session restored. ({detail})"
+                if _is_manual_auth_failure(detail):
+                    self._broker_manual_auth_needed[broker_name] = True
+                    self.log_event(
+                        f"[{broker_name}] Reconnect needs manual auth — pausing auto-retries. ({detail})"
                     )
+                else:
+                    self.log_event(f"[{broker_name}] Reconnect failed ({streak}x): {detail}")
+                    if streak >= 2:
+                        self.send_discord_alert(
+                            f"🚨 [{broker_name}] Reconnect failed {streak}x — auto cycles paused until session restored. ({detail})"
+                        )
 
         def _fail(err):
             self._reconnect_in_flight[broker_name] = False
@@ -3935,14 +5400,34 @@ class MarketAdvisorGUI(QMainWindow):
         self._queue_started_at = time.time()
         self._stall_alerted = False
         broker_name, task = self.task_queue.pop(0)
+        if not self.auto_trade_enabled.get(broker_name):
+            self.log_event(f"[AUTO] Skipping {task} on {broker_name} (disarmed)")
+            self.cycle_finished()
+            return
         self._cycle_broker = broker_name
         self._set_trading_context(broker_name)
         self.log_event(f"[AUTO] Starting {task} cycle on {broker_name}")
 
-        if task == "CRYPTO": self.run_crypto_cycle()
-        elif task == "PENNY": self.run_penny_cycle()
-        elif task == "CORE": self.run_core_cycle()
-        elif task == "PORTFOLIO": self.run_portfolio_cycle()
+        if task == "CRYPTO":
+            if not self._broker_supports(broker_name, "supports_crypto"):
+                self.log_event(f"[AUTO] Skipping CRYPTO on {broker_name} (broker has no crypto)")
+                self.cycle_finished()
+                return
+            self.run_crypto_cycle()
+        elif task == "PENNY":
+            if not self._broker_supports(broker_name, "supports_equities"):
+                self.log_event(f"[AUTO] Skipping PENNY on {broker_name} (no equities)")
+                self.cycle_finished()
+                return
+            self.run_penny_cycle()
+        elif task == "CORE":
+            if not self._broker_supports(broker_name, "supports_equities"):
+                self.log_event(f"[AUTO] Skipping CORE on {broker_name} (no equities)")
+                self.cycle_finished()
+                return
+            self.run_core_cycle()
+        elif task == "PORTFOLIO":
+            self.run_portfolio_cycle()
         else:
             self.log_event(f"[AUTO] Unknown task {task} — skipping")
             self.cycle_finished()
@@ -3963,7 +5448,8 @@ class MarketAdvisorGUI(QMainWindow):
     def _holdings_fingerprint(self, assets):
         """Stable signature of positions — ignores live price so quotes don't thrash the table."""
         parts = []
-        for a in sorted(assets, key=lambda x: (str(x.get('broker', '')), str(x.get('ticker', '')))):
+        safe = [a for a in (assets or []) if isinstance(a, dict)]
+        for a in sorted(safe, key=lambda x: (str(x.get('broker', '')), str(x.get('ticker', '')))):
             parts.append(f"{a.get('broker','')}:{a.get('ticker','')}:{float(a.get('shares') or 0):.8f}")
         return "|".join(parts)
 
@@ -3971,17 +5457,17 @@ class MarketAdvisorGUI(QMainWindow):
         """Update cached holdings counts without hitting broker APIs on the UI thread."""
         cache = getattr(self, "_holdings_count_cache", None)
         if cache is None:
-            self._holdings_count_cache = {"Robinhood": 0, "Coinbase": 0}
+            self._holdings_count_cache = _blank_broker_map(0)
             cache = self._holdings_count_cache
         if assets is None:
             return cache
-        counts = {"Robinhood": 0, "Coinbase": 0}
+        counts = _blank_broker_map(0)
         for a in assets:
             name = a.get("broker") or ""
             if name in counts:
                 counts[name] += 1
         # When view is a single broker, only refresh that broker's count
-        if self.view_mode in ("Robinhood", "Coinbase"):
+        if self.view_mode in BROKER_NAMES:
             cache[self.view_mode] = counts.get(self.view_mode, 0)
         else:
             cache.update(counts)
@@ -3991,15 +5477,20 @@ class MarketAdvisorGUI(QMainWindow):
         """Returns holdings for the current view_mode (All = both brokers tagged), with live prices."""
         if self.view_mode == "All":
             combined = []
-            for name in ("Robinhood", "Coinbase"):
+            for name in BROKER_NAMES:
                 for a in self.get_broker_holdings(name):
+                    if not isinstance(a, dict) or not a.get("ticker"):
+                        continue
                     row = dict(a)
                     row["broker"] = name
                     combined.append(row)
             assets = combined
         else:
             name = self.view_mode if self.view_mode in self.brokers else self.active_broker_name
-            assets = self.get_broker_holdings(name)
+            assets = [
+                a for a in (self.get_broker_holdings(name) or [])
+                if isinstance(a, dict) and a.get("ticker")
+            ]
             for a in assets:
                 a["broker"] = name
 
@@ -4007,7 +5498,7 @@ class MarketAdvisorGUI(QMainWindow):
             broker_name = a.get("broker") or self.active_broker_name
             broker = self.brokers.get(broker_name)
             try:
-                a["live_price"] = float(broker.get_live_price(a["ticker"]) if broker else 0.0) or 0.0
+                a["live_price"] = float(broker.get_live_price(a.get("ticker")) if broker else 0.0) or 0.0
             except Exception:
                 a["live_price"] = 0.0
 
@@ -4016,8 +5507,9 @@ class MarketAdvisorGUI(QMainWindow):
             self._holdings_count_cache = {
                 "Robinhood": sum(1 for a in assets if a.get("broker") == "Robinhood"),
                 "Coinbase": sum(1 for a in assets if a.get("broker") == "Coinbase"),
+                "E*TRADE": sum(1 for a in assets if a.get("broker") == "E*TRADE"),
             }
-        elif self.view_mode in ("Robinhood", "Coinbase"):
+        elif self.view_mode in BROKER_NAMES:
             self._holdings_count_cache[self.view_mode] = len(assets)
         return assets
 
@@ -4033,7 +5525,7 @@ class MarketAdvisorGUI(QMainWindow):
         def _done(assets):
             assets = assets or []
             self._refresh_holdings_count_cache(assets if self.view_mode == "All" else None)
-            if self.view_mode in ("Robinhood", "Coinbase"):
+            if self.view_mode in BROKER_NAMES:
                 self._holdings_count_cache[self.view_mode] = len(assets)
             fp = self._holdings_fingerprint(assets)
             changed = force or fp != self._portfolio_fingerprint or self.portfolio_table.rowCount() == 0
@@ -4077,10 +5569,11 @@ class MarketAdvisorGUI(QMainWindow):
             self.portfolio_table.setItem(row, 5, QTableWidgetItem(format_currency(shares * price)))
 
     def _on_portfolio_loaded(self, assets):
+        assets = [a for a in (assets or []) if isinstance(a, dict) and a.get("ticker")]
         self.portfolio_table.setRowCount(len(assets))
         for row, a in enumerate(assets):
             broker_name = a.get('broker') or self.active_broker_name
-            t_item = QTableWidgetItem(a['ticker'])
+            t_item = QTableWidgetItem(str(a.get('ticker') or ""))
             t_item.setCheckState(Qt.Checked)
             t_item.setData(Qt.UserRole, a.get('type', ''))
             t_item.setData(Qt.UserRole + 1, broker_name)
@@ -4089,10 +5582,11 @@ class MarketAdvisorGUI(QMainWindow):
 
             self.portfolio_table.setItem(row, 0, QTableWidgetItem(broker_name))
             self.portfolio_table.setItem(row, 1, t_item)
-            self.portfolio_table.setItem(row, 2, QTableWidgetItem(format_quantity(a['shares'])))
+            self.portfolio_table.setItem(row, 2, QTableWidgetItem(format_quantity(a.get('shares') or 0)))
             self.portfolio_table.setItem(row, 3, QTableWidgetItem(format_currency(a.get('cost') or 0)))
             self.portfolio_table.setItem(row, 4, QTableWidgetItem(format_currency(price)))
-            self.portfolio_table.setItem(row, 5, QTableWidgetItem(format_currency(a['shares'] * price)))
+            shares = float(a.get("shares") or 0.0)
+            self.portfolio_table.setItem(row, 5, QTableWidgetItem(format_currency(shares * price)))
             self.portfolio_table.setItem(row, 6, QTableWidgetItem("Pending..."))
             self.portfolio_table.setItem(row, 7, QTableWidgetItem("Not Traded"))
         self.set_working_state(False)
@@ -4145,14 +5639,20 @@ class MarketAdvisorGUI(QMainWindow):
         self.set_working_state(False)
 
     def calculate_order_sizing(self, current_bp, asset_type="", entry_price=0.0, equity=None,
-                               score=None, open_count=None, max_open_positions=None):
+                               score=None, open_count=None, max_open_positions=None,
+                               existing_name_value=0.0, size_frac=1.0, return_detail=False,
+                               ticker=None):
         """
-        BP-aware diversified size: deployable_BP / remaining_slots (vs max_open),
-        floored by allocation_pct_* baseline; conviction may stretch the aim up to 1.5×.
-        Hard/soft caps inside calculate_risk_sizing: risk $, ~15% equity name cap, cash reserve.
+        BP-aware concentrated size: deployable_BP / min(remaining capacity, focus_slots),
+        floored by allocation_pct_* baseline; conviction may stretch the aim (posture max).
+        Hard/soft caps inside risk_sizing_breakdown: risk $, soft equity name cap.
         min_trade_dollars is a floor/skip only — not the target size.
+        existing_name_value / size_frac: gated scale-in — size_frac shrinks aim before
+        caps; min floor still applies when remaining name room allows.
+
+        Returns trade dollars, or (trade, detail_dict) when return_detail=True.
         """
-        from scoring import calculate_risk_sizing, get_stop_distance_pct
+        from scoring import risk_sizing_breakdown, get_stop_distance_pct
         is_crypto = "crypto" in str(asset_type).lower()
         if is_crypto:
             alloc_pct = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 8.0)) / 100.0
@@ -4160,7 +5660,9 @@ class MarketAdvisorGUI(QMainWindow):
             alloc_pct = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0)) / 100.0
         min_dollars = self.settings.get("min_trade_dollars", 5.0)
         broker_id = getattr(self.cycle_broker, "broker_id", None) or self.cycle_broker_name.upper()
-        stop_d = get_stop_distance_pct(broker_id, asset_type=asset_type)
+        stop_d = get_stop_distance_pct(
+            broker_id, ticker=ticker, asset_type=asset_type, for_sizing=True,
+        )
         eq = float(equity) if equity is not None else None
         if eq is None:
             try:
@@ -4169,18 +5671,71 @@ class MarketAdvisorGUI(QMainWindow):
                 eq = float(current_bp or 0.0)
         max_open = max_open_positions
         if max_open is None:
-            max_open = int(self.settings.get("max_open_positions", 20))
+            max_open = int(self.settings.get("max_open_positions", 8))
         open_n = open_count
         if open_n is None:
             try:
                 holdings = self.get_broker_holdings(self.cycle_broker_name) or []
-                open_n = len({(a.get("ticker") or "").upper() for a in holdings if a.get("ticker")})
+                open_n = len({
+                    (a.get("ticker") or "").upper()
+                    for a in holdings
+                    if isinstance(a, dict) and a.get("ticker")
+                })
             except Exception:
                 open_n = 0
-        return calculate_risk_sizing(
+        try:
+            util = float(self.settings.get("target_bp_utilization_pct", 88.0))
+        except (TypeError, ValueError):
+            util = 88.0
+        try:
+            focus = int(self.settings.get("sizing_focus_slots", 6))
+        except (TypeError, ValueError):
+            focus = 6
+        try:
+            name_cap = float(self.settings.get("max_single_name_equity_pct", 15.0))
+        except (TypeError, ValueError):
+            name_cap = 15.0
+        try:
+            conv_max = float(self.settings.get("conviction_alloc_mult_max", 1.50))
+        except (TypeError, ValueError):
+            conv_max = 1.50
+        detail = risk_sizing_breakdown(
             eq, current_bp, stop_d, alloc_pct, min_dollars=min_dollars,
             conviction_score=score, open_count=open_n, max_open_positions=max_open,
+            target_bp_utilization=util, sizing_focus_slots=focus,
+            soft_name_equity_frac=name_cap, conviction_mult_max=conv_max,
+            existing_name_value=existing_name_value, size_frac=size_frac,
         )
+        trade = float(detail.get("trade") or 0.0)
+        if return_detail:
+            return trade, detail
+        return trade
+
+    def _note_scale_in_skip(self, notes, broker_name, ticker, reason, throttle_sec=600):
+        """
+        Append a SCALE-IN skip note, throttling identical broker/ticker/reason spam.
+        Re-emits after throttle_sec with a repeat count so the Activity Log stays readable.
+        """
+        reason = str(reason or "sizing blocked").strip()
+        key = (str(broker_name or "").upper(), str(ticker or "").upper(), reason)
+        now = time.time()
+        if not hasattr(self, "_si_skip_throttle"):
+            self._si_skip_throttle = {}
+        prev = self._si_skip_throttle.get(key)
+        if prev is not None:
+            elapsed = now - float(prev.get("t") or 0.0)
+            if elapsed < float(throttle_sec):
+                prev["n"] = int(prev.get("n") or 1) + 1
+                return
+            n = int(prev.get("n") or 1)
+            self._si_skip_throttle[key] = {"t": now, "n": 1}
+            suffix = f" (repeated {n}× over last {int(elapsed // 60) or 1}m)" if n > 1 else ""
+            notes.append(
+                f"[{broker_name}] SCALE-IN skipped [{ticker}]: {reason}{suffix}"
+            )
+            return
+        self._si_skip_throttle[key] = {"t": now, "n": 1}
+        notes.append(f"[{broker_name}] SCALE-IN skipped [{ticker}]: {reason}")
 
     def _attach_protective_stop(self, broker_name, ticker, asset_type, price, spent):
         """After a successful buy: broker stop if live; virtual stop in paper. Software TTP remains backup."""
@@ -4192,7 +5747,7 @@ class MarketAdvisorGUI(QMainWindow):
             qty = (float(spent) / float(price)) if price and spent else 0.0
             if qty <= 0 or price <= 0:
                 return
-            broker_id = broker_name.upper()
+            broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
             existing = get_protective_order(broker_id, ticker)
             if existing and existing.get("order_id"):
                 self.log_event(f"[{broker_name}] Protective already tracked for {ticker} — skip duplicate")
@@ -4240,7 +5795,7 @@ class MarketAdvisorGUI(QMainWindow):
     def _cancel_protective_stop(self, broker_name, ticker, asset_type=""):
         """Cancel orphan protective orders after a full exit."""
         from scoring import get_protective_order, clear_protective_order
-        broker_id = broker_name.upper()
+        broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
         info = get_protective_order(broker_id, ticker)
         if not info:
             return
@@ -4325,8 +5880,9 @@ class MarketAdvisorGUI(QMainWindow):
             return
         self.set_working_state(True, "Executing sells…")
         self.run_thread(
-            lambda: self._bg_execute_sell_batch(sell_list),
-            lambda payload: self._on_sell_batch_done(payload, auto_mode=auto_mode, finish_cycle=False)
+            self._bg_execute_sell_batch,
+            lambda payload: self._on_sell_batch_done(payload, auto_mode=auto_mode, finish_cycle=False),
+            sell_list,
         )
 
     def execute_scanner_trades(self, table, auto_mode=False, buy_candidates=None):
@@ -4410,69 +5966,138 @@ class MarketAdvisorGUI(QMainWindow):
 
         self.set_working_state(True, "Executing buys…")
         runner = self.run_cycle_thread if auto_mode else self.run_thread
+        rank = bool(buy_candidates is None and auto_mode)
         runner(
-            lambda: self._bg_buy_batch(filtered, rank=(buy_candidates is None and auto_mode)),
-            lambda payload: self._on_buy_batch_done(payload, auto_mode=auto_mode, table=table)
+            self._bg_buy_batch,
+            lambda payload: self._on_buy_batch_done(payload, auto_mode=auto_mode, table=table),
+            filtered,
+            rank,
         )
 
     def _bg_buy_batch(self, candidates, rank=False):
         """Place buys on a worker thread (confirm_order sleeps stay off the UI)."""
-        from scoring import concentration_blocks_buy, buy_rank_score_for_book
+        from scoring import (
+            concentration_blocks_buy, buy_rank_score_for_book, buy_rank_score,
+            evaluate_scale_in, record_scale_in, get_scale_in_params,
+        )
         broker_name = self.cycle_broker_name
+        broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
         session = self.get_equity_session_info()
         use_ext = session["use_ext"]
         market_hours = session["market_hours"]
         allow_fractional = session["fractional_ok"]
-        max_positions = int(self.settings.get("max_open_positions", 20))
+        max_positions = int(self.settings.get("max_open_positions", 8))
         max_buys = int(self.settings.get("max_buys_per_cycle", 2))
+        posture = self.settings.get("risk_posture", "balanced")
+        si_params = get_scale_in_params(posture=posture, settings=self.settings)
         notes = []
         ranked = list(candidates or [])
 
         equity, bp = self.get_broker_balances(broker_name)
         holdings = self.get_broker_holdings(broker_name) or []
-        held = {a["ticker"].upper() for a in holdings}
+        held = {
+            (a.get("ticker") or "").upper()
+            for a in holdings
+            if isinstance(a, dict) and a.get("ticker")
+        }
         open_count = len(held)
         # Refresh monitor cache from this bg holdings pull
         self._holdings_count_cache[broker_name] = open_count
 
         holdings_meta = []
+        holdings_by_ticker = {}
         broker = self.brokers.get(broker_name)
+        # Coinbase (crypto-only): skip equity-wide crypto book cap — BP util is the cash rail
+        crypto_only_broker = not bool(getattr(broker, "supports_equities", True))
         for a in holdings:
+            if not isinstance(a, dict):
+                continue
             t = a.get("ticker") or ""
+            if not t:
+                continue
             is_c = "crypto" in str(a.get("type") or "").lower() or str(t).upper() in KNOWN_CRYPTOS
             px = 0.0
             try:
                 px = float(broker.get_live_price(t) if broker else 0.0) or 0.0
             except Exception:
                 px = 0.0
-            holdings_meta.append({
+            try:
+                avg_cost = float(a.get("cost") or 0.0)
+            except (TypeError, ValueError):
+                avg_cost = 0.0
+            if avg_cost <= 0:
+                avg_cost = float(self._avg_cost_for(broker_name, t) or 0.0)
+            meta = {
                 "ticker": t,
                 "value": float(a.get("shares") or 0) * px,
                 "is_crypto": is_c,
-            })
+                "avg_cost": avg_cost,
+                "shares": float(a.get("shares") or 0),
+            }
+            holdings_meta.append(meta)
+            holdings_by_ticker[str(t).upper()] = meta
 
-        # Rank against *this* book: bury already-held / full clusters; prefer underweight themes
+        # Rank against *this* book; held names may qualify as gated scale-in
         if ranked:
             with SuppressPrints():
                 for c in ranked:
                     ticker = c.get("ticker") or ""
                     asset_type = c.get("asset_type") or ""
                     is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
+                    tu = ticker.upper()
                     try:
-                        c["score"] = float(buy_rank_score_for_book(
-                            ticker, is_crypto=is_crypto, held_tickers=held,
-                            holdings_meta=holdings_meta, portfolio_value=equity,
-                        ))
+                        if tu in held:
+                            meta = holdings_by_ticker.get(tu) or {}
+                            live_px = float(c.get("price") or 0.0)
+                            if live_px <= 0:
+                                try:
+                                    live_px = float(broker.get_live_price(ticker) if broker else 0.0) or 0.0
+                                except Exception:
+                                    live_px = 0.0
+                            base = float(buy_rank_score(ticker, is_crypto=is_crypto))
+                            ev = evaluate_scale_in(
+                                ticker, live_px, meta.get("avg_cost") or 0.0,
+                                broker_id=broker_id, asset_type=asset_type, is_crypto=is_crypto,
+                                signal_score=base, posture=posture, settings=self.settings,
+                                existing_name_value=meta.get("value") or 0.0,
+                                portfolio_value=equity,
+                            )
+                            c["scale_in"] = bool(ev.get("allowed"))
+                            c["scale_in_eval"] = ev
+                            if ev.get("allowed"):
+                                c["score"] = float(buy_rank_score_for_book(
+                                    ticker, is_crypto=is_crypto, held_tickers=held,
+                                    holdings_meta=holdings_meta, portfolio_value=equity,
+                                    scale_in_candidate=True,
+                                    crypto_only_broker=crypto_only_broker,
+                                ))
+                                notes.append(
+                                    f"[{broker_name}] SCALE-IN considered [{ticker}]: OK — {ev.get('reason')}"
+                                )
+                            else:
+                                c["score"] = -1000.0
+                                notes.append(
+                                    f"[{broker_name}] SCALE-IN blocked [{ticker}]: {ev.get('reason')}"
+                                )
+                        else:
+                            c["scale_in"] = False
+                            c["score"] = float(buy_rank_score_for_book(
+                                ticker, is_crypto=is_crypto, held_tickers=held,
+                                holdings_meta=holdings_meta, portfolio_value=equity,
+                                crypto_only_broker=crypto_only_broker,
+                            ))
                     except Exception:
                         c["score"] = float(c.get("score") or 0.0)
+                        c["scale_in"] = bool(c.get("scale_in"))
             ranked.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-            # Drop names that cannot improve the book (already held / cluster full)
+            # Drop names that cannot improve the book (already held without scale-in / cluster full)
             actionable = [c for c in ranked if float(c.get("score") or 0.0) > -500.0]
             if rank or len(ranked) > 1:
                 top_src = actionable or ranked
                 top = ", ".join(
-                    f"{c.get('ticker')}({float(c.get('score') or 0):.0f})" for c in top_src[:3]
+                    f"{c.get('ticker')}({float(c.get('score') or 0):.0f}"
+                    f"{'*SI' if c.get('scale_in') else ''})" for c in top_src[:3]
                 )
                 notes.append(f"[{broker_name}] Ranked {len(actionable)}/{len(ranked)} buys for book — top: {top}")
             ranked = actionable
@@ -4484,15 +6109,16 @@ class MarketAdvisorGUI(QMainWindow):
             asset_type = c.get("asset_type") or ""
             price = float(c.get("price") or 0.0)
             is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
+            tu = ticker.upper()
+            is_held = tu in held
             if buys_done >= max_buys:
                 notes.append(f"[{broker_name}] Buy cap reached ({max_buys}/cycle) — stopping this pulse")
                 break
-            if max_positions > 0 and open_count >= max_positions:
+            # max_open blocks new slots only — scale-in keeps the same ticker
+            if (not is_held) and max_positions > 0 and open_count >= max_positions:
                 notes.append(f"[{broker_name}] Max open positions ({max_positions}) — skipping further buys")
                 break
-            if ticker.upper() in held:
-                notes.append(f"[{broker_name}] Skipped [{ticker}]: already holding")
-                continue
+
             # Fresh live price — reject missing/stale quotes (no buy on blind data)
             live = 0.0
             try:
@@ -4503,29 +6129,85 @@ class MarketAdvisorGUI(QMainWindow):
                 notes.append(f"[{broker_name}] Skipped [{ticker}]: missing/stale live price")
                 continue
             price = live
-            # Size first so crypto-book check can use proposed dollars
-            row_dollars = self.calculate_order_sizing(
+
+            scale_in = False
+            scale_frac = 1.0
+            existing_val = 0.0
+            if is_held:
+                meta = holdings_by_ticker.get(tu) or {}
+                existing_val = float(meta.get("value") or 0.0)
+                base = float(c.get("score") or 0.0)
+                # Re-evaluate at live price (gates may have moved since rank)
+                try:
+                    sig = float(buy_rank_score(ticker, is_crypto=is_crypto))
+                except Exception:
+                    sig = base
+                ev = evaluate_scale_in(
+                    ticker, price, meta.get("avg_cost") or 0.0,
+                    broker_id=broker_id, asset_type=asset_type, is_crypto=is_crypto,
+                    signal_score=sig, posture=posture, settings=self.settings,
+                    existing_name_value=existing_val, portfolio_value=equity,
+                )
+                if not ev.get("allowed"):
+                    notes.append(
+                        f"[{broker_name}] SCALE-IN blocked [{ticker}]: {ev.get('reason')}"
+                    )
+                    continue
+                scale_in = True
+                scale_frac = float(ev.get("size_frac") or si_params.get("scale_in_size_frac") or 0.5)
+
+            row_dollars, size_detail = self.calculate_order_sizing(
                 bp, asset_type, entry_price=price, equity=equity, score=c.get("score"),
                 open_count=open_count, max_open_positions=max_positions,
+                existing_name_value=existing_val if scale_in else 0.0,
+                size_frac=scale_frac if scale_in else 1.0,
+                return_detail=True, ticker=ticker,
             )
             if row_dollars <= 0:
+                if scale_in:
+                    why = (size_detail or {}).get("skip_reason") or "size too small / name cap"
+                    self._note_scale_in_skip(notes, broker_name, ticker, why)
+                    continue
                 notes.append(f"[{broker_name}] Skipping buys — buying power/risk size too low ({format_currency(bp)})")
                 break
             blocked, reason = concentration_blocks_buy(
                 ticker, held, holdings_meta=holdings_meta, portfolio_value=equity,
                 proposed_dollars=row_dollars, is_crypto=is_crypto,
+                allow_held_scale_in=scale_in,
+                crypto_only_broker=crypto_only_broker,
             )
             if blocked:
                 notes.append(f"[{broker_name}] Skipped [{ticker}]: concentration — {reason}")
                 continue
+            if scale_in:
+                notes.append(
+                    f"[{broker_name}] SCALE-IN {ticker} … reason: {ev.get('reason')} "
+                    f"… size ${row_dollars:.2f}"
+                )
             status, spent = self.execute_buy_order(
                 ticker, asset_type, price, row_dollars, offset, use_ext,
                 market_hours=market_hours, allow_fractional=allow_fractional,
             )
             ok = "Fail" not in status and "Skipped" not in status
             if ok:
-                held.add(ticker.upper())
-                open_count += 1
+                if scale_in:
+                    try:
+                        record_scale_in(broker_id, ticker)
+                    except Exception:
+                        pass
+                    # Allow future skip notes again if adds re-arm later
+                    if hasattr(self, "_si_skip_throttle"):
+                        prefix = (str(broker_name or "").upper(), str(ticker or "").upper())
+                        for k in list(self._si_skip_throttle.keys()):
+                            if k[:2] == prefix:
+                                self._si_skip_throttle.pop(k, None)
+                    if tu in holdings_by_ticker and spent:
+                        holdings_by_ticker[tu]["value"] = float(
+                            holdings_by_ticker[tu].get("value") or 0
+                        ) + float(spent)
+                else:
+                    held.add(tu)
+                    open_count += 1
                 buys_done += 1
                 if spent:
                     bp = max(0.0, bp - float(spent))
@@ -4540,6 +6222,7 @@ class MarketAdvisorGUI(QMainWindow):
                 "spent": spent,
                 "ok": ok,
                 "table_row": c.get("table_row"),
+                "scale_in": scale_in,
             })
         return {"fills": fills, "notes": notes, "buys_done": buys_done, "broker": broker_name}
 
@@ -4553,8 +6236,9 @@ class MarketAdvisorGUI(QMainWindow):
             status = fill.get("status") or ""
             if fill.get("ok"):
                 self.set_lock(ticker)
-            self.log_event(f"[{broker}] Execution [{ticker}]: {status}")
-            self.send_discord_alert(f"BUY {ticker}: {status}", is_trade=True)
+            tag = "SCALE-IN " if fill.get("scale_in") else ""
+            self.log_event(f"[{broker}] Execution [{ticker}]: {tag}{status}")
+            self.send_discord_alert(f"{'SCALE-IN' if fill.get('scale_in') else 'BUY'} {ticker}: {status}", is_trade=True)
             row = fill.get("table_row")
             if table is not None and row is not None and row < table.rowCount():
                 try:
@@ -4669,6 +6353,12 @@ class MarketAdvisorGUI(QMainWindow):
             status = fill.get("status") or ""
             if fill.get("ok"):
                 self.set_lock(ticker)
+                try:
+                    from scoring import clear_scale_in_count
+                    bid = getattr(self.brokers.get(broker), "broker_id", None) or str(broker).upper()
+                    clear_scale_in_count(bid, ticker)
+                except Exception:
+                    pass
             self.log_event(f"[{broker}] Execution [{ticker}]: {status}")
             if not fill.get("skipped"):
                 roi = None
@@ -4769,9 +6459,12 @@ class MarketAdvisorGUI(QMainWindow):
                     continue
                 action = evaluate_holding(
                     ticker, avg_cost,
-                    broker_id=broker_name.upper(),
+                    broker_id=getattr(broker, "broker_id", None) or broker_name,
                     asset_type=asset_type,
-                    live_price=price
+                    live_price=price,
+                    exit_roi_scale=float(self.settings.get("exit_roi_scale", 1.0) or 1.0),
+                    exit_time_scale=float(self.settings.get("exit_time_scale", 1.0) or 1.0),
+                    ttp_arm_scale=float(self.settings.get("ttp_arm_scale", 1.0) or 1.0),
                 )
                 results.append((row, price, action, asset_type, None))
         flush_state()
@@ -4780,7 +6473,9 @@ class MarketAdvisorGUI(QMainWindow):
     def _bg_score_opportunities(self, items):
         from scoring import evaluate_crypto_opportunity, evaluate_opportunity
         results = []
-        # Stocks/ETFs always price+execute context via Robinhood; crypto uses the cycle broker
+        # Price/score in the cycle broker's context (E*TRADE equities use ET, not RH)
+        cycle = self.cycle_broker
+        cycle_id = getattr(cycle, "broker_id", None) or self.cycle_broker_name
         rh = self.brokers.get("Robinhood")
         with SuppressPrints():
             for entry in items:
@@ -4788,14 +6483,24 @@ class MarketAdvisorGUI(QMainWindow):
                 is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
                 is_penny = asset_type == "Penny Stock" or "mover" in str(asset_type).lower()
                 if is_crypto:
-                    broker = self.cycle_broker
-                    broker_id = self.cycle_broker_name.upper()
+                    broker = cycle
+                    broker_id = cycle_id
                 else:
-                    broker = rh
-                    broker_id = "ROBINHOOD"
+                    # Equity scanners historically used RH quotes; prefer cycle broker when it supports equities
+                    if getattr(cycle, "supports_equities", False):
+                        broker = cycle
+                        broker_id = cycle_id
+                    else:
+                        broker = rh
+                        broker_id = "ROBINHOOD"
                 price = broker.get_live_price(ticker) if broker else 0.0
                 if is_crypto:
-                    action = evaluate_crypto_opportunity(ticker, broker_id=broker_id, live_price=price)
+                    action = evaluate_crypto_opportunity(
+                        ticker,
+                        broker_id=broker_id,
+                        live_price=price,
+                        posture=self.settings.get("risk_posture", "balanced"),
+                    )
                 else:
                     action = evaluate_opportunity(ticker, is_penny_stock=is_penny, broker_id=broker_id, live_price=price)
                 results.append((row, price, action, asset_type, None))
@@ -4809,50 +6514,83 @@ class MarketAdvisorGUI(QMainWindow):
                 item.setCheckState(check_state)
 
     def _populate_opp_table(self, table, opps):
-        table.setRowCount(len(opps))
-        for row, item in enumerate(opps):
-            t_item = QTableWidgetItem(item['symbol'])
+        rows = [o for o in (opps or []) if isinstance(o, dict) and (o.get("symbol") or o.get("ticker"))]
+        table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            sym = str(item.get("symbol") or item.get("ticker") or "")
+            t_item = QTableWidgetItem(sym)
             t_item.setCheckState(Qt.Checked)
-            t_item.setData(Qt.UserRole, item['type'])
+            t_item.setData(Qt.UserRole, item.get("type") or "")
             table.setItem(row, 0, t_item)
-            table.setItem(row, 1, QTableWidgetItem(item['type']))
+            table.setItem(row, 1, QTableWidgetItem(str(item.get("type") or "")))
             table.setItem(row, 2, QTableWidgetItem("Pending..."))
             table.setItem(row, 3, QTableWidgetItem("Pending..."))
             table.setItem(row, 4, QTableWidgetItem("Ready"))
 
     def _bg_scan_and_score(self, scan_func):
         """Discover tickers, score, and pre-rank BUY candidates in one background job."""
-        from scoring import buy_rank_score_for_book
+        from scoring import buy_rank_score_for_book, buy_rank_score, evaluate_scale_in
         opps = scan_func() or []
         if not opps:
-            return [], [], []
-        items = [(i, o['symbol'], 0.0, 0.0, o.get('type', '')) for i, o in enumerate(opps)]
+            return [], [], [], []
+        items = []
+        for i, o in enumerate(opps):
+            if not isinstance(o, dict):
+                continue
+            sym = o.get("symbol") or o.get("ticker")
+            if not sym:
+                continue
+            items.append((i, sym, 0.0, 0.0, o.get("type", "")))
+        if not items:
+            return [], [], [], []
         results = self._bg_score_opportunities(items)
 
         broker_name = self.cycle_broker_name
+        broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
+        posture = self.settings.get("risk_posture", "balanced")
         try:
             equity, _bp = self.get_broker_balances(broker_name)
         except Exception:
             equity = 0.0
         holdings = self.get_broker_holdings(broker_name) or []
-        held = {(a.get("ticker") or "").upper() for a in holdings if a.get("ticker")}
+        held = {
+            (a.get("ticker") or "").upper()
+            for a in holdings
+            if isinstance(a, dict) and a.get("ticker")
+        }
         broker = self.brokers.get(broker_name)
+        crypto_only_broker = not bool(getattr(broker, "supports_equities", True))
         holdings_meta = []
+        holdings_by_ticker = {}
         for a in holdings:
+            if not isinstance(a, dict):
+                continue
             t = a.get("ticker") or ""
+            if not t:
+                continue
             is_c = "crypto" in str(a.get("type") or "").lower() or str(t).upper() in KNOWN_CRYPTOS
             px = 0.0
             try:
                 px = float(broker.get_live_price(t) if broker else 0.0) or 0.0
             except Exception:
                 px = 0.0
-            holdings_meta.append({
+            try:
+                avg_cost = float(a.get("cost") or 0.0)
+            except (TypeError, ValueError):
+                avg_cost = 0.0
+            if avg_cost <= 0:
+                avg_cost = float(self._avg_cost_for(broker_name, t) or 0.0)
+            meta = {
                 "ticker": t,
                 "value": float(a.get("shares") or 0) * px,
                 "is_crypto": is_c,
-            })
+                "avg_cost": avg_cost,
+            }
+            holdings_meta.append(meta)
+            holdings_by_ticker[str(t).upper()] = meta
 
         buy_candidates = []
+        dropped = []  # BUY signals filtered as already-held / cluster-full (not actionable)
         with SuppressPrints():
             for row, price, action, asset_type, err in results:
                 action_u = str(action).upper()
@@ -4860,32 +6598,89 @@ class MarketAdvisorGUI(QMainWindow):
                     continue
                 if row >= len(opps):
                     continue
-                ticker = opps[row].get("symbol") or ""
-                atype = asset_type or opps[row].get("type", "")
+                opp_row = opps[row]
+                if not isinstance(opp_row, dict):
+                    continue
+                ticker = opp_row.get("symbol") or opp_row.get("ticker") or ""
+                atype = asset_type or opp_row.get("type", "")
                 is_crypto = "crypto" in str(atype).lower() or ticker.upper() in KNOWN_CRYPTOS
+                tu = ticker.upper()
+                live_px = float(price or 0.0)
                 try:
+                    if tu in held:
+                        meta = holdings_by_ticker.get(tu) or {}
+                        if live_px <= 0:
+                            try:
+                                live_px = float(broker.get_live_price(ticker) if broker else 0.0) or 0.0
+                            except Exception:
+                                live_px = float(price or 0.0)
+                        base = float(buy_rank_score(ticker, is_crypto=is_crypto))
+                        ev = evaluate_scale_in(
+                            ticker, live_px, meta.get("avg_cost") or 0.0,
+                            broker_id=broker_id, asset_type=atype, is_crypto=is_crypto,
+                            signal_score=base, posture=posture, settings=self.settings,
+                            existing_name_value=meta.get("value") or 0.0,
+                            portfolio_value=equity,
+                        )
+                        if not ev.get("allowed"):
+                            dropped.append(f"{ticker} (scale-in blocked: {ev.get('reason')})")
+                            continue
+                        score = float(buy_rank_score_for_book(
+                            ticker, is_crypto=is_crypto, held_tickers=held,
+                            holdings_meta=holdings_meta, portfolio_value=equity,
+                            scale_in_candidate=True,
+                            crypto_only_broker=crypto_only_broker,
+                        ))
+                        buy_candidates.append({
+                            "ticker": ticker,
+                            "asset_type": atype,
+                            "price": live_px,
+                            "score": score,
+                            "table_row": row,
+                            "scale_in": True,
+                            "scale_in_reason": ev.get("reason"),
+                        })
+                        continue
                     score = float(buy_rank_score_for_book(
                         ticker, is_crypto=is_crypto, held_tickers=held,
                         holdings_meta=holdings_meta, portfolio_value=equity,
+                        crypto_only_broker=crypto_only_broker,
                     ))
                 except Exception:
                     score = 0.0
                 if score <= -500.0:
-                    continue  # already held / cluster full — don't promote as a candidate
+                    # cluster full — don't promote as a candidate
+                    why = "already held / cluster full"
+                    try:
+                        from scoring import concentration_blocks_buy
+                        blocked, reason = concentration_blocks_buy(
+                            ticker, held, holdings_meta=holdings_meta,
+                            portfolio_value=equity, is_crypto=is_crypto,
+                            crypto_only_broker=crypto_only_broker,
+                        )
+                        if blocked and reason:
+                            why = reason
+                    except Exception:
+                        pass
+                    dropped.append(f"{ticker} ({why})")
+                    continue
                 buy_candidates.append({
                     "ticker": ticker,
                     "asset_type": atype,
                     "price": float(price or 0.0),
                     "score": score,
                     "table_row": row,
+                    "scale_in": False,
                 })
         buy_candidates.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-        return opps, results, buy_candidates
+        return opps, results, buy_candidates, dropped
 
     def _bg_portfolio_load_and_score(self, broker_name):
         """Load one broker's holdings and score them in one job. Returns (assets, results)."""
         assets = []
         for a in self.get_broker_holdings(broker_name) or []:
+            if not isinstance(a, dict) or not a.get("ticker"):
+                continue
             row = dict(a)
             row['broker'] = broker_name
             assets.append(row)
@@ -4893,7 +6688,7 @@ class MarketAdvisorGUI(QMainWindow):
         if not assets:
             return [], []
         items = [
-            (i, a['ticker'], a.get('shares', 0.0), a.get('cost', 0.0), a.get('type', ''), broker_name)
+            (i, a.get('ticker'), a.get('shares', 0.0), a.get('cost', 0.0), a.get('type', ''), broker_name)
             for i, a in enumerate(assets)
         ]
         results = self._bg_score_portfolio(items)
@@ -4929,8 +6724,9 @@ class MarketAdvisorGUI(QMainWindow):
             self._set_engine_banner(f"🤖 📊 [{broker}] PORTFOLIO — load + score...", "#00897B")
         self.set_working_state(True, f"Scoring {broker} holdings...")
         self.run_cycle_thread(
-            lambda b=broker: self._bg_portfolio_load_and_score(b),
-            self._port_on_scored
+            self._bg_portfolio_load_and_score,
+            self._port_on_scored,
+            broker,
         )
 
     def _port_on_scored(self, payload):
@@ -4947,11 +6743,16 @@ class MarketAdvisorGUI(QMainWindow):
             if row >= len(assets):
                 continue
             a = assets[row]
-            self._patch_portfolio_row_action(broker, a['ticker'], price, action)
+            if not isinstance(a, dict):
+                continue
+            ticker = a.get("ticker") or ""
+            if not ticker:
+                continue
+            self._patch_portfolio_row_action(broker, ticker, price, action)
             if "SELL" in str(action).upper():
                 sell_list.append({
                     'broker': broker,
-                    'ticker': a['ticker'],
+                    'ticker': ticker,
                     'shares': float(a.get('shares') or 0),
                     'price': float(price or 0),
                     'avg_cost': float(a.get('cost') or 0),
@@ -5000,8 +6801,9 @@ class MarketAdvisorGUI(QMainWindow):
         if actionable and self._is_broker_auto_trading():
             self._set_engine_banner(f"🤖 💰 [{broker}] PORTFOLIO — executing...", "#00897B")
             self.run_cycle_thread(
-                lambda: self._bg_execute_sell_batch(actionable),
-                lambda res: self._on_sell_batch_done(res, auto_mode=True, finish_cycle=True)
+                self._bg_execute_sell_batch,
+                lambda res: self._on_sell_batch_done(res, auto_mode=True, finish_cycle=True),
+                actionable,
             )
         else:
             self.set_working_state(False)
@@ -5014,8 +6816,9 @@ class MarketAdvisorGUI(QMainWindow):
         self.set_working_state(True, "Executing sells…")
         runner = self.run_cycle_thread if auto_mode else self.run_thread
         runner(
-            lambda: self._bg_execute_sell_batch(sell_list),
-            lambda res: self._on_sell_batch_done(res, auto_mode=auto_mode, finish_cycle=auto_mode)
+            self._bg_execute_sell_batch,
+            lambda res: self._on_sell_batch_done(res, auto_mode=auto_mode, finish_cycle=auto_mode),
+            sell_list,
         )
 
     def run_crypto_cycle(self):
@@ -5025,15 +6828,35 @@ class MarketAdvisorGUI(QMainWindow):
         self.set_working_state(True, f"Crypto scan+score ({broker})...")
         self.crypto_table.setRowCount(0)
         self.run_cycle_thread(
-            lambda: self._bg_scan_and_score(self._bg_scan_crypto),
-            self._crypto_on_scored
+            self._bg_scan_and_score,
+            self._crypto_on_scored,
+            self._bg_scan_crypto,
         )
 
+    def _log_scan_buy_outcome(self, engine, results, buy_candidates, dropped=None):
+        """
+        Log BUY score count, and when signals exist but none are actionable for the book,
+        explain the silent drop (already held / cluster full) so BP-idle cycles are clear.
+        """
+        broker = self.cycle_broker_name
+        raw_buys = self._count_buy_signals(results)
+        actionable = len(buy_candidates or [])
+        if actionable:
+            self.log_event(f"[AUTO] [{broker}] {engine} scored — {actionable} BUY signal(s)")
+        else:
+            self.log_event(f"[AUTO] [{broker}] {engine} scored — {raw_buys} BUY signal(s)")
+        if raw_buys > 0 and actionable == 0 and self._is_broker_auto_trading():
+            detail = ", ".join((dropped or [])[:8]) or "already held / cluster full"
+            extra = f" (+{len(dropped) - 8} more)" if dropped and len(dropped) > 8 else ""
+            self.log_event(
+                f"[{broker}] {engine}: {raw_buys} BUY signal(s) but 0 actionable for book "
+                f"— no orders. Dropped: {detail}{extra}"
+            )
+
     def _crypto_on_scored(self, payload):
-        opps, results, buy_candidates = self._unpack_scan_payload(payload)
+        opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
         self._apply_scored_opportunities(self.crypto_table, opps, results)
-        buy_count = len(buy_candidates) if buy_candidates else self._count_buy_signals(results)
-        self.log_event(f"[AUTO] [{self.cycle_broker_name}] CRYPTO scored — {buy_count} BUY signal(s)")
+        self._log_scan_buy_outcome("CRYPTO", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
             if len(buy_candidates) > 1:
                 top = ", ".join(
@@ -5053,15 +6876,15 @@ class MarketAdvisorGUI(QMainWindow):
         self.set_working_state(True, "Breakout scan+score...")
         self.penny_table.setRowCount(0)
         self.run_cycle_thread(
-            lambda: self._bg_scan_and_score(self._bg_scan_penny),
-            self._penny_on_scored
+            self._bg_scan_and_score,
+            self._penny_on_scored,
+            self._bg_scan_penny,
         )
 
     def _penny_on_scored(self, payload):
-        opps, results, buy_candidates = self._unpack_scan_payload(payload)
+        opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
         self._apply_scored_opportunities(self.penny_table, opps, results)
-        buy_count = len(buy_candidates) if buy_candidates else self._count_buy_signals(results)
-        self.log_event(f"[AUTO] [{self.cycle_broker_name}] BREAKOUT scored — {buy_count} BUY signal(s)")
+        self._log_scan_buy_outcome("BREAKOUT", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
             if len(buy_candidates) > 1:
                 top = ", ".join(
@@ -5081,15 +6904,15 @@ class MarketAdvisorGUI(QMainWindow):
         self.set_working_state(True, "Core scan+score...")
         self.core_table.setRowCount(0)
         self.run_cycle_thread(
-            lambda: self._bg_scan_and_score(self._bg_scan_core),
-            self._core_on_scored
+            self._bg_scan_and_score,
+            self._core_on_scored,
+            self._bg_scan_core,
         )
 
     def _core_on_scored(self, payload):
-        opps, results, buy_candidates = self._unpack_scan_payload(payload)
+        opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
         self._apply_scored_opportunities(self.core_table, opps, results)
-        buy_count = len(buy_candidates) if buy_candidates else self._count_buy_signals(results)
-        self.log_event(f"[AUTO] [{self.cycle_broker_name}] CORE scored — {buy_count} BUY signal(s)")
+        self._log_scan_buy_outcome("CORE", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
             if len(buy_candidates) > 1:
                 top = ", ".join(
@@ -5103,15 +6926,17 @@ class MarketAdvisorGUI(QMainWindow):
             self.cycle_finished()
 
     def _unpack_scan_payload(self, payload):
-        """Normalize (opps, results[, buy_candidates]) from bg scan jobs."""
+        """Normalize (opps, results[, buy_candidates[, dropped]]) from bg scan jobs."""
         if not payload:
-            return [], [], []
+            return [], [], [], []
         if isinstance(payload, (list, tuple)):
+            if len(payload) >= 4:
+                return payload[0] or [], payload[1] or [], payload[2] or [], payload[3] or []
             if len(payload) >= 3:
-                return payload[0] or [], payload[1] or [], payload[2] or []
+                return payload[0] or [], payload[1] or [], payload[2] or [], []
             if len(payload) == 2:
-                return payload[0] or [], payload[1] or [], []
-        return [], [], []
+                return payload[0] or [], payload[1] or [], [], []
+        return [], [], [], []
 
     def _bg_scan_crypto(self):
         return [{'symbol': c, 'type': 'Crypto'} for c in ["BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"]]
@@ -5173,6 +6998,46 @@ class MarketAdvisorGUI(QMainWindow):
             top_bar_btn_style("#E65100") if self.paper_mode else top_bar_btn_style("#1B5E20")
         )
 
+    def _on_risk_posture_changed(self, _index=None):
+        """Selecting a posture retunes related knobs; user can still fine-tune afterward."""
+        from scoring import get_risk_posture_profile, normalize_risk_posture
+        if not hasattr(self, "risk_posture_combo"):
+            return
+        key = self.risk_posture_combo.currentData()
+        if key is None:
+            key = normalize_risk_posture(self.risk_posture_combo.currentText())
+        else:
+            key = normalize_risk_posture(key)
+        prof = get_risk_posture_profile(key)
+        if hasattr(self, "risk_posture_hint"):
+            self.risk_posture_hint.setText(prof.get("hint", ""))
+        # Apply profile values to dependent spinboxes (block signals not needed — no loops)
+        if hasattr(self, "bp_util_spin"):
+            self.bp_util_spin.setValue(float(prof["target_bp_utilization_pct"]))
+        if hasattr(self, "sizing_focus_spin"):
+            self.sizing_focus_spin.setValue(int(prof["sizing_focus_slots"]))
+        if hasattr(self, "max_pos_spin"):
+            self.max_pos_spin.setValue(int(prof["max_open_positions"]))
+        if hasattr(self, "max_buys_spin"):
+            self.max_buys_spin.setValue(int(prof["max_buys_per_cycle"]))
+        if hasattr(self, "name_cap_spin"):
+            self.name_cap_spin.setValue(float(prof["max_single_name_equity_pct"]))
+        if hasattr(self, "conviction_mult_spin"):
+            self.conviction_mult_spin.setValue(float(prof["conviction_alloc_mult_max"]))
+        # Exit scales live in settings (no dedicated spins) — stage for save
+        self.settings["exit_roi_scale"] = float(prof["exit_roi_scale"])
+        self.settings["exit_time_scale"] = float(prof["exit_time_scale"])
+        self.settings["ttp_arm_scale"] = float(prof["ttp_arm_scale"])
+        self.settings["risk_posture"] = key
+        # Scale-in: posture supplies default; user can still toggle after
+        if hasattr(self, "allow_scale_in_chk"):
+            self.allow_scale_in_chk.setChecked(bool(prof.get("allow_scale_in", False)))
+        self.settings["allow_scale_in"] = bool(prof.get("allow_scale_in", False))
+        if "scale_in_size_frac" in prof:
+            self.settings["scale_in_size_frac"] = float(prof["scale_in_size_frac"])
+        if "scale_in_max_adds" in prof:
+            self.settings["scale_in_max_adds"] = int(prof["scale_in_max_adds"])
+
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
         self.settings["dark_mode"] = self.dark_mode
@@ -5182,9 +7047,10 @@ class MarketAdvisorGUI(QMainWindow):
         self._style_home_cards()
         self._reset_autotrader_banner_style()
         self.update_market_status()
+        self._update_discord_webhook_status()
 
     def save_custom_settings(self):
-        self.settings["discord_webhook"] = self.discord_input.text().strip()
+        # discord_webhook is owned by the Webhook… dialog (writes on its Save)
         self.settings["discord_alert_level"] = self.discord_lvl_combo.currentText()
         self.settings["discord_heartbeat_schedule"] = self.discord_hb_combo.currentText()
         self.settings["discord_big_win_roi_pct"] = self.discord_big_win_spin.value()
@@ -5197,6 +7063,23 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["allocation_pct_crypto"] = self.alloc_crypto_spin.value()
         self.settings["allocation_pct"] = self.alloc_stock_spin.value()
         self.settings["min_trade_dollars"] = self.min_dollar_spin.value()
+        if hasattr(self, "risk_posture_combo"):
+            key = self.risk_posture_combo.currentData()
+            self.settings["risk_posture"] = str(key or "balanced").lower()
+        if hasattr(self, "allow_scale_in_chk"):
+            self.settings["allow_scale_in"] = bool(self.allow_scale_in_chk.isChecked())
+        self.settings["target_bp_utilization_pct"] = self.bp_util_spin.value()
+        self.settings["sizing_focus_slots"] = int(self.sizing_focus_spin.value())
+        if hasattr(self, "name_cap_spin"):
+            self.settings["max_single_name_equity_pct"] = float(self.name_cap_spin.value())
+        if hasattr(self, "conviction_mult_spin"):
+            self.settings["conviction_alloc_mult_max"] = float(self.conviction_mult_spin.value())
+        # Exit scales have no dedicated spins — always derive from selected posture
+        from scoring import get_risk_posture_profile, normalize_risk_posture
+        _prof = get_risk_posture_profile(normalize_risk_posture(self.settings.get("risk_posture")))
+        self.settings["exit_roi_scale"] = float(_prof["exit_roi_scale"])
+        self.settings["exit_time_scale"] = float(_prof["exit_time_scale"])
+        self.settings["ttp_arm_scale"] = float(_prof["ttp_arm_scale"])
         self.settings["limit_offset_pct"] = self.offset_spin.value()
         self.settings["daily_profit_target"] = self.profit_spin.value()
         self.settings["daily_loss_limit"] = self.loss_spin.value()
@@ -5208,7 +7091,13 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["interval_portfolio"] = self.port_spin.value()
         if hasattr(self, "bal_spin"):
             self.settings["interval_balance_refresh"] = int(self.bal_spin.value())
+        if hasattr(self, "cb_live_trading_chk"):
+            self.settings["coinbase_live_trading"] = bool(self.cb_live_trading_chk.isChecked())
+            cb = self.brokers.get("Coinbase")
+            if cb is not None:
+                cb.live_trading_enabled = bool(self.settings["coinbase_live_trading"])
         save_settings(self.settings)
+        self._update_discord_webhook_status()
         self._start_web_monitor()
         QMessageBox.information(self, "Settings Saved", "Configuration updated successfully!")
 
@@ -5303,10 +7192,12 @@ class MarketAdvisorGUI(QMainWindow):
         self.status_text.setStyleSheet(
             f"font-size: {ui_px(14)}px; font-weight: 600; color: {tc['text']};"
         )
-        QApplication.processEvents()
+        # Avoid processEvents here — reentrancy during startup connect / theme paint
+        # previously contributed to white/frozen windows when a modal blocked the loop.
 
     def apply_theme(self):
         arrow = combo_arrow_path(self.dark_mode)
+        spin_up, spin_down = spin_arrow_paths(self.dark_mode)
         accent = theme_colors(self.dark_mode)["accent"]
         if self.dark_mode:
             qss = f"""
@@ -5355,11 +7246,39 @@ class MarketAdvisorGUI(QMainWindow):
                 }}
                 QPushButton:hover {{ background-color: #2A303A; border-color: #3A4150; }}
                 QPushButton:pressed {{ background-color: #1A1D24; }}
-                QLineEdit, QDoubleSpinBox, QSpinBox, QTextEdit {{
+                QLineEdit, QTextEdit {{
                     background-color: #1A1D24; color: #E8EAED;
                     border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
                     padding: {ui_px(5)}px {ui_px(8)}px;
                     selection-background-color: {accent}; selection-color: #FFFFFF;
+                }}
+                QDoubleSpinBox, QSpinBox {{
+                    background-color: #1A1D24; color: #E8EAED;
+                    border: 1px solid #2A2F3A; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    padding: {ui_px(5)}px {ui_px(28)}px {ui_px(5)}px {ui_px(8)}px;
+                    selection-background-color: {accent}; selection-color: #FFFFFF;
+                }}
+                QDoubleSpinBox::up-button, QSpinBox::up-button {{
+                    subcontrol-origin: border; subcontrol-position: top right;
+                    width: {ui_px(22)}px; border-left: 1px solid #2A2F3A;
+                    background-color: #22262E;
+                    border-top-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                }}
+                QDoubleSpinBox::down-button, QSpinBox::down-button {{
+                    subcontrol-origin: border; subcontrol-position: bottom right;
+                    width: {ui_px(22)}px; border-left: 1px solid #2A2F3A;
+                    background-color: #22262E;
+                    border-bottom-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                }}
+                QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover,
+                QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {{
+                    background-color: #2A303A;
+                }}
+                QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {{
+                    image: url("{spin_up}"); width: {ui_px(10)}px; height: {ui_px(6)}px;
+                }}
+                QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {{
+                    image: url("{spin_down}"); width: {ui_px(10)}px; height: {ui_px(6)}px;
                 }}
                 QComboBox {{
                     background-color: #1A1D24; color: #E8EAED;
@@ -5403,7 +7322,18 @@ class MarketAdvisorGUI(QMainWindow):
                     color: #E8EAED; font-size: {ui_px(14)}px; min-height: {ui_px(28)}px;
                     padding: {ui_px(2)}px {ui_px(4)}px;
                 }}
-                QCheckBox {{ spacing: {ui_px(8)}px; }}
+                QCheckBox {{
+                    spacing: {ui_px(8)}px; color: #E8EAED;
+                }}
+                QCheckBox::indicator {{
+                    width: {ui_px(16)}px; height: {ui_px(16)}px;
+                    border: 1px solid #9AA0A6; border-radius: {ui_px(3)}px;
+                    background-color: #1A1D24;
+                }}
+                QCheckBox::indicator:hover {{ border-color: #E8EAED; }}
+                QCheckBox::indicator:checked {{
+                    background-color: {accent}; border-color: {accent};
+                }}
                 QScrollBar:vertical {{
                     background: #0F1115; width: {ui_px(10)}px; margin: 0; border: none;
                 }}
@@ -5459,11 +7389,39 @@ class MarketAdvisorGUI(QMainWindow):
                 }}
                 QPushButton:hover {{ background-color: #F0F2F5; border-color: #9AA0A6; }}
                 QPushButton:pressed {{ background-color: #E8EAED; }}
-                QLineEdit, QDoubleSpinBox, QSpinBox, QTextEdit {{
+                QLineEdit, QTextEdit {{
                     background-color: #FFFFFF; color: #1A1A1A;
                     border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
                     padding: {ui_px(5)}px {ui_px(8)}px;
                     selection-background-color: {accent}; selection-color: #FFFFFF;
+                }}
+                QDoubleSpinBox, QSpinBox {{
+                    background-color: #FFFFFF; color: #1A1A1A;
+                    border: 1px solid #C5CAD3; border-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                    padding: {ui_px(5)}px {ui_px(28)}px {ui_px(5)}px {ui_px(8)}px;
+                    selection-background-color: {accent}; selection-color: #FFFFFF;
+                }}
+                QDoubleSpinBox::up-button, QSpinBox::up-button {{
+                    subcontrol-origin: border; subcontrol-position: top right;
+                    width: {ui_px(22)}px; border-left: 1px solid #C5CAD3;
+                    background-color: #F0F2F5;
+                    border-top-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                }}
+                QDoubleSpinBox::down-button, QSpinBox::down-button {{
+                    subcontrol-origin: border; subcontrol-position: bottom right;
+                    width: {ui_px(22)}px; border-left: 1px solid #C5CAD3;
+                    background-color: #F0F2F5;
+                    border-bottom-right-radius: {ui_px(UI_RADIUS_INPUT)}px;
+                }}
+                QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover,
+                QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {{
+                    background-color: #E8EAED;
+                }}
+                QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {{
+                    image: url("{spin_up}"); width: {ui_px(10)}px; height: {ui_px(6)}px;
+                }}
+                QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {{
+                    image: url("{spin_down}"); width: {ui_px(10)}px; height: {ui_px(6)}px;
                 }}
                 QComboBox {{
                     background-color: #FFFFFF; color: #1A1A1A;
@@ -5519,6 +7477,16 @@ class MarketAdvisorGUI(QMainWindow):
             self._reset_autotrader_banner_style()
         self._style_combo_popups()
         self._style_home_cards()
+        if hasattr(self, "et_live_trading_chk"):
+            tc_chk = theme_colors(self.dark_mode)
+            self.et_live_trading_chk.setStyleSheet(
+                f"QCheckBox {{ color: {tc_chk['text']}; spacing: {ui_px(8)}px; }}"
+            )
+        if hasattr(self, "cb_live_trading_chk"):
+            tc_chk = theme_colors(self.dark_mode)
+            self.cb_live_trading_chk.setStyleSheet(
+                f"QCheckBox {{ color: {tc_chk['text']}; spacing: {ui_px(8)}px; }}"
+            )
         if hasattr(self, "status_text"):
             tc = theme_colors(self.dark_mode)
             self.status_text.setStyleSheet(
