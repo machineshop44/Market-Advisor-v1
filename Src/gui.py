@@ -1825,14 +1825,11 @@ class MarketAdvisorGUI(QMainWindow):
         totals = getattr(self, "_last_balance_totals", {}) or {}
         fields = []
         combined_eq = combined_cash = combined_pl = 0.0
-        any_down = False
 
         # Always show both brokers (armed or not) so a false loss-halt doesn't "erase" RH from Discord
         for name in BROKER_NAMES:
             connected = self.brokers[name].is_connected or self.paper_mode
             armed = bool(self.auto_trade_enabled.get(name))
-            if not connected:
-                any_down = True
             p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
             bp = float(totals.get(name, {}).get("bp", 0.0) or 0.0)
             start = self.session_starts.get(name)
@@ -1869,8 +1866,8 @@ class MarketAdvisorGUI(QMainWindow):
             "inline": False,
         })
 
-        # Side color: red if any broker down or day down; green if day up; blue if flat
-        if any_down or combined_pl < -0.001:
+        # Side color: red if day down; green if day up; blue if flat (broker Down status ignored)
+        if combined_pl < -0.001:
             color = 0xE74C3C
         elif combined_pl > 0.001:
             color = 0x2ECC71
