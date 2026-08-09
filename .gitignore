@@ -5,6 +5,7 @@ Src/scoring_state.json
 Src/activity_log.txt
 Src/_combo_arrow_*.png
 Src/_spin_arrow_*.png
+Src/monitor_tls/
 wants and needs.txt
 *.env
 .env.*
@@ -29,6 +30,14 @@ Src/_pyinstaller_entry.py
 Thumbs.db
 .vscode/
 .idea/
+
+# Android companion build
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/*.iml
+android/app/*.iml
 
 # Local backups (keep on disk only)
 Backups/

@@ -110,6 +110,27 @@ class TestEtradeHoldingsShape(unittest.TestCase):
         self.assertAlmostEqual(eq, 87.16)
         self.assertAlmostEqual(bp, 41.25)
 
+        # Sandbox-style aliases (settledCash / marginBuyingPower)
+        sandbox = {
+            "BalanceResponse": {
+                "Computed": {"settledCash": "12.50", "MarginBuyingPower": "0"},
+                "RealTimeValues": {"totalAccountValue": "12.50"},
+            }
+        }
+        eq2, bp2 = parse_etrade_balances(sandbox)
+        self.assertAlmostEqual(eq2, 12.50)
+        self.assertAlmostEqual(bp2, 12.50)
+
+        cash_nested = {
+            "BalanceResponse": {
+                "Cash": {"fundsForTrading": "33.00"},
+                "RealTimeValues": {"totalAccountValue": "40.00"},
+            }
+        }
+        eq3, bp3 = parse_etrade_balances(cash_nested)
+        self.assertAlmostEqual(eq3, 40.00)
+        self.assertAlmostEqual(bp3, 33.00)
+
     def test_adapter_holdings_are_list(self):
         from etrade_broker import ETradeAdapter
         from unittest.mock import MagicMock

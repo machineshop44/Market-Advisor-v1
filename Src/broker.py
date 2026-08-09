@@ -118,7 +118,8 @@ class BaseBroker:
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
                         market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-                         market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
+                         market_hours="regular_hours", allow_fractional=True, sell_all=False):
+        raise NotImplementedError
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
         return False, "unsupported"
     def cancel_order(self, order_id, is_crypto=False):
@@ -141,6 +142,113 @@ class BaseBroker:
         except Exception:
             return True, "invalid size/price"
         return False, ""
+
+def _rh_crypto_avg_cost(pos, qty):
+    """
+    Per-unit avg cost from a Robinhood crypto position payload.
+    Prefer cost_bases[].direct_cost_basis (total) / qty; fall back to per-unit fields.
+    Returns 0.0 when unknown — never invents a price.
+    """
+    try:
+        qty = float(qty or 0.0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    if qty <= 0 or not isinstance(pos, dict):
+        return 0.0
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    cb = pos.get("cost_bases")
+    if cb is None:
+        cb = pos.get("cost_basis")
+    if isinstance(cb, list) and cb:
+        total = 0.0
+        found = False
+        for entry in cb:
+            if not isinstance(entry, dict):
+                continue
+            entry_hit = False
+            for key in (
+                "direct_cost_basis", "directCostBasis",
+                "cost_basis", "costBasis",
+                "marked_cost_basis", "markedCostBasis",
+                "intraday_cost_basis", "intradayCostBasis",
+            ):
+                raw = entry.get(key)
+                if raw is None:
+                    continue
+                if isinstance(raw, dict):
+                    v = _f(raw.get("amount") or raw.get("value"))
+                else:
+                    v = _f(raw)
+                if v > 0:
+                    total += v
+                    found = True
+                    entry_hit = True
+                    break
+            if entry_hit:
+                continue
+            for nest_key in ("direct_cost_basis", "cost_basis", "amount"):
+                nested = entry.get(nest_key)
+                if isinstance(nested, dict):
+                    v = _f(nested.get("amount") or nested.get("value"))
+                    if v > 0:
+                        total += v
+                        found = True
+                        break
+        if found and total > 0:
+            return total / qty
+    elif isinstance(cb, dict):
+        for key in (
+            "direct_cost_basis", "directCostBasis",
+            "cost_basis", "costBasis",
+            "amount", "value",
+        ):
+            raw = cb.get(key)
+            if isinstance(raw, dict):
+                v = _f(raw.get("amount") or raw.get("value"))
+            else:
+                v = _f(raw)
+            if v > 0:
+                return v / qty
+    elif cb is not None and not isinstance(cb, (list, dict)):
+        v = _f(cb)
+        if v > 0:
+            return v / qty
+
+    # Explicit per-unit fields (do not invent from mark price)
+    for key in (
+        "average_cost", "averageCost",
+        "average_buy_price", "averageBuyPrice",
+        "avg_cost", "avgCost",
+        "average_entry_price", "averageEntryPrice",
+    ):
+        raw = pos.get(key)
+        if isinstance(raw, dict):
+            v = _f(raw.get("amount") or raw.get("value"))
+        else:
+            v = _f(raw)
+        if v > 0:
+            return v
+
+    # Total cost fields (divide by qty)
+    for key in (
+        "total_cost_basis", "totalCostBasis",
+        "cost_basis_total", "costBasisTotal",
+    ):
+        raw = pos.get(key)
+        if isinstance(raw, dict):
+            v = _f(raw.get("amount") or raw.get("value"))
+        else:
+            v = _f(raw)
+        if v > 0:
+            return v / qty
+    return 0.0
+
 
 def robinhood_pickle_path(pickle_name=""):
     """Default robin_stocks session file: ~/.tokens/robinhood.pickle"""
@@ -319,7 +427,14 @@ class RobinhoodAdapter(BaseBroker):
                 for pos in crypto_positions:
                     if not isinstance(pos, dict):
                         continue
-                    qty = float(pos.get('quantity', 0) or 0)
+                    try:
+                        qty = float(
+                            pos.get("quantity")
+                            or pos.get("quantity_available")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        qty = 0.0
                     if qty > 0:
                         cur = pos.get('currency')
                         if isinstance(cur, dict):
@@ -328,9 +443,13 @@ class RobinhoodAdapter(BaseBroker):
                             symbol = str(cur or "")
                         if not symbol:
                             continue
-                        cb = pos.get('cost_bases')
-                        avg_cost = float(cb[0].get('direct_cost_basis', 0)) / qty if cb and isinstance(cb, list) and len(cb) > 0 and isinstance(cb[0], dict) and qty > 0 else 0.0
-                        assets.append({'ticker': symbol, 'shares': qty, 'cost': avg_cost, 'type': 'Ready (Crypto)'})
+                        avg_cost = _rh_crypto_avg_cost(pos, qty)
+                        assets.append({
+                            'ticker': symbol,
+                            'shares': qty,
+                            'cost': avg_cost,
+                            'type': 'Ready (Crypto)',
+                        })
         except Exception: pass
         return assets
 
@@ -558,15 +677,15 @@ class RobinhoodAdapter(BaseBroker):
                         return f"Skipped: RH rejected ({state})", 0.0, None
                     tag = "Filled" if conf else f"Pending/{state}"
                     return f"Crypto Buy {tag} ({actual_spent:.2f})", actual_spent, oid
-                err = str(res)
+                err = self._format_rh_order_error(res, what=f"crypto buy {ticker}")
                 if "422" in err or res is None:
-                    return f"Skipped: RH rejected small/invalid crypto size ({res})", 0.0, None
-                return f"Fail: {res}", 0.0, None
+                    return f"Skipped: RH rejected small/invalid crypto size ({err})", 0.0, None
+                return f"Fail: {err}", 0.0, None
             except Exception as e:
-                err = str(e)
+                err = str(e) if str(e).strip() and str(e).strip().lower() != "none" else repr(e)
                 if "422" in err:
                     return f"Skipped: RH 422 (size/limits) for {ticker}", 0.0, None
-                return f"Fail: {e}", 0.0, None
+                return f"Fail: {err}", 0.0, None
 
         # Prefer dollar fractional when RH allows it for this session.
         # Overnight / late extended: fractionals OFF — whole-share limit only.
@@ -662,9 +781,82 @@ class RobinhoodAdapter(BaseBroker):
             return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
         return f"Fail: {res}", 0.0, None
 
+
+    @staticmethod
+    def _format_rh_order_error(res, what="order"):
+        """Turn None/opaque RH responses into a journal-usable error string."""
+        if res is None:
+            return (
+                f"RH {what} returned empty response (None) — "
+                "auth expired, rate-limit, or API unavailable"
+            )
+        if isinstance(res, dict):
+            for key in ("detail", "error", "message", "msg", "non_field_errors", "reason"):
+                val = res.get(key)
+                if val:
+                    return f"{what}: {val}"
+            for key in ("errors", "error_response"):
+                val = res.get(key)
+                if val:
+                    return f"{what}: {val}"
+            if not res:
+                return f"RH {what} returned empty dict"
+            return f"{what}: {res}"
+        s = str(res).strip()
+        if not s or s.lower() == "none":
+            return f"RH {what} returned no detail"
+        return s
+
+    def _live_sellable_qty(self, ticker, is_crypto):
+        """Fresh broker position qty for full exits (avoids stale UI / truncated sells)."""
+        clean = str(ticker).replace("-USD", "").upper()
+        try:
+            if is_crypto:
+                positions = r.crypto.get_crypto_positions() or []
+                for pos in positions:
+                    if not isinstance(pos, dict):
+                        continue
+                    cur = pos.get("currency")
+                    if isinstance(cur, dict):
+                        symbol = (cur.get("code") or cur.get("id") or "").upper()
+                    else:
+                        symbol = str(cur or "").upper()
+                    if symbol != clean:
+                        continue
+                    qty = float(pos.get("quantity", 0) or 0)
+                    if qty > 0:
+                        return qty
+                return None
+            holdings = r.build_holdings()
+            if isinstance(holdings, dict):
+                data = holdings.get(clean) or holdings.get(ticker)
+                if isinstance(data, dict):
+                    qty = float(data.get("quantity", 0) or 0)
+                    if qty > 0:
+                        return qty
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _qty_is_whole_shares(shares_val):
+        try:
+            d = Decimal(str(shares_val))
+            return d >= 1 and d == d.to_integral_value()
+        except Exception:
+            return False
+
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-                         market_hours="regular_hours", allow_fractional=True):
+                         market_hours="regular_hours", allow_fractional=True, sell_all=False):
         is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
+        # RH has no native sell-all endpoint — refresh live qty and never int-truncate fractionals.
+        if sell_all:
+            live_qty = self._live_sellable_qty(ticker, is_crypto)
+            if live_qty is not None and live_qty > 0:
+                shares_val = live_qty
+
+        all_tag = "Sell-All" if sell_all else "Sell"
+
         if is_crypto:
             inc, min_qty = self._get_crypto_order_limits(ticker)
             d_inc = Decimal(str(inc))
@@ -682,23 +874,24 @@ class RobinhoodAdapter(BaseBroker):
                     oid = res['id']
                     conf, state = self.confirm_order(oid, is_crypto=True)
                     tag = "Filled" if conf else f"Pending/{state}"
-                    return f"Crypto Sell {tag} ({safe_qty_str})", oid
-                # RH sometimes returns validation errors as dict without id
-                err = str(res)
-                if "too small" in err.lower() or "at least" in err.lower():
-                    return f"Skipped: {res}", None
-                return f"Fail: {res}", None
-            except Exception as e:
-                err = str(e)
+                    return f"Crypto {all_tag} {tag} ({safe_qty_str})", oid
+                # RH sometimes returns validation errors as dict without id (or None)
+                err = self._format_rh_order_error(res, what=f"crypto sell {ticker}")
                 if "too small" in err.lower() or "at least" in err.lower():
                     return f"Skipped: {err}", None
-                return f"Fail: {e}", None
+                return f"Fail: {err}", None
+            except Exception as e:
+                err = str(e) if str(e).strip() and str(e).strip().lower() != "none" else repr(e)
+                if "too small" in err.lower() or "at least" in err.lower():
+                    return f"Skipped: {err}", None
+                return f"Fail: {err}", None
 
         if price <= 0:
             return "Skipped: No valid market price (delisted/untradeable)", None
 
-        if shares_val >= 1.0:
-            qty_to_sell = int(shares_val)
+        # Whole-share-only path (limit). Never int() a fractional full exit — that left dust.
+        if self._qty_is_whole_shares(shares_val):
+            qty_to_sell = int(Decimal(str(shares_val)).to_integral_value())
             limit_price = round(price * (1.0 - offset_pct), 4 if price < 1.0 else 2)
             try:
                 res = r.order_sell_limit(symbol=ticker, quantity=qty_to_sell, limitPrice=limit_price, timeInForce='gfd', extendedHours=use_ext_hours)
@@ -706,7 +899,7 @@ class RobinhoodAdapter(BaseBroker):
                     oid = res.get('id')
                     conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
                     tag = "Filled" if conf else f"Pending/{state}"
-                    return f"Sell {tag} ({qty_to_sell})", oid
+                    return f"{all_tag} {tag} ({qty_to_sell})", oid
                 return f"Fail: {res}", None
             except Exception as e:
                 err = str(e)
@@ -714,7 +907,7 @@ class RobinhoodAdapter(BaseBroker):
                     return f"Skipped: Untradeable ticker ({err})", None
                 return f"Fail: {e}", None
 
-        # Fractional remainder / sub-1 share positions
+        # Fractional remainder / mixed integer+fractional / sub-1 share — sell exact qty
         if (shares_val * price) < 1.00:
             return f"Skipped: Fractional value under $1.00", None
 
@@ -742,7 +935,8 @@ class RobinhoodAdapter(BaseBroker):
                 conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
                 tag = "Filled" if conf else f"Pending/{state}"
                 suffix = " Ext" if want_ext else ""
-                return f"Sell{suffix} {tag} ({shares_val})", oid
+                qty_lbl = format(float(shares_val), ".6f").rstrip("0").rstrip(".")
+                return f"{all_tag}{suffix} {tag} ({qty_lbl})", oid
             err = str(res)
             if want_ext:
                 return f"Skipped: Ext. Hours fractional not eligible ({err[:100]})", None
@@ -759,6 +953,7 @@ class RobinhoodAdapter(BaseBroker):
         """Poll Robinhood until filled/cancelled/rejected or timeout."""
         if not order_id:
             return False, "no_id"
+        self._last_fill_fee = None
         deadline = time.time() + timeout_sec
         last_state = "unknown"
         while time.time() < deadline:
@@ -770,6 +965,16 @@ class RobinhoodAdapter(BaseBroker):
                 if isinstance(info, dict):
                     last_state = str(info.get('state') or info.get('status') or "unknown").lower()
                     if last_state in ("filled", "completed"):
+                        try:
+                            from analytics import extract_fee_dollars_from_order
+                            self._last_fill_fee = extract_fee_dollars_from_order(info)
+                        except Exception:
+                            # RH fees field is common on stock fills
+                            try:
+                                if info.get("fees") is not None:
+                                    self._last_fill_fee = float(info.get("fees"))
+                            except (TypeError, ValueError):
+                                pass
                         return True, last_state
                     if last_state in ("cancelled", "canceled", "rejected", "failed"):
                         return False, last_state
@@ -809,11 +1014,14 @@ class RobinhoodAdapter(BaseBroker):
             stop_d = abs(float(stop_pct or 0))
             if qty <= 0 or entry <= 0 or stop_d <= 0:
                 return False, None, "invalid qty/entry/stop"
+            # RH rejects stops on fractional qty — TTP only (do not retry as "missing")
+            if not self._qty_is_whole_shares(qty):
+                return False, None, "fractional — broker stop N/A, TTP only"
             # RH rejects >8 decimal qty and non-integer trailing_peg percentages.
             qty_dec = Decimal(str(qty)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
             if qty_dec <= 0:
                 return False, None, "qty rounded to 0"
-            qty_arg = int(qty_dec) if qty_dec == qty_dec.to_integral_value() else float(qty_dec)
+            qty_arg = int(qty_dec)  # whole shares only after gate above
             # Integer percent points (ceil so trail is at least as wide as configured)
             trail_pct_points = max(1, int(math.ceil(stop_d * 100.0 - 1e-12)))
             # 1) Trailing stop — rises with price; software TTP still handles tighter trails
@@ -1158,8 +1366,22 @@ class CoinbaseAdapter(BaseBroker):
         except Exception as e:
             return f"Fail: {e}", 0.0, None
 
+    def _available_base_qty(self, ticker):
+        """Sellable (available, not hold) base size for a currency."""
+        clean = str(ticker).replace("-USD", "").upper()
+        try:
+            for acc in self._fetch_all_accounts():
+                if not isinstance(acc, dict):
+                    continue
+                if str(acc.get("currency") or "").upper() != clean:
+                    continue
+                return _money_value(acc.get("available_balance"))
+        except Exception:
+            pass
+        return 0.0
+
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-                         market_hours="regular_hours", allow_fractional=True):
+                         market_hours="regular_hours", allow_fractional=True, sell_all=False):
         if not self.is_connected:
             return "Fail: Not connected", None
         ok, reason = self._orders_allowed()
@@ -1169,6 +1391,12 @@ class CoinbaseAdapter(BaseBroker):
         product_id = f"{clean}-USD"
 
         try:
+            # Full exit: use available balance (not hold) and prefer native close_position.
+            if sell_all:
+                avail = self._available_base_qty(clean)
+                if avail > 0:
+                    shares_val = avail
+
             dust, reason = self.position_is_dust(clean, shares_val, price, asset_type)
             if dust:
                 return f"Skipped: Dust ({reason})", None
@@ -1186,6 +1414,27 @@ class CoinbaseAdapter(BaseBroker):
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
 
             client_order_id = str(int(time.time() * 1000))
+
+            if sell_all and hasattr(self.client, "close_position"):
+                try:
+                    # Native close — size optional in API; pass available base to close the bag.
+                    res = self._cb_call(
+                        self.client.close_position,
+                        client_order_id=client_order_id,
+                        product_id=product_id,
+                        size=safe_qty_str,
+                    )
+                    data = self._cb_payload(res)
+                    if data.get("success"):
+                        oid = self._extract_order_id(data)
+                        conf, state = self.confirm_order(oid, is_crypto=True) if oid else (False, "no_id")
+                        tag = "Filled" if conf else f"Pending/{state}"
+                        return f"Coinbase Sell-All {tag} ({safe_qty_str})", oid
+                    # Fall through to market sell if close_position rejects (e.g. spot-only quirks)
+                except Exception:
+                    pass
+                client_order_id = str(int(time.time() * 1000))
+
             res = self._cb_call(
                 self.client.market_order_sell,
                 client_order_id=client_order_id,
@@ -1198,7 +1447,8 @@ class CoinbaseAdapter(BaseBroker):
                 oid = self._extract_order_id(data)
                 conf, state = self.confirm_order(oid, is_crypto=True) if oid else (False, "no_id")
                 tag = "Filled" if conf else f"Pending/{state}"
-                return f"Coinbase Sell {tag} ({safe_qty_str})", oid
+                label = "Coinbase Sell-All" if sell_all else "Coinbase Sell"
+                return f"{label} {tag} ({safe_qty_str})", oid
             return f"Fail: {data.get('error_response', 'Unknown Error')}", None
         except Exception as e:
             return f"Fail: {e}", None
@@ -1207,17 +1457,31 @@ class CoinbaseAdapter(BaseBroker):
         """Poll Coinbase until FILLED/CANCELLED/FAILED or timeout."""
         if not order_id or not self.client:
             return False, "no_id"
+        self._last_fill_fee = None
         deadline = time.time() + timeout_sec
         last_state = "unknown"
         while time.time() < deadline:
             try:
                 data = self._cb_payload(self._cb_call(self.client.get_order, order_id))
                 order = _as_dict(data.get("order"))
+                blob = order or data or {}
                 if order:
                     last_state = str(order.get("status") or "unknown").upper()
                 elif data:
                     last_state = str(data.get("status") or "unknown").upper()
                 if last_state in ("FILLED", "COMPLETED"):
+                    try:
+                        from analytics import extract_fee_dollars_from_order
+                        self._last_fill_fee = extract_fee_dollars_from_order(blob)
+                    except Exception:
+                        for k in ("total_fees", "total_fees_value", "commission"):
+                            if blob.get(k) is None:
+                                continue
+                            try:
+                                self._last_fill_fee = float(blob.get(k))
+                                break
+                            except (TypeError, ValueError):
+                                pass
                     return True, last_state.lower()
                 if last_state in ("CANCELLED", "CANCELED", "EXPIRED", "FAILED", "REJECTED"):
                     return False, last_state.lower()

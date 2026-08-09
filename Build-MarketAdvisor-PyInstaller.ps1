@@ -35,13 +35,15 @@ $entry = Join-Path $src "_pyinstaller_entry.py"
 import os
 import sys
 
-# When frozen, _MEIPASS is the unpack dir; app data stays in repo Src\
+# When frozen, _MEIPASS is the unpack dir; app data stays in Src\ (portable or repo)
 _SRC = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
-    # Prefer Src beside dist\MarketAdvisor\, else beside the exe
+    # Portable: Src next to MarketAdvisor.exe; repo: dist\MarketAdvisor → ../../Src
+    _exe_dir = os.path.dirname(sys.executable)
     _cand = [
-        os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", "..", "Src")),
-        os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", "Src")),
+        os.path.abspath(os.path.join(_exe_dir, "Src")),
+        os.path.abspath(os.path.join(_exe_dir, "..", "..", "Src")),
+        os.path.abspath(os.path.join(_exe_dir, "..", "Src")),
         _SRC,
     ]
     for c in _cand:
@@ -79,6 +81,7 @@ $args = @(
     "--workpath", $work,
     "--specpath", $root,
     "--collect-all", "PyQt5",
+    "--collect-all", "qrcode",
     "--hidden-import", "gui",
     "--hidden-import", "broker",
     "--hidden-import", "scoring",
@@ -90,6 +93,16 @@ $args = @(
     "--hidden-import", "etrade_broker",
     "--hidden-import", "etrade_client",
     "--hidden-import", "version",
+    "--hidden-import", "analytics",
+    "--hidden-import", "auto_cycle",
+    "--hidden-import", "decision_log",
+    "--hidden-import", "activity_log_util",
+    "--hidden-import", "companion_qr",
+    "--hidden-import", "monitor_tls",
+    "--hidden-import", "qrcode",
+    "--hidden-import", "qrcode.image.pil",
+    "--hidden-import", "PIL",
+    "--hidden-import", "PIL.Image",
     $entry
 )
 

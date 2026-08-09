@@ -25,53 +25,66 @@ except ImportError:
 # BROKER FEE PROFILES
 # Round-trip friction is baked into exit thresholds so a "win" is a real win.
 # RH stocks ≈ $0 commission. RH crypto / CB Advanced take a real bite.
+# Profit-taking rails (TTP arm / time exits) must clear estimated RT fees
+# + MIN_PROFIT_OVER_FEES_PCT — see enforce_min_profit_over_fees().
+# Hard stops / stale (red) exits are deliberately exempt.
 # Discipline: cut losers / bank winners same-session — no multi-day hope.
 # =========================================================================
+# Minimum net edge over estimated round-trip fees for discretionary profit exits.
+MIN_PROFIT_OVER_FEES_PCT = 0.01  # 100 bps (1.0%)
+
 FEE_PROFILES = {
     "ROBINHOOD_STOCK": {
-        "ttp_arm": 0.012,          # +1.2% arms trail (was 2.0% — too high for small RH tickets)
-        "ttp_trail": 0.008,        # -0.8% trail
+        # Est. RT ~0.20% → floor fee_rt+1% = +1.2%
+        "ttp_arm": 0.012,          # +1.2% arms trail
+        "ttp_trail": 0.008,        # -0.8% trail (post-arm lock-in; may exit below floor)
         "hard_stop": -0.035,       # -3.5% — clear disaster cut, not noise
-        "time_30m_target": 0.008,  # +0.8%
-        "time_60m_target": 0.006,  # +0.6%
+        "time_30m_target": 0.012,  # +1.2% (≥ fee_rt + 1%)
+        "time_60m_target": 0.012,  # +1.2%
         "time_green_min": 45,      # minutes
-        "time_green_roi": 0.006,   # +0.6% — above typical RH stock spread crumbs
+        "time_green_roi": 0.012,   # +1.2% — no penny "wins" after friction
         "stale_minutes": 180,      # 3h same-session (2h/−1% was twitchy on META/TSLA)
         "stale_roi": -0.015,       # -1.5%
     },
     "ROBINHOOD_CRYPTO": {
-        "ttp_arm": 0.018,          # +1.8% (was 2.8%)
+        # Est. one-way 0.95% (MM spread rebate ≈ exchange tier <$50K) → RT 1.90% → floor +2.90%
+        "ttp_arm": 0.029,          # +2.9%
         "ttp_trail": 0.010,
         "hard_stop": -0.040,       # -4.0% — crypto vol needs a wider disaster line
-        "time_30m_target": 0.014,  # +1.4% — above typical RH crypto spread round-trip
-        "time_60m_target": 0.010,  # +1.0%
+        "time_30m_target": 0.029,  # +2.9%
+        "time_60m_target": 0.029,  # +2.9%
         "time_green_min": 45,
-        "time_green_roi": 0.010,   # +1.0% min green (spread is the real cost on RH crypto)
+        "time_green_roi": 0.029,   # +2.9% min green — no thin crypto "wins"
         "stale_minutes": 120,      # crypto stays tighter than equities
         "stale_roi": -0.012,       # -1.2%
     },
     "COINBASE": {
-        # Advanced retail taker ≈ 0.60% each side → ~1.2% round-trip (+ slippage buffer)
-        "ttp_arm": 0.022,          # +2.2% arms trail
-        "ttp_trail": 0.010,        # -1.0% trail → exit still ~+1.2%+ once armed above peak
+        # Intro 1 taker 1.2% one-way (small-book default) → 2.4% RT → floor = +3.4%
+        # Higher tiers (Intro 2 / Advanced) can lower _FEE_ONE_WAY_PCT if volume rises.
+        "ttp_arm": 0.034,          # +3.4% arms trail
+        "ttp_trail": 0.010,        # -1.0% trail → exit still ~+2.4%+ once armed above peak
         "hard_stop": -0.040,
-        "time_30m_target": 0.016,  # +1.6% clears ~1.2% fees + buffer
-        "time_60m_target": 0.014,  # +1.4%
+        "time_30m_target": 0.034,  # +3.4% (≥ fee_rt + 1%)
+        "time_60m_target": 0.034,  # +3.4%
         "time_green_min": 45,
-        "time_green_roi": 0.015,   # +1.5% — never take a CB "win" that fees wipe out
+        "time_green_roi": 0.034,   # +3.4% — never take a CB "win" that fees wipe out
         "stale_minutes": 120,
         "stale_roi": -0.012,
     },
-    # E*TRADE equities ≈ commission-free — profit-after-friction rails match RH stock.
-    # (Kept as its own profile so we can tune ET independently later.)
+    # E*TRADE STOCK/ETF (Andrew official schedule): $0 commission on stocks / options MF / ETFs.
+    # Est. 0.10% one-way (SEC/TAF + spread friction) → 0.20% RT → floor fee_rt+1% = +1.2%.
+    # Honest overestimate vs listed $0 — keeps discretionary exits ≥ ~1%+friction; no penny-takes.
+    # Schedule also lists crypto 0.50% one-way — UNUSED here (no ETRADE_CRYPTO profile):
+    # Market Advisor never places ET crypto (supports_crypto=False; equity orders only).
+    # (Own profile so ET can diverge from RH later. OTC $6.95 / options $0.65 not modeled.)
     "ETRADE_STOCK": {
         "ttp_arm": 0.012,          # +1.2% arms trail
         "ttp_trail": 0.008,        # -0.8% trail
         "hard_stop": -0.035,       # -3.5%
-        "time_30m_target": 0.008,  # +0.8%
-        "time_60m_target": 0.006,  # +0.6%
+        "time_30m_target": 0.012,  # +1.2%
+        "time_60m_target": 0.012,  # +1.2%
         "time_green_min": 45,
-        "time_green_roi": 0.006,   # +0.6% min green exit
+        "time_green_roi": 0.012,   # +1.2% min green exit
         "stale_minutes": 180,
         "stale_roi": -0.015,
     },
@@ -89,8 +102,8 @@ LOSS_STREAK_PAUSE_SEC = 45 * 60
 RSI_PERIOD = 14
 RSI_CEILING = 70            # 70 is standard; 60 was blocking too many real trends
 ATR_PERIOD = 14
-ATR_SIZING_MULT = 1.5       # size risk distance = max(fee hard-stop, ATR% * mult)
-ATR_SIZING_CAP_MULT = 2.0   # never widen sizing stop beyond 2× fee hard-stop
+ATR_SIZING_MULT = 1.5       # risk distance = max(fee hard-stop, ATR% * mult)
+ATR_SIZING_CAP_MULT = 2.0   # never widen stop beyond 2× fee hard-stop (sizing + exits)
 _ATR_CACHE_TTL = 120
 
 # Regime gate (baked-in — not a user toggle): multi-source BTC/SPY vs EMA20
@@ -103,14 +116,30 @@ REGIME_BROKER_SHORT_LOOKBACK = 90 * 60  # degraded: live vs ~1.5h-ago broker pri
 REGIME_BROKER_SAMPLE_GAP = 45       # min seconds between ring-buffer samples
 REGIME_BROKER_RING_MAX = 72         # keep ~3d of hourly broker closes
 
-# Pro risk stack (baked-in — no Settings maze)
-RISK_PCT_PER_TRADE = 0.0075       # 0.75% of equity risked per trade
+# Pro risk stack — risk $ per trade is posture/settings tunable (see RISK_POSTURE_PROFILES)
+RISK_PCT_PER_TRADE = 0.0075       # 0.75% of equity risked per trade (Balanced default)
+DEFAULT_MAX_OPEN_RISK_PCT = 0.06  # soft book heat: sum of stop-risk $ ≤ 6% equity
 CASH_RESERVE_PCT = 0.12           # leave 12% buying power undeployed (overridden by target_bp_utilization)
 DEFAULT_TARGET_BP_UTILIZATION = 0.88  # deploy most usable BP; idle cash does not earn
 DEFAULT_SIZING_FOCUS_SLOTS = 6    # size as if filling next N tickets — not all max_open slots
 MAX_CRYPTO_BOOK_FRAC = 0.40       # max crypto share on multi-asset brokers (RH); skipped on crypto-only (CB)
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
 MAX_SINGLE_NAME_EQUITY_FRAC = 0.15  # soft cap: one name ≤ ~15% of equity
+# Fill-quality feedback (conservative; throttled)
+FILL_FEEDBACK_WINDOW = 20         # look at last N fills with slippage
+FILL_FEEDBACK_ADVERSE_MIN = 5     # adverse count before adjusting
+FILL_FEEDBACK_ADVERSE_BPS = 5.0   # slippage_bps > this counts adverse
+FILL_FEEDBACK_COOLDOWN_SEC = 1800  # don't thrash — 30 min between adjustments
+FILL_FEEDBACK_OFFSET_BUMP = 0.05  # +0.05% limit offset when adverse
+FILL_FEEDBACK_SIZE_MULT = 0.90    # shrink size 10% after adverse cluster
+FILL_FEEDBACK_MAX_OFFSET_BUMP = 0.15
+_fill_feedback_state = {
+    "recent_slip_bps": [],        # newest last
+    "last_adjust_ts": 0.0,
+    "offset_bump_pct": 0.0,       # added to settings limit_offset_pct
+    "size_mult": 1.0,
+    "last_note": "",
+}
 STOCK_LIMIT_FILL_TIMEOUT = 45     # cancel unfilled stock limits after N seconds
 PRICE_STALE_SECONDS = 120         # reject buys if live quote older than this (when timestamped)
 # Strong buy_rank_score may stretch slot/alloc aim (still hard-capped by risk $ / soft name / deployable)
@@ -127,15 +156,21 @@ _scale_in_support_cache = {}  # ticker -> (ts, levels_list)
 
 # Risk Posture profiles — one UI choice that retunes concentration + exit patience together.
 # Stops / cluster caps stay in force in every mode (Aggressive still has rails).
+# Scale-in ROI bands sit ABOVE the ~−3.5% stock hard stop (stop_floor ≈ −3.0%).
 RISK_POSTURE_PROFILES = {
     "safer": {
         "label": "Safer",
-        "hint": "More slots, lower util, tighter name exposure — BTC uptrend required for crypto",
+        "hint": (
+            "Diversified book, 25% cash buffer, banks winners sooner, no averaging-down, "
+            "no opportunity-swap — BTC uptrend required for crypto. Day DD pause ~3%."
+        ),
         "require_crypto_regime": True,
         "target_bp_utilization_pct": 75.0,
         "sizing_focus_slots": 8,
         "max_open_positions": 10,
         "max_buys_per_cycle": 2,
+        "risk_pct_per_trade": 0.50,       # % of equity risked to hard stop per new ticket
+        "max_open_risk_pct": 4.0,         # book heat soft cap (% equity)
         "max_single_name_equity_pct": 10.0,
         "conviction_alloc_mult_max": 1.25,
         "exit_roi_scale": 0.80,   # lower time-exit ROI targets → take profits sooner
@@ -144,19 +179,28 @@ RISK_POSTURE_PROFILES = {
         "allow_scale_in": False,
         "scale_in_size_frac": 0.40,
         "scale_in_max_adds": 1,
-        "scale_in_roi_min": -0.04,   # deepest add (must be above hard stop)
-        "scale_in_roi_max": -0.008,  # must be at least this underwater
+        "scale_in_roi_min": -0.022,  # shallow adds only if user enables
+        "scale_in_roi_max": -0.012,
         "scale_in_near_pct": 0.012,
         "scale_in_min_score": 55.0,
+        "day_dd_pause_pct": 0.03,
+        "peak_dd_pause_pct": 0.08,
+        "dd_pause_minutes": 60,
+        "daily_loss_limit_equity_pct": 0.03,  # seeds $ daily_loss_limit from equity
     },
     "balanced": {
         "label": "Balanced",
-        "hint": "Focus 6, ~88% util — crypto uses each coin's trend without a BTC gate",
+        "hint": (
+            "Focus 6 slots, ~88% util, scale-in near support, opportunity-swap on with "
+            "fee gates — crypto uses each coin's trend (no BTC gate). Day DD pause ~5%."
+        ),
         "require_crypto_regime": False,
         "target_bp_utilization_pct": 88.0,
         "sizing_focus_slots": 6,
         "max_open_positions": 8,
         "max_buys_per_cycle": 2,
+        "risk_pct_per_trade": 0.75,
+        "max_open_risk_pct": 6.0,
         "max_single_name_equity_pct": 15.0,
         "conviction_alloc_mult_max": 1.50,
         "exit_roi_scale": 1.0,
@@ -165,20 +209,29 @@ RISK_POSTURE_PROFILES = {
         "allow_scale_in": True,
         "scale_in_size_frac": 0.50,
         "scale_in_max_adds": 1,
-        "scale_in_roi_min": -0.08,
-        "scale_in_roi_max": -0.005,
+        "scale_in_roi_min": -0.025,  # −2.5% … −1.0% underwater
+        "scale_in_roi_max": -0.010,
         "scale_in_near_pct": 0.015,
-        "scale_in_min_score": 45.0,
+        "scale_in_min_score": 48.0,
+        "day_dd_pause_pct": 0.05,
+        "peak_dd_pause_pct": 0.12,
+        "dd_pause_minutes": 45,
+        "daily_loss_limit_equity_pct": 0.05,
     },
     "aggressive": {
         "label": "Aggressive",
-        "hint": "Fewer slots, higher util — crypto uses each coin's trend without a BTC gate",
+        "hint": (
+            "Concentrated (≤20% name), high util, patient exits, deeper scale-in & rotates — "
+            "still hard-stopped. Day DD pause ~8%. Not a 'max stocks' robo mix."
+        ),
         "require_crypto_regime": False,
         "target_bp_utilization_pct": 95.0,
         "sizing_focus_slots": 3,
         "max_open_positions": 5,
         "max_buys_per_cycle": 1,
-        "max_single_name_equity_pct": 25.0,
+        "risk_pct_per_trade": 1.00,
+        "max_open_risk_pct": 10.0,
+        "max_single_name_equity_pct": 20.0,  # soft-capped vs prior 25%
         "conviction_alloc_mult_max": 1.75,
         "exit_roi_scale": 1.35,   # need more gain before time-exit
         "exit_time_scale": 1.30,  # wait longer before time-green
@@ -186,10 +239,14 @@ RISK_POSTURE_PROFILES = {
         "allow_scale_in": True,
         "scale_in_size_frac": 0.60,
         "scale_in_max_adds": 1,
-        "scale_in_roi_min": -0.10,
-        "scale_in_roi_max": -0.003,
+        "scale_in_roi_min": -0.029,  # near stop_floor; wider than balanced
+        "scale_in_roi_max": -0.005,
         "scale_in_near_pct": 0.020,
         "scale_in_min_score": 40.0,
+        "day_dd_pause_pct": 0.08,
+        "peak_dd_pause_pct": 0.15,
+        "dd_pause_minutes": 30,
+        "daily_loss_limit_equity_pct": 0.08,
     },
 }
 
@@ -209,10 +266,25 @@ def crypto_regime_required(posture=None):
     return bool(get_risk_posture_profile(posture).get("require_crypto_regime", False))
 
 
+def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False):
+    """
+    Hard gate for NEW entries (scan + execute). Matches evaluate_* posture rules:
+      - Equities: always require SPY regime unless allow_when_blocked
+      - Crypto: BTC regime only when posture.require_crypto_regime (Safer)
+    Returns (ok: bool, reason: str). Override setting defaults OFF for live.
+    """
+    if allow_when_blocked:
+        return True, "override:allow_buys_when_regime_blocked"
+    if is_crypto and not crypto_regime_required(posture):
+        return True, ""
+    return market_regime_ok(is_crypto=bool(is_crypto))
+
+
 def get_scale_in_params(posture=None, settings=None):
     """
     Merge Risk Posture scale-in defaults with optional settings overrides.
-    settings.allow_scale_in (bool) wins when explicitly set; posture supplies the rest.
+    settings.allow_scale_in (bool) wins when explicitly set; posture supplies ROI bands
+    unless advanced_scale_in_override is True (Advanced dialog committed custom bands).
     """
     prof = get_risk_posture_profile(posture)
     s = settings or {}
@@ -220,30 +292,42 @@ def get_scale_in_params(posture=None, settings=None):
         "allow_scale_in": bool(prof.get("allow_scale_in", False)),
         "scale_in_size_frac": float(prof.get("scale_in_size_frac", 0.50)),
         "scale_in_max_adds": int(prof.get("scale_in_max_adds", 1)),
-        "scale_in_roi_min": float(prof.get("scale_in_roi_min", -0.08)),
-        "scale_in_roi_max": float(prof.get("scale_in_roi_max", -0.005)),
+        "scale_in_roi_min": float(prof.get("scale_in_roi_min", -0.025)),
+        "scale_in_roi_max": float(prof.get("scale_in_roi_max", -0.010)),
         "scale_in_near_pct": float(prof.get("scale_in_near_pct", 0.015)),
-        "scale_in_min_score": float(prof.get("scale_in_min_score", 45.0)),
+        "scale_in_min_score": float(prof.get("scale_in_min_score", 48.0)),
     }
     if "allow_scale_in" in s and s.get("allow_scale_in") is not None:
         out["allow_scale_in"] = bool(s.get("allow_scale_in"))
-    for key, cast in (
-        ("scale_in_size_frac", float),
-        ("scale_in_max_adds", int),
-        ("scale_in_roi_min", float),
-        ("scale_in_roi_max", float),
-        ("scale_in_near_pct", float),
-        ("scale_in_min_score", float),
-    ):
-        if key in s and s.get(key) is not None:
+    if s.get("advanced_scale_in_override"):
+        for key in (
+            "scale_in_size_frac",
+            "scale_in_max_adds",
+            "scale_in_roi_min",
+            "scale_in_roi_max",
+            "scale_in_near_pct",
+            "scale_in_min_score",
+        ):
+            if key in s and s.get(key) is not None:
+                try:
+                    out[key] = type(out[key])(s.get(key))
+                except (TypeError, ValueError):
+                    pass
+    else:
+        # Soft overrides for size / max adds only (common Advanced tweaks)
+        if "scale_in_size_frac" in s and s.get("scale_in_size_frac") is not None:
             try:
-                out[key] = cast(s.get(key))
+                out["scale_in_size_frac"] = float(s.get("scale_in_size_frac"))
             except (TypeError, ValueError):
                 pass
-    out["scale_in_size_frac"] = min(0.75, max(0.25, float(out["scale_in_size_frac"])))
+        if "scale_in_max_adds" in s and s.get("scale_in_max_adds") is not None:
+            try:
+                out["scale_in_max_adds"] = int(s.get("scale_in_max_adds"))
+            except (TypeError, ValueError):
+                pass
+    out["scale_in_size_frac"] = max(0.25, min(0.75, float(out["scale_in_size_frac"])))
     out["scale_in_max_adds"] = max(0, min(3, int(out["scale_in_max_adds"])))
     out["scale_in_near_pct"] = min(0.05, max(0.005, float(out["scale_in_near_pct"])))
-    # Ensure roi_min (deeper loss) <= roi_max (shallower)
     if out["scale_in_roi_min"] > out["scale_in_roi_max"]:
         out["scale_in_roi_min"], out["scale_in_roi_max"] = (
             out["scale_in_roi_max"], out["scale_in_roi_min"]
@@ -254,7 +338,7 @@ def get_scale_in_params(posture=None, settings=None):
 def apply_exit_posture(fees, exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0):
     """
     Scale time-based take-profit / TTP-arm thresholds on a fee-profile copy.
-    Hard stops and cluster rails are not relaxed here.
+    Hard stops and cluster rails are not relaxed here (ATR may widen them separately).
     """
     out = dict(fees or {})
     try:
@@ -286,6 +370,85 @@ def apply_exit_posture(fees, exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_sc
         except (TypeError, ValueError):
             pass
     return out
+
+
+def atr_adapt_exit_fees(fees, ticker=None):
+    """
+    Widen hard_stop (and ttp_trail / ttp_arm) toward ATR%, capped at 2× fee base.
+    Returns a copy; no-op when ticker missing or ATR unavailable.
+    """
+    out = dict(fees or {})
+    clean = str(ticker or "").replace("-USD", "").upper()
+    if not clean:
+        return out
+    try:
+        base_hs = abs(float(out.get("hard_stop") or -0.035))
+    except (TypeError, ValueError):
+        base_hs = 0.035
+    if base_hs <= 0:
+        return out
+    atr = _atr_pct(clean)
+    if atr is None or atr <= 0:
+        return out
+    widened = max(base_hs, float(atr) * ATR_SIZING_MULT)
+    widened = min(widened, base_hs * ATR_SIZING_CAP_MULT)
+    scale = widened / base_hs if base_hs > 0 else 1.0
+    out["hard_stop"] = -widened
+    for key in ("ttp_trail", "ttp_arm"):
+        if key in out and out[key] is not None:
+            try:
+                out[key] = float(out[key]) * scale
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def min_profit_exit_roi_pct(broker_id, ticker=None, asset_type=""):
+    """
+    Minimum ROI for discretionary profit-taking / TTP arm / time-green sells:
+    estimated round-trip fees + MIN_PROFIT_OVER_FEES_PCT.
+    """
+    return float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type)) + float(
+        MIN_PROFIT_OVER_FEES_PCT
+    )
+
+
+def enforce_min_profit_over_fees(fees, broker_id, ticker=None, asset_type=""):
+    """
+    Clamp profit-taking rails to ≥ fee_rt + MIN_PROFIT_OVER_FEES_PCT.
+    Does not touch hard_stop, stale_roi, or ttp_trail (trail lock-in / protective exits).
+    """
+    out = dict(fees or {})
+    floor = min_profit_exit_roi_pct(broker_id, ticker, asset_type)
+    for key in ("time_green_roi", "time_30m_target", "time_60m_target", "ttp_arm"):
+        if key in out and out[key] is not None:
+            try:
+                out[key] = max(float(out[key]), floor)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def resolve_exit_fees(
+    broker_id,
+    ticker=None,
+    asset_type="",
+    exit_roi_scale=1.0,
+    exit_time_scale=1.0,
+    ttp_arm_scale=1.0,
+):
+    """Fee profile → ATR exit adapt → posture scales → min profit-over-fees floor."""
+    fees = atr_adapt_exit_fees(
+        _resolve_fee_profile(broker_id, ticker, asset_type),
+        ticker,
+    )
+    fees = apply_exit_posture(
+        fees,
+        exit_roi_scale=exit_roi_scale,
+        exit_time_scale=exit_time_scale,
+        ttp_arm_scale=ttp_arm_scale,
+    )
+    return enforce_min_profit_over_fees(fees, broker_id, ticker, asset_type)
 
 
 # Practical concentration heuristics (maintainable, no quant library)
@@ -346,6 +509,11 @@ _protective_orders = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> {order_id, 
 _scale_in_counts = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> adds already taken
 # broker -> {"events": [ts, ...], "pause_until": float}
 _loss_streak = {b: {"events": [], "pause_until": 0.0} for b in _KNOWN_BROKER_IDS}
+# Per-broker equity high-water + day open for drawdown pauses
+_equity_dd = {
+    b: {"day": "", "day_open": 0.0, "peak": 0.0, "pause_until": 0.0, "pause_reason": ""}
+    for b in _KNOWN_BROKER_IDS
+}
 _trend_cache = {}
 _TREND_CACHE_TTL = 45  # seconds
 _atr_cache = {}  # ticker -> (ts, atr_pct or None)
@@ -457,6 +625,92 @@ def _loss_streak_block(broker_id):
     return True, ""
 
 
+def _local_day_key():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
+    """
+    Track day-open + peak equity; pause new buys when day or peak drawdown
+    exceeds posture thresholds. Returns (paused_now: bool, message: str).
+    """
+    broker_id = _normalize_broker_id(broker_id)
+    try:
+        eq = float(equity or 0.0)
+    except (TypeError, ValueError):
+        eq = 0.0
+    if eq <= 0:
+        return False, ""
+
+    prof = get_risk_posture_profile(posture)
+    s = settings or {}
+    day_pct = float(s.get("day_dd_pause_pct", prof.get("day_dd_pause_pct", 0.05)) or 0.05)
+    peak_pct = float(s.get("peak_dd_pause_pct", prof.get("peak_dd_pause_pct", 0.12)) or 0.12)
+    pause_min = int(s.get("dd_pause_minutes", prof.get("dd_pause_minutes", 45)) or 45)
+    day_pct = max(0.01, min(0.25, day_pct))
+    peak_pct = max(0.02, min(0.40, peak_pct))
+    pause_min = max(10, min(240, pause_min))
+
+    if broker_id not in _equity_dd:
+        _equity_dd[broker_id] = {
+            "day": "", "day_open": 0.0, "peak": 0.0, "pause_until": 0.0, "pause_reason": ""
+        }
+    st = _equity_dd[broker_id]
+    today = _local_day_key()
+    if st.get("day") != today or float(st.get("day_open") or 0) <= 0:
+        st["day"] = today
+        st["day_open"] = eq
+        st["peak"] = max(eq, float(st.get("peak") or 0.0))
+        # New day clears prior pause unless still in the future from yesterday
+        if float(st.get("pause_until") or 0) < time.time():
+            st["pause_reason"] = ""
+    else:
+        st["peak"] = max(eq, float(st.get("peak") or 0.0))
+
+    day_open = float(st["day_open"] or eq)
+    peak = float(st["peak"] or eq)
+    day_dd = (eq - day_open) / day_open if day_open > 0 else 0.0
+    peak_dd = (eq - peak) / peak if peak > 0 else 0.0
+
+    now = time.time()
+    triggered = None
+    if day_dd <= -day_pct:
+        triggered = f"Day drawdown {day_dd*100:.1f}% ≤ −{day_pct*100:.0f}%"
+    elif peak_dd <= -peak_pct:
+        triggered = f"Peak drawdown {peak_dd*100:.1f}% ≤ −{peak_pct*100:.0f}%"
+
+    if triggered and float(st.get("pause_until") or 0) < now:
+        st["pause_until"] = now + pause_min * 60
+        st["pause_reason"] = triggered
+        save_state(force=True)
+        return True, triggered
+
+    save_state(force=False)
+    return False, ""
+
+
+def _drawdown_block(broker_id):
+    """Return (allowed, reason) — False allowed means blocked."""
+    broker_id = _normalize_broker_id(broker_id)
+    st = _equity_dd.get(broker_id) or {}
+    pause_until = float(st.get("pause_until") or 0.0)
+    now = time.time()
+    if pause_until > now:
+        mins = int((pause_until - now) / 60) + 1
+        why = st.get("pause_reason") or "Drawdown pause"
+        return False, f"DO NOT BUY ({why}; {mins}m left)"
+    return True, ""
+
+
+def get_drawdown_status(broker_id):
+    """Snapshot for UI / monitor."""
+    broker_id = _normalize_broker_id(broker_id)
+    st = dict(_equity_dd.get(broker_id) or {})
+    now = time.time()
+    st["paused"] = float(st.get("pause_until") or 0) > now
+    return st
+
+
 def get_scale_in_count(broker_id, ticker):
     bid = _normalize_broker_id(broker_id)
     key = str(ticker or "").replace("-USD", "").upper()
@@ -565,6 +819,10 @@ def _check_hysteresis(ticker, current_price, is_crypto, broker_id):
     if not allowed:
         return False, reason
 
+    allowed, reason = _drawdown_block(broker_id)
+    if not allowed:
+        return False, reason
+
     key = str(ticker or "").replace("-USD", "").upper()
     if key not in _cooldown_memory[broker_id] and ticker not in _cooldown_memory[broker_id]:
         return True, ""
@@ -614,8 +872,10 @@ def save_state(force=False):
             "protective": _protective_orders,
             "scale_in_counts": _scale_in_counts,
             "loss_streak": _loss_streak,
+            "equity_dd": _equity_dd,
             "regime_last_good": _regime_last_good,
             "regime_broker_hourly": _broker_hourly_closes,
+            "rotate_day_counts": _rotate_day_counts,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -636,7 +896,8 @@ def flush_state():
 def load_state():
     """Restore TTP/cooldown/protective/regime memory from disk."""
     global _portfolio_memory, _cooldown_memory, _protective_orders, _scale_in_counts
-    global _loss_streak, _regime_last_good, _broker_hourly_closes
+    global _loss_streak, _regime_last_good, _broker_hourly_closes, _rotate_day_counts
+    global _equity_dd
     if not os.path.exists(STATE_FILE):
         return False
     try:
@@ -646,6 +907,14 @@ def load_state():
         cool = data.get("cooldown") or {}
         prot = data.get("protective") or {}
         sic = data.get("scale_in_counts") or {}
+        rdc = data.get("rotate_day_counts") or {}
+        if isinstance(rdc, dict):
+            _rotate_day_counts.clear()
+            for k, v in rdc.items():
+                try:
+                    _rotate_day_counts[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    pass
         for bid in _KNOWN_BROKER_IDS:
             _portfolio_memory[bid] = port.get(bid, {})
             _cooldown_memory[bid] = cool.get(bid, {})
@@ -675,6 +944,22 @@ def load_state():
                 except (TypeError, ValueError):
                     pause_until = 0.0
                 _loss_streak[bid] = {"events": events[-12:], "pause_until": pause_until}
+        edd = data.get("equity_dd") or {}
+        if isinstance(edd, dict):
+            for bid in _KNOWN_BROKER_IDS:
+                row = edd.get(bid) or {}
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    _equity_dd[bid] = {
+                        "day": str(row.get("day") or ""),
+                        "day_open": float(row.get("day_open") or 0.0),
+                        "peak": float(row.get("peak") or 0.0),
+                        "pause_until": float(row.get("pause_until") or 0.0),
+                        "pause_reason": str(row.get("pause_reason") or ""),
+                    }
+                except (TypeError, ValueError):
+                    pass
         lg = data.get("regime_last_good") or {}
         if isinstance(lg, dict):
             _regime_last_good = lg
@@ -726,13 +1011,15 @@ def _atr_pct(ticker, period=ATR_PERIOD):
 def get_stop_distance_pct(broker_id, ticker=None, asset_type="", *, for_sizing=False):
     """
     Hard-stop distance as a positive fraction (matches FEE_PROFILES / broker stop).
-    When for_sizing=True and ticker is known, widen toward ATR so high-vol names
-    get smaller dollar size (risk $ / wider stop) without changing the exit hard-stop.
+    When ticker is known, widen toward ATR (capped at 2× fee hard-stop) for both
+    sizing and exits. ``for_sizing`` is kept for call-site clarity / backward compat.
     """
     fees = _resolve_fee_profile(broker_id, ticker, asset_type)
     base = abs(float(fees.get("hard_stop") or -0.035))
-    if not for_sizing or not ticker:
+    if not ticker:
         return base
+    # for_sizing unused for branching — exits and sizing share the same ATR widen rule
+    _ = for_sizing
     atr = _atr_pct(ticker)
     if atr is None or atr <= 0:
         return base
@@ -741,8 +1028,148 @@ def get_stop_distance_pct(broker_id, ticker=None, asset_type="", *, for_sizing=F
 
 
 def get_trail_pct(broker_id, ticker=None, asset_type=""):
-    fees = _resolve_fee_profile(broker_id, ticker, asset_type)
+    fees = atr_adapt_exit_fees(_resolve_fee_profile(broker_id, ticker, asset_type), ticker)
     return float(fees.get("ttp_trail") or 0.008)
+
+
+def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
+    """
+    Approx open risk $ / % to hard stop, BP headroom, DD pause, and session $-loss room.
+
+    broker_rows: iterable of {
+      broker, broker_id, equity, buying_power, day_pnl, armed,
+      holdings: [{ticker, value, asset_type}, ...]
+    }
+    """
+    settings = settings or {}
+    posture = posture or settings.get("risk_posture", "balanced")
+    prof = get_risk_posture_profile(posture)
+    try:
+        util_pct = float(
+            settings.get("target_bp_utilization_pct", prof.get("target_bp_utilization_pct", 88.0))
+            or 88.0
+        )
+    except (TypeError, ValueError):
+        util_pct = 88.0
+    util = util_pct / 100.0 if util_pct > 1.0 else util_pct
+    util = max(0.50, min(0.99, util))
+    try:
+        loss_limit = float(settings.get("daily_loss_limit", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        loss_limit = 0.0
+
+    by_broker = {}
+    combined = {
+        "open_risk_dollars": 0.0,
+        "open_risk_pct": 0.0,
+        "equity": 0.0,
+        "buying_power": 0.0,
+        "bp_headroom": 0.0,
+        "day_pnl": 0.0,
+        "dd_paused": False,
+        "dd_reason": "",
+        "loss_disarmed": False,
+        "loss_room": 0.0 if loss_limit > 0 else None,
+        "session_risk_used_pct": 0.0,
+        "armed_any": False,
+    }
+    now = time.time()
+
+    for row in broker_rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("broker") or "")
+        bid = _normalize_broker_id(row.get("broker_id") or name)
+        try:
+            eq = float(row.get("equity") or 0.0)
+            bp = float(row.get("buying_power") or 0.0)
+            pnl = float(row.get("day_pnl") or 0.0)
+        except (TypeError, ValueError):
+            eq, bp, pnl = 0.0, 0.0, 0.0
+        armed = bool(row.get("armed"))
+        dd = get_drawdown_status(bid)
+        dd_paused = bool(dd.get("paused"))
+        dd_reason = str(dd.get("pause_reason") or "")
+        mins_left = 0
+        if dd_paused:
+            mins_left = int(max(0.0, float(dd.get("pause_until") or 0.0) - now) / 60.0) + 1
+
+        risk_dollars = 0.0
+        for h in row.get("holdings") or []:
+            if not isinstance(h, dict):
+                continue
+            t = str(h.get("ticker") or "").replace("-USD", "").upper()
+            if not t:
+                continue
+            try:
+                val = float(h.get("value") or 0.0)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val <= 0:
+                try:
+                    px = float(h.get("price") or h.get("live_price") or 0.0)
+                    qty = float(h.get("shares") or h.get("qty") or 0.0)
+                    val = abs(px * qty)
+                except (TypeError, ValueError):
+                    val = 0.0
+            if val <= 0:
+                continue
+            asset_type = h.get("asset_type") or ""
+            stop_d = get_stop_distance_pct(bid, ticker=t, asset_type=asset_type)
+            risk_dollars += val * float(stop_d)
+
+        bp_headroom = max(0.0, bp * util)
+        loss_room = max(0.0, loss_limit + pnl) if loss_limit > 0 else None
+        # $-loss path disarms; DD only pauses buys
+        loss_hit = bool(loss_limit > 0 and pnl <= -loss_limit)
+        used_pct = 0.0
+        if loss_limit > 0:
+            used_pct = min(100.0, abs(min(0.0, pnl)) / loss_limit * 100.0)
+
+        snap = {
+            "open_risk_dollars": risk_dollars,
+            "open_risk_pct": (risk_dollars / eq * 100.0) if eq > 0 else 0.0,
+            "equity": eq,
+            "buying_power": bp,
+            "bp_headroom": bp_headroom,
+            "bp_util_target_pct": util * 100.0,
+            "day_pnl": pnl,
+            "dd_paused": dd_paused,
+            "dd_reason": dd_reason,
+            "dd_mins_left": mins_left,
+            "armed": armed,
+            "loss_limit": loss_limit,
+            "loss_room": loss_room,
+            "loss_hit": loss_hit,
+            "loss_disarmed": bool(loss_hit and not armed),
+            "session_risk_used_pct": used_pct,
+        }
+        by_broker[name or bid] = snap
+        combined["open_risk_dollars"] += risk_dollars
+        combined["equity"] += eq
+        combined["buying_power"] += bp
+        combined["bp_headroom"] += bp_headroom
+        combined["day_pnl"] += pnl
+        if dd_paused:
+            combined["dd_paused"] = True
+            if not combined["dd_reason"]:
+                combined["dd_reason"] = dd_reason
+        if snap["loss_disarmed"]:
+            combined["loss_disarmed"] = True
+        if armed:
+            combined["armed_any"] = True
+        if loss_room is not None:
+            combined["loss_room"] = (combined["loss_room"] or 0.0) + loss_room
+
+    if combined["equity"] > 0:
+        combined["open_risk_pct"] = combined["open_risk_dollars"] / combined["equity"] * 100.0
+    if loss_limit > 0 and by_broker:
+        # Session meter: worst broker used-pct (or combined day loss vs per-broker limit)
+        combined["session_risk_used_pct"] = max(
+            float(b.get("session_risk_used_pct") or 0.0) for b in by_broker.values()
+        )
+
+    return {"combined": combined, "by_broker": by_broker}
 
 
 def conviction_alloc_multiplier(score=None, mult_max=None):
@@ -772,12 +1199,20 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
                           open_count=None, max_open_positions=None,
                           target_bp_utilization=None, sizing_focus_slots=None,
                           soft_name_equity_frac=None, conviction_mult_max=None,
-                          existing_name_value=0.0, size_frac=1.0):
+                          existing_name_value=0.0, size_frac=1.0,
+                          risk_pct_per_trade=None, open_risk_dollars=0.0,
+                          max_open_risk_pct=None):
     """
     Full sizing math + skip diagnostics.
 
     Returns dict with trade (float), skip_reason (str|None), and intermediate
     caps (aim, soft_room, soft_cap, risk_size, deployable, already, …).
+
+    Risk-$ path: notional ≤ (equity × risk_pct) / stop_distance, further capped by
+    remaining book heat (max_open_risk_pct × equity − open_risk_dollars) / stop.
+
+    When stop_distance is missing/invalid: fall back to util/slot aim only
+    (no risk-$ cap) and set sizing_note accordingly — preserves Small-BP behavior.
 
     size_frac: scale-in multiplier applied to *aim* before hard/soft caps — not
     after. That way a 50% add on a small account can still lift to min_dollars
@@ -792,12 +1227,17 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
         "soft_cap": 0.0,
         "soft_room": 0.0,
         "risk_size": 0.0,
+        "risk_budget": 0.0,
         "deployable": 0.0,
         "already": 0.0,
         "name_limit": 0.0,
         "size_frac": 1.0,
         "min_dollars": float(min_dollars or 5.0),
         "equity": 0.0,
+        "risk_pct": float(RISK_PCT_PER_TRADE),
+        "sizing_mode": "risk_dollar",
+        "sizing_note": "",
+        "used_stop_fallback": False,
     }
     bp = float(buying_power or 0.0)
     eq = float(equity or 0.0)
@@ -807,7 +1247,7 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
     stop_d = float(stop_distance_pct or 0.0)
     min_d = float(min_dollars or 5.0)
     out["min_dollars"] = min_d
-    if bp <= 0 or stop_d <= 0:
+    if bp <= 0:
         out["skip_reason"] = "no buying power / invalid stop"
         return out
 
@@ -827,9 +1267,56 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
         out["skip_reason"] = f"deployable ${deployable:.2f} too low"
         return out
 
-    risk_budget = eq * RISK_PCT_PER_TRADE
-    risk_size = risk_budget / stop_d
-    out["risk_size"] = round(risk_size, 2)
+    # Risk % of equity — settings/profiles use percent points (0.75 = 0.75%);
+    # bare fractions ≤ ~5% (e.g. 0.0075) also accepted for call-site compat.
+    try:
+        if risk_pct_per_trade is None:
+            risk_pct = float(RISK_PCT_PER_TRADE)
+        else:
+            risk_pct = float(risk_pct_per_trade)
+            if risk_pct > 0.05:
+                risk_pct = risk_pct / 100.0
+    except (TypeError, ValueError):
+        risk_pct = float(RISK_PCT_PER_TRADE)
+    risk_pct = min(0.05, max(0.001, risk_pct))
+    out["risk_pct"] = risk_pct
+    risk_budget = eq * risk_pct
+    out["risk_budget"] = round(risk_budget, 2)
+
+    try:
+        if max_open_risk_pct is None:
+            book_risk_pct = float(DEFAULT_MAX_OPEN_RISK_PCT)
+        else:
+            book_risk_pct = float(max_open_risk_pct)
+            if book_risk_pct > 1.0:
+                book_risk_pct = book_risk_pct / 100.0
+    except (TypeError, ValueError):
+        book_risk_pct = float(DEFAULT_MAX_OPEN_RISK_PCT)
+    book_risk_pct = min(0.25, max(0.01, book_risk_pct))
+    try:
+        open_risk = max(0.0, float(open_risk_dollars or 0.0))
+    except (TypeError, ValueError):
+        open_risk = 0.0
+    remaining_heat_dollars = max(0.0, eq * book_risk_pct - open_risk)
+
+    stop_ok = stop_d > 1e-8
+    if stop_ok:
+        risk_size = risk_budget / stop_d
+        if remaining_heat_dollars > 0 and stop_d > 0:
+            heat_cap = remaining_heat_dollars / stop_d
+            risk_size = min(risk_size, heat_cap)
+        out["risk_size"] = round(risk_size, 2)
+        out["sizing_mode"] = "risk_dollar"
+        out["sizing_note"] = ""
+        out["used_stop_fallback"] = False
+    else:
+        # Graceful degrade: util/slot aim without risk-$ cap (Small-BP / unknown stop)
+        risk_size = deployable
+        out["risk_size"] = round(risk_size, 2)
+        out["sizing_mode"] = "util_fallback"
+        out["sizing_note"] = "stop distance unknown — util/slot sizing (no risk-$ cap)"
+        out["used_stop_fallback"] = True
+
     alloc_pct = max(0.0, float(alloc_ceiling_pct or 0.0))
     alloc_base = deployable * alloc_pct
     mult = conviction_alloc_multiplier(conviction_score, mult_max=conviction_mult_max)
@@ -938,7 +1425,9 @@ def calculate_risk_sizing(equity, buying_power, stop_distance_pct, alloc_ceiling
                           open_count=None, max_open_positions=None,
                           target_bp_utilization=None, sizing_focus_slots=None,
                           soft_name_equity_frac=None, conviction_mult_max=None,
-                          existing_name_value=0.0, size_frac=1.0):
+                          existing_name_value=0.0, size_frac=1.0,
+                          risk_pct_per_trade=None, open_risk_dollars=0.0,
+                          max_open_risk_pct=None):
     """
     Buying-power-aware concentrated sizing:
       aim ≈ max(deployable / focus_slots, alloc% × deployable) × conviction × size_frac
@@ -946,7 +1435,8 @@ def calculate_risk_sizing(equity, buying_power, stop_distance_pct, alloc_ceiling
 
     Deploy most usable BP into fewer high-conviction tickets rather than spraying
     min clips across a large max_open book. Hard/soft caps (smallest wins): risk $
-    (equity × RISK_PCT / stop), soft single-name equity frac, deployable BP.
+    (equity × risk_pct / stop), soft single-name equity frac, deployable BP,
+    remaining book heat.
 
     existing_name_value: already-held notional for this ticker (scale-in) — soft cap
     applies to total name exposure, so only remaining room is usable.
@@ -966,8 +1456,91 @@ def calculate_risk_sizing(equity, buying_power, stop_distance_pct, alloc_ceiling
         conviction_mult_max=conviction_mult_max,
         existing_name_value=existing_name_value,
         size_frac=size_frac,
+        risk_pct_per_trade=risk_pct_per_trade,
+        open_risk_dollars=open_risk_dollars,
+        max_open_risk_pct=max_open_risk_pct,
     )
     return float(detail.get("trade") or 0.0)
+
+
+def compute_slippage_bps(side, quote_price, fill_price):
+    """Signed slippage in bps vs quote. Positive = adverse for the side."""
+    try:
+        q = float(quote_price or 0)
+        f = float(fill_price or 0)
+    except (TypeError, ValueError):
+        return None
+    if q <= 0 or f <= 0:
+        return None
+    s = str(side or "").upper()
+    if s == "BUY":
+        return (f - q) / q * 10000.0
+    if s == "SELL":
+        return (q - f) / q * 10000.0
+    return None
+
+
+def note_fill_slippage(slippage_bps):
+    """
+    Record a fill's slippage for the light execution feedback loop.
+    Returns a short note string when an adjustment fires, else "".
+    """
+    global _fill_feedback_state
+    st = _fill_feedback_state
+    try:
+        bps = float(slippage_bps)
+    except (TypeError, ValueError):
+        return ""
+    recent = list(st.get("recent_slip_bps") or [])
+    recent.append(bps)
+    if len(recent) > FILL_FEEDBACK_WINDOW:
+        recent = recent[-FILL_FEEDBACK_WINDOW:]
+    st["recent_slip_bps"] = recent
+
+    adverse = sum(1 for x in recent if x > FILL_FEEDBACK_ADVERSE_BPS)
+    now = time.time()
+    last = float(st.get("last_adjust_ts") or 0.0)
+    note = ""
+    if (
+        adverse >= FILL_FEEDBACK_ADVERSE_MIN
+        and (now - last) >= FILL_FEEDBACK_COOLDOWN_SEC
+        and len(recent) >= FILL_FEEDBACK_ADVERSE_MIN
+    ):
+        bump = float(st.get("offset_bump_pct") or 0.0) + FILL_FEEDBACK_OFFSET_BUMP
+        bump = min(FILL_FEEDBACK_MAX_OFFSET_BUMP, bump)
+        st["offset_bump_pct"] = bump
+        st["size_mult"] = min(1.0, max(0.70, float(st.get("size_mult") or 1.0) * FILL_FEEDBACK_SIZE_MULT))
+        st["last_adjust_ts"] = now
+        note = (
+            f"fill-quality feedback: {adverse}/{len(recent)} adverse "
+            f"(>{FILL_FEEDBACK_ADVERSE_BPS:.0f}bps) → offset +{bump:.2f}% · "
+            f"size×{float(st['size_mult']):.2f}"
+        )
+        st["last_note"] = note
+    return note
+
+
+def get_execution_feedback():
+    """Current conservative offset bump (% points) and size multiplier."""
+    st = _fill_feedback_state
+    return {
+        "offset_bump_pct": float(st.get("offset_bump_pct") or 0.0),
+        "size_mult": float(st.get("size_mult") or 1.0),
+        "last_note": str(st.get("last_note") or ""),
+        "recent_count": len(st.get("recent_slip_bps") or []),
+    }
+
+
+def reset_execution_feedback():
+    """Test helper — clear fill-quality feedback state."""
+    global _fill_feedback_state
+    _fill_feedback_state = {
+        "recent_slip_bps": [],
+        "last_adjust_ts": 0.0,
+        "offset_bump_pct": 0.0,
+        "size_mult": 1.0,
+        "last_note": "",
+    }
 
 
 def concentration_blocks_buy(ticker, held_tickers, holdings_meta=None, portfolio_value=0.0,
@@ -1083,6 +1656,128 @@ def get_protective_order(broker_id, ticker):
     if bid not in _protective_orders:
         _protective_orders[bid] = {}
     return _protective_orders[bid].get(str(ticker).upper())
+
+
+def list_protective_orders(broker_id=None):
+    """Return [(broker_id, ticker, info_dict), ...] for tracked protective stops."""
+    out = []
+    if broker_id:
+        bids = [_normalize_broker_id(broker_id)]
+    else:
+        bids = list(_KNOWN_BROKER_IDS)
+    for bid in bids:
+        for ticker, info in (_protective_orders.get(bid) or {}).items():
+            if info:
+                out.append((bid, str(ticker).upper(), dict(info)))
+    return out
+
+
+def _qty_is_whole_shares(shares_val):
+    """True when qty is an integer >= 1 (RH broker stops require whole shares)."""
+    try:
+        from decimal import Decimal
+        d = Decimal(str(shares_val))
+        return d >= 1 and d == d.to_integral_value()
+    except Exception:
+        return False
+
+
+def protective_stop_health(holdings, *, paper_mode=False):
+    """
+    Compare open holdings that should have stops vs tracked protective orders.
+
+    holdings: iterable of {
+      broker_id|broker, ticker, value?, shares?, is_crypto?, supports_protective?
+    }
+    Brokers with supports_protective=False are skipped (E*TRADE).
+    Crypto and fractional equity qty are N/A for broker stops (TTP only) — not "missing".
+    Returns {ok, missing, fractional_na, crypto_na, tracked, expected, missing_count, ...}.
+    """
+    expected = []
+    fractional_na = []
+    crypto_na = []
+    for h in holdings or []:
+        if not isinstance(h, dict):
+            continue
+        t = str(h.get("ticker") or "").replace("-USD", "").upper()
+        if not t:
+            continue
+        bid = _normalize_broker_id(h.get("broker_id") or h.get("broker") or "")
+        if not bid:
+            continue
+        supports = h.get("supports_protective")
+        if supports is False:
+            continue
+        # Default: ROBINHOOD / COINBASE expect stops; ETRADE does not
+        if supports is None and bid == "ETRADE":
+            continue
+        is_crypto = bool(h.get("is_crypto")) or t in CRYPTO_TICKERS
+        if is_crypto:
+            # No broker stop API — software TTP only; do not count as missing
+            crypto_na.append({"broker_id": bid, "ticker": t, "why": "crypto — TTP only"})
+            continue
+        try:
+            val = float(h.get("value") or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val < 1.0 and not paper_mode:
+            # skip dust
+            continue
+        shares = h.get("shares")
+        if shares is None:
+            shares = h.get("qty")
+        try:
+            shares_f = float(shares) if shares is not None else None
+        except (TypeError, ValueError):
+            shares_f = None
+        # RH rejects stops on fractional qty — classify separately from true gaps
+        if shares_f is not None and not _qty_is_whole_shares(shares_f):
+            fractional_na.append({
+                "broker_id": bid,
+                "ticker": t,
+                "shares": shares_f,
+                "why": "fractional — broker stop N/A, TTP only",
+            })
+            continue
+        expected.append((bid, t))
+
+    tracked_set = {(b, t) for b, t, _ in list_protective_orders()}
+    missing = [{"broker_id": b, "ticker": t} for b, t in expected if (b, t) not in tracked_set]
+    return {
+        "ok": len(missing) == 0,
+        "expected": len(expected),
+        "tracked": len(tracked_set),
+        "missing_count": len(missing),
+        "missing": missing[:12],
+        "fractional_na_count": len(fractional_na),
+        "fractional_na": fractional_na[:12],
+        "crypto_na_count": len(crypto_na),
+        "crypto_na": crypto_na[:12],
+    }
+
+
+def cluster_heat_snapshot(held_tickers):
+    """
+    Live correlation-cluster fill for UI.
+    held_tickers: iterable of ticker strings (any broker combined or single book).
+    Returns ordered list of {name, held, count, max, full, members}.
+    """
+    held = {str(t).replace("-USD", "").upper() for t in (held_tickers or []) if t}
+    rows = []
+    for name, members in CORRELATION_CLUSTERS.items():
+        overlap = sorted(held & set(members))
+        n = len(overlap)
+        rows.append({
+            "name": name,
+            "held": overlap,
+            "count": n,
+            "max": int(MAX_CLUSTER_POSITIONS),
+            "full": n >= MAX_CLUSTER_POSITIONS,
+            "members": sorted(members),
+        })
+    # fullest first, then name
+    rows.sort(key=lambda r: (-r["count"], r["name"]))
+    return rows
 
 
 def set_protective_order(broker_id, ticker, order_info):
@@ -1594,6 +2289,470 @@ def buy_rank_score_for_book(ticker, is_crypto=True, held_tickers=None, holdings_
 
 
 # =========================================================================
+# OPPORTUNITY SWAP (balanced + aggressive capital recycle)
+# =========================================================================
+
+def opportunity_swap_params(posture=None):
+    """
+    Guardrails for selling a weaker holding to fund a superior BUY.
+    Safer posture: disabled. Returns a plain dict (safe to mutate by caller).
+    """
+    p = normalize_risk_posture(posture)
+    if p == "safer":
+        return {
+            "enabled": False,
+            "roi_floor": 0.0,
+            "score_gap": 999.0,
+            "min_hold_crypto_min": 45.0,
+            "min_hold_equity_min": 90.0,
+            "hard_stop_buffer": 0.005,
+            "max_rotates_per_day": 0,
+            "fee_buffer_pct": MIN_PROFIT_OVER_FEES_PCT,
+            "score_to_edge_pct": 0.0015,
+            "freeze_on_regime_fail": True,
+        }
+    if p == "aggressive":
+        return {
+            "enabled": True,
+            "roi_floor": -0.03,
+            "score_gap": 8.0,
+            "min_hold_crypto_min": 45.0,
+            "min_hold_equity_min": 90.0,
+            "hard_stop_buffer": 0.005,
+            "max_rotates_per_day": 3,
+            "fee_buffer_pct": MIN_PROFIT_OVER_FEES_PCT,
+            "score_to_edge_pct": 0.0015,
+            "freeze_on_regime_fail": True,
+        }
+    # balanced
+    return {
+        "enabled": True,
+        "roi_floor": -0.015,
+        "score_gap": 12.0,
+        "min_hold_crypto_min": 45.0,
+        "min_hold_equity_min": 90.0,
+        "hard_stop_buffer": 0.005,
+        "max_rotates_per_day": 2,
+        "fee_buffer_pct": MIN_PROFIT_OVER_FEES_PCT,
+        "score_to_edge_pct": 0.0015,
+        "freeze_on_regime_fail": True,
+    }
+
+
+def opportunity_swap_enabled(posture=None):
+    return bool(opportunity_swap_params(posture).get("enabled"))
+
+
+# Estimated one-way friction (spread + commission) for analytics / rotate fee gates.
+# Round-trip ≈ 2x. Honest Est. for retail/self-directed use — not broker invoices.
+# RH listed equities: $0 commission; tiny SEC/TAF + spread crumbs ≈ 10 bps one-way.
+# E*TRADE equities (Andrew schedule): $0 commission stocks/ETFs; Est. still 10 bps one-way
+#   for SEC/spread — not underestimating to penny-takes. No ETRADE_CRYPTO profile: this
+#   autotrader is equity/ETF-only on ET (schedule crypto 0.50% unused; if ever wired →
+#   1.0% RT / exit floor 2.0%).
+# RH crypto: this app uses robin_stocks order_*_crypto_by_quantity (classic API).
+#   MM routing (default / API v1): RH rebate ~$0.95/$100 embedded in spread ≈ 0.95% one-way.
+#   Smart exchange routing (in-app opt-in): Andrew's tiers show <$50K = 0.95% one-way.
+#   Prefer not underestimating small books → Est. 0.95% one-way either path.
+# Coinbase: Intro 1 taker = 1.2% one-way (small-book default; autotrader uses market/taker).
+# Intro 2 (0.40%/0.80% @ $10K) / Advanced 1 (0.25%/0.50% @ $25K) — lower later if volume rises.
+_FEE_ONE_WAY_PCT = {
+    "ROBINHOOD_STOCK": 0.0010,
+    "ROBINHOOD_CRYPTO": 0.0095,
+    "COINBASE": 0.0120,
+    "ETRADE_STOCK": 0.0010,
+}
+
+
+def fee_profile_key(broker_id, ticker=None, asset_type=""):
+    """Canonical FEE_PROFILES key for journaling / reports."""
+    return _profile_key_for(broker_id, ticker, asset_type)
+
+
+def _profile_key_for(broker_id, ticker=None, asset_type=""):
+    raw = str(broker_id or "").strip().upper()
+    if raw in _FEE_ONE_WAY_PCT:
+        return raw
+    bid = _normalize_broker_id(broker_id)
+    clean = str(ticker or "").replace("-USD", "").upper()
+    is_crypto = "crypto" in str(asset_type or "").lower() or clean in CRYPTO_TICKERS
+    if bid == "COINBASE":
+        return "COINBASE"
+    if bid == "ETRADE":
+        return "ETRADE_STOCK"
+    if is_crypto:
+        return "ROBINHOOD_CRYPTO"
+    return "ROBINHOOD_STOCK"
+
+
+def estimate_round_trip_fee_pct(broker_id, ticker=None, asset_type=""):
+    """Estimated round-trip friction as a fraction of notional (e.g. 0.012 = 1.2%)."""
+    key = _profile_key_for(broker_id, ticker, asset_type)
+    one = float(_FEE_ONE_WAY_PCT.get(key, 0.002))
+    return one * 2.0
+
+
+def estimate_fee_dollars(notional, broker_id, ticker=None, asset_type="", *, round_trip=True):
+    """Estimated fee $ for one-way or round-trip on notional."""
+    try:
+        n = abs(float(notional or 0.0))
+    except (TypeError, ValueError):
+        n = 0.0
+    pct = estimate_round_trip_fee_pct(broker_id, ticker, asset_type)
+    if not round_trip:
+        pct = pct / 2.0
+    return n * pct
+
+
+# Per-broker daily rotate counters: { "ROBINHOOD|2026-08-05": 2 }
+_rotate_day_counts = {}
+
+
+def _rotate_day_key(broker_id, day=None):
+    bid = _normalize_broker_id(broker_id)
+    if day is None:
+        day = datetime.now().date().isoformat()
+    return f"{bid}|{day}"
+
+
+def rotates_today(broker_id, day=None):
+    return int(_rotate_day_counts.get(_rotate_day_key(broker_id, day), 0) or 0)
+
+
+def record_rotation(broker_id, day=None):
+    """Increment daily rotate counter (call after a successful rotate sell)."""
+    key = _rotate_day_key(broker_id, day)
+    _rotate_day_counts[key] = rotates_today(broker_id, day) + 1
+    save_state(force=True)
+    return _rotate_day_counts[key]
+
+
+def rotation_allowed_today(broker_id, posture=None, day=None):
+    params = opportunity_swap_params(posture)
+    if not params.get("enabled"):
+        return False, "safer posture"
+    cap = int(params.get("max_rotates_per_day") or 0)
+    used = rotates_today(broker_id, day)
+    if used >= cap:
+        return False, f"daily rotate cap ({used}/{cap})"
+    return True, ""
+
+
+def holding_opportunity_score(ticker, is_crypto=False, roi=0.0, score_fn=None):
+    """
+    Remaining opportunity proxy for a held name.
+    Higher = stronger thesis / already working → worse funding victim.
+    Lower = weaker remaining edge → preferred funding source.
+    """
+    clean = str(ticker or "").replace("-USD", "").upper()
+    fn = score_fn or buy_rank_score
+    try:
+        base = float(fn(clean, is_crypto=bool(is_crypto)))
+    except TypeError:
+        base = float(fn(clean))
+    except Exception:
+        base = 0.0
+    try:
+        r = float(roi or 0.0)
+    except (TypeError, ValueError):
+        r = 0.0
+    # Already-green names look stronger (harder to rotate out)
+    return base + max(-20.0, min(30.0, r * 100.0))
+
+
+def _holding_mem(broker_id, ticker):
+    bid = _normalize_broker_id(broker_id)
+    key = str(ticker or "").replace("-USD", "").upper()
+    return (_portfolio_memory.get(bid) or {}).get(key) or {}
+
+
+def holding_held_minutes(broker_id, ticker, now=None):
+    """Minutes since buy_time in portfolio memory; None if unknown."""
+    mem = _holding_mem(broker_id, ticker)
+    bt = mem.get("buy_time")
+    if not bt:
+        return None
+    try:
+        tnow = float(now if now is not None else time.time())
+        return max(0.0, (tnow - float(bt)) / 60.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_ttp_armed_holding(broker_id, ticker, avg_cost, current_price, asset_type="",
+                         exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0):
+    """True when trailing take-profit is armed (do not rotate out winners under trail)."""
+    try:
+        cost = float(avg_cost or 0.0)
+        px = float(current_price or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if cost <= 0 or px <= 0:
+        return False
+    fees = resolve_exit_fees(
+        broker_id, ticker, asset_type,
+        exit_roi_scale=exit_roi_scale,
+        exit_time_scale=exit_time_scale,
+        ttp_arm_scale=ttp_arm_scale,
+    )
+    mem = _holding_mem(broker_id, ticker)
+    try:
+        highest = float(mem.get("highest") or px)
+    except (TypeError, ValueError):
+        highest = px
+    highest = max(highest, px)
+    peak_roi = (highest - cost) / cost
+    return peak_roi >= float(fees.get("ttp_arm") or 0.02)
+
+
+def mark_opportunity_swap_exit(broker_id, ticker):
+    """Tag memory so auto-detect cooldown does not treat this as a hard-stop loss."""
+    bid = _normalize_broker_id(broker_id)
+    key = str(ticker or "").replace("-USD", "").upper()
+    if bid not in _portfolio_memory:
+        _portfolio_memory[bid] = {}
+    mem = _portfolio_memory[bid].setdefault(key, {"highest": 0.0, "buy_time": time.time(), "last_eval": time.time()})
+    mem["exit_reason"] = "opportunity_swap"
+    mem["last_eval"] = time.time()
+
+
+def _parse_cluster_block(block_reason):
+    """Extract cluster name from concentration reason like 'cluster BTC_BETA full (...)'."""
+    text = str(block_reason or "")
+    if "cluster " not in text.lower():
+        return None
+    try:
+        # cluster NAME full
+        part = text.split("cluster", 1)[1].strip()
+        name = part.split()[0].strip()
+        return name if name in CORRELATION_CLUSTERS else None
+    except Exception:
+        return None
+
+
+_last_rotate_reject = ""
+
+# Robinhood crypto notional floor (broker rejects under ~$5). Never lower this to "fit" BP.
+RH_CRYPTO_MIN_NOTIONAL = 5.0
+
+
+def broker_min_notional(broker_id, *, is_crypto: bool = False) -> float:
+    """Hard broker ticket floor used for rotate-to-clear-BP (not a soft aim)."""
+    bid = _normalize_broker_id(broker_id)
+    if bid == "ROBINHOOD" and is_crypto:
+        return float(RH_CRYPTO_MIN_NOTIONAL)
+    if bid == "COINBASE":
+        return float(RH_CRYPTO_MIN_NOTIONAL)  # CB Advanced also rejects tiny notionals
+    return 5.0
+
+
+def pick_rotation_funding(
+    candidate_ticker,
+    candidate_score,
+    candidate_is_crypto,
+    holdings,
+    *,
+    posture="balanced",
+    broker_id="ROBINHOOD",
+    block_reason="",
+    now=None,
+    score_fn=None,
+    exit_roi_scale=1.0,
+    exit_time_scale=1.0,
+    ttp_arm_scale=1.0,
+    skip_regime_check=False,
+    need_dollars=None,
+    current_bp=None,
+):
+    """
+    Choose one held name to fully exit so we can fund candidate_ticker.
+    Returns dict {ticker, score, roi, value, is_crypto, reason, ...} or None.
+
+    When ``need_dollars`` is set (e.g. RH crypto floor $5 with BP under floor),
+    prefer a funder whose proceeds clear the shortfall. Still respects ROI / TTP /
+    fee / score-gap / daily rotate caps — never invents under-floor buys.
+    """
+    global _last_rotate_reject
+    _last_rotate_reject = ""
+    params = opportunity_swap_params(posture)
+    if not params.get("enabled"):
+        _last_rotate_reject = "safer posture"
+        return None
+
+    ok_day, day_why = rotation_allowed_today(broker_id, posture=posture)
+    if not ok_day:
+        _last_rotate_reject = day_why
+        return None
+
+    if params.get("freeze_on_regime_fail") and not skip_regime_check:
+        try:
+            regime_ok, regime_why = market_regime_ok(is_crypto=bool(candidate_is_crypto))
+        except Exception:
+            regime_ok, regime_why = False, "regime check failed"
+        if not regime_ok:
+            _last_rotate_reject = f"regime freeze ({regime_why or 'risk-off'})"
+            return None
+
+    cand = str(candidate_ticker or "").replace("-USD", "").upper()
+    if not cand:
+        return None
+    try:
+        cand_score = float(candidate_score or 0.0)
+    except (TypeError, ValueError):
+        cand_score = 0.0
+    gap = float(params["score_gap"])
+    roi_floor = float(params["roi_floor"])
+    buf = float(params["hard_stop_buffer"])
+    # Discretionary rotate edge must clear recycle fees + MIN_PROFIT_OVER_FEES_PCT
+    # (posture fee_buffer_pct is kept ≥ that floor; never grind pennies after friction).
+    fee_buf = max(
+        float(params.get("fee_buffer_pct") or 0.0),
+        float(MIN_PROFIT_OVER_FEES_PCT),
+    )
+    edge_per_pt = float(params.get("score_to_edge_pct") or 0.0015)
+    tnow = float(now if now is not None else time.time())
+    block = str(block_reason or "")
+    cluster_name = _parse_cluster_block(block)
+    cluster_members = set(CORRELATION_CLUSTERS.get(cluster_name) or ()) if cluster_name else set()
+    need_cluster_slot = bool(cluster_members)
+
+    try:
+        need_d = float(need_dollars) if need_dollars is not None else None
+    except (TypeError, ValueError):
+        need_d = None
+    try:
+        bp_now = float(current_bp) if current_bp is not None else 0.0
+    except (TypeError, ValueError):
+        bp_now = 0.0
+    shortfall = 0.0
+    if need_d is not None and need_d > 0:
+        shortfall = max(0.0, need_d - max(0.0, bp_now))
+
+    candidates = []
+    for h in holdings or []:
+        if not isinstance(h, dict):
+            continue
+        t = str(h.get("ticker") or "").replace("-USD", "").upper()
+        if not t or t == cand:
+            continue
+        is_c = bool(h.get("is_crypto")) or t in CRYPTO_TICKERS
+        try:
+            px = float(h.get("price") or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        try:
+            cost = float(h.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        try:
+            val = float(h.get("value") or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if cost > 0 and px > 0:
+            roi = (px - cost) / cost
+        else:
+            try:
+                roi = float(h.get("roi"))
+            except (TypeError, ValueError):
+                roi = 0.0
+
+        asset_type = h.get("asset_type") or ("cryptocurrency" if is_c else "stock")
+        hard_stop = -abs(float(get_stop_distance_pct(broker_id, ticker=t, asset_type=asset_type)))
+        if roi <= hard_stop + buf:
+            continue
+        if roi < roi_floor:
+            continue
+
+        held_m = holding_held_minutes(broker_id, t, now=tnow)
+        min_hold = float(params["min_hold_crypto_min"] if is_c else params["min_hold_equity_min"])
+        if held_m is not None and held_m < min_hold:
+            continue
+
+        if is_ttp_armed_holding(
+            broker_id, t, cost if cost > 0 else px, px if px > 0 else cost,
+            asset_type=asset_type,
+            exit_roi_scale=exit_roi_scale,
+            exit_time_scale=exit_time_scale,
+            ttp_arm_scale=ttp_arm_scale,
+        ):
+            continue
+
+        if need_cluster_slot and t not in cluster_members:
+            continue
+
+        hold_score = holding_opportunity_score(t, is_crypto=is_c, roi=roi, score_fn=score_fn)
+        score_delta = cand_score - hold_score
+        if score_delta < gap:
+            continue
+
+        # Fee-aware: expected edge from score gap must beat round-trip + buffer
+        # on the funding notional (sell + buy friction).
+        rt_fee = estimate_round_trip_fee_pct(broker_id, t, asset_type)
+        # Candidate buy also pays one-way; approximate full recycle as 1.5x RT on fund value
+        # (sell fund + buy cand ≈ 1.5–2x one name RT). Use max of fund and cand profiles.
+        rt_cand = estimate_round_trip_fee_pct(
+            broker_id, cand, "cryptocurrency" if candidate_is_crypto else "stock"
+        )
+        recycle_fee = max(rt_fee, rt_cand) * 1.25
+        edge_pct = float(score_delta) * edge_per_pt
+        if edge_pct < recycle_fee + fee_buf:
+            continue
+
+        same_sleeve = (bool(candidate_is_crypto) == bool(is_c))
+        clears_shortfall = True if shortfall <= 0 else (val + 1e-9 >= shortfall)
+        candidates.append({
+            "ticker": t,
+            "score": hold_score,
+            "roi": roi,
+            "value": val,
+            "is_crypto": is_c,
+            "same_sleeve": same_sleeve,
+            "clears_shortfall": clears_shortfall,
+            "price": px,
+            "avg_cost": cost,
+            "shares": float(h.get("shares") or 0.0),
+            "asset_type": asset_type,
+            "edge_pct": edge_pct,
+            "recycle_fee_pct": recycle_fee,
+            "fee_est": estimate_fee_dollars(val, broker_id, t, asset_type, round_trip=True),
+            "reason": (
+                f"score gap {score_delta:.0f} "
+                f"(cand {cand_score:.0f} vs hold {hold_score:.0f}, need +{gap:.0f}); "
+                f"roi {roi*100:.2f}%; edge {edge_pct*100:.2f}% vs fees {recycle_fee*100:.2f}%"
+            ),
+        })
+
+    if not candidates:
+        _last_rotate_reject = "no eligible funding name (ROI/TTP/hold/fees/gap)"
+        return None
+
+    if shortfall > 0:
+        clearing = [c for c in candidates if c.get("clears_shortfall")]
+        if not clearing:
+            _last_rotate_reject = (
+                f"no funder frees enough for broker floor "
+                f"(need ≥${shortfall:.2f} proceeds; BP ${bp_now:.2f})"
+            )
+            return None
+        candidates = clearing
+
+    candidates.sort(
+        key=lambda x: (
+            0 if x.get("same_sleeve") else 1,
+            0 if x.get("clears_shortfall") else 1,
+            float(x.get("score") or 0.0),
+            float(x.get("roi") or 0.0),
+            -float(x.get("value") or 0.0),
+        )
+    )
+    return candidates[0]
+
+
+def last_rotation_reject_reason():
+    return str(_last_rotate_reject or "")
+
+
+# =========================================================================
 # PRIMARY EVALUATION ENGINES
 # =========================================================================
 
@@ -1602,7 +2761,10 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     """
     Trailing take-profit / hard stop / time-stop.
     Fee thresholds change by broker so CB doesn't take thin RH-style exits.
-    Optional posture scales adjust time-exit / TTP-arm patience (hard stops unchanged).
+    ATR may widen hard_stop / trail / arm (capped at 2×); posture scales time / TTP-arm.
+    Profit-taking rails (TTP arm, time-green, time targets) are floored at
+    estimated RT fees + MIN_PROFIT_OVER_FEES_PCT. Hard stop and stale (red) exits
+    remain exempt so disasters / dead money can still clear.
     """
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
@@ -1613,8 +2775,8 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     if avg_cost <= 0:
         avg_cost = current_price
 
-    fees = apply_exit_posture(
-        _resolve_fee_profile(broker_id, ticker, asset_type),
+    fees = resolve_exit_fees(
+        broker_id, ticker, asset_type,
         exit_roi_scale=exit_roi_scale,
         exit_time_scale=exit_time_scale,
         ttp_arm_scale=ttp_arm_scale,

@@ -1,5 +1,9 @@
 """
-E*TRADE BaseBroker adapter — equities/ETFs only.
+E*TRADE BaseBroker adapter — equities/ETFs only (CORE / Breakouts stocks & ETFs).
+
+No crypto trading path: supports_crypto=False; buy/sell reject crypto tickers/asset types;
+orders use equity XML via ETradeClient.preview/place_equity_order only.
+(Andrew retail schedule lists crypto at 0.50% — unused by this autotrader.)
 
 Live order placement is gated by credentials['live_trading_enabled'] (default False).
 Sandbox environment may place against apisb sample responses for integration testing.
@@ -514,7 +518,7 @@ class ETradeAdapter(BaseBroker):
             return f"E*TRADE buy error: {e}", 0.0, None
 
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-                         market_hours="regular_hours", allow_fractional=True):
+                         market_hours="regular_hours", allow_fractional=True, sell_all=False):
         if self._reject_crypto(ticker, asset_type):
             return "E*TRADE does not support crypto via API", None
         ok, reason = self._orders_allowed()
@@ -522,6 +526,19 @@ class ETradeAdapter(BaseBroker):
             return reason, None
         if not self.is_connected or not self.client or not self.account_id_key:
             return "E*TRADE not connected", None
+
+        # No native sell-all / close-position in E*TRADE equity XML — refresh live qty on full exit.
+        if sell_all:
+            try:
+                sym = str(ticker).replace("-USD", "").upper()
+                for h in self.get_current_holdings() or []:
+                    if str(h.get("ticker") or "").upper() == sym:
+                        live = float(h.get("shares") or 0)
+                        if live > 0:
+                            shares_val = live
+                        break
+            except Exception:
+                pass
 
         qty = round_fractional_qty(shares_val) if allow_fractional else float(math.floor(float(shares_val)))
         if qty <= 0:
@@ -570,7 +587,8 @@ class ETradeAdapter(BaseBroker):
             placed = self.client.place_equity_order(self.account_id_key, place_xml)
             order_id = _extract_order_id(placed)
             self._last_order_meta[str(order_id)] = {"side": "SELL", "qty": qty, "symbol": str(ticker).upper()}
-            return f"E*TRADE Sell submitted ({price_type} {qty} {str(ticker).upper()})", order_id
+            label = "Sell-All" if sell_all else "Sell"
+            return f"E*TRADE {label} submitted ({price_type} {qty} {str(ticker).upper()})", order_id
         except Exception as e:
             return f"E*TRADE sell error: {e}", None
 
@@ -579,12 +597,21 @@ class ETradeAdapter(BaseBroker):
             return False, "crypto unsupported"
         if not self.client or not self.account_id_key:
             return False, "not connected"
+        self._last_fill_fee = None
         deadline = time.time() + max(3, int(timeout_sec))
         while time.time() < deadline:
             try:
                 data = self.client.list_orders(self.account_id_key, status=None)
                 # Search OPEN + recent — sandbox shapes vary
                 if _order_filled(data, order_id):
+                    try:
+                        from analytics import extract_fee_dollars_from_order
+                        fee = _extract_etrade_order_fee(data, order_id)
+                        if fee is None:
+                            fee = extract_fee_dollars_from_order(data)
+                        self._last_fill_fee = fee
+                    except Exception:
+                        self._last_fill_fee = _extract_etrade_order_fee(data, order_id)
                     return True, "FILLED"
                 if _order_terminal_reject(data, order_id):
                     return False, "REJECTED"
@@ -688,7 +715,13 @@ def normalize_etrade_holdings(data):
 
 
 def parse_etrade_balances(data):
-    """Return (equity, buying_power) from a balance payload; safe on odd XML shapes."""
+    """Return (equity, buying_power) from a balance payload; safe on odd XML shapes.
+
+    Sandbox payloads often omit CashBuyingPower or nest BP under alternate keys
+    (marginBuyingPower, settledCash, cashBalance). Live accounts usually have
+    Computed.CashBuyingPower. When every BP field is missing/zero, callers should
+    surface Sandbox / no BP UX rather than treating $0 as real buying power.
+    """
     if not isinstance(data, dict):
         return 0.0, 0.0
     bal = _as_dict(data.get("BalanceResponse") or data.get("balanceResponse") or data)
@@ -696,19 +729,47 @@ def parse_etrade_balances(data):
     rt = _as_dict(bal.get("RealTimeValues") or bal.get("realTimeValues"))
     if not rt:
         rt = _as_dict(computed.get("RealTimeValues") or computed.get("realTimeValues"))
-    bp_details = _as_dict(computed.get("BuyingPowerDetails") or computed.get("buyingPowerDetails"))
+    bp_details = _as_dict(
+        computed.get("BuyingPowerDetails")
+        or computed.get("buyingPowerDetails")
+        or bal.get("BuyingPowerDetails")
+        or bal.get("buyingPowerDetails")
+    )
+    cash = _as_dict(bal.get("Cash") or bal.get("cash") or computed.get("Cash") or computed.get("cash"))
+
     equity = (
-        _f(rt.get("totalAccountValue"))
-        or _f(bal.get("accountBalance"))
-        or _f(computed.get("CashBuyingPower") or computed.get("cashBuyingPower"))
+        _f(rt.get("totalAccountValue") or rt.get("TotalAccountValue"))
+        or _f(bal.get("accountBalance") or bal.get("AccountBalance"))
+        or _f(computed.get("accountBalance"))
         or 0.0
     )
-    bp = (
-        _f(computed.get("CashBuyingPower") or computed.get("cashBuyingPower"))
-        or _f(bp_details.get("cashBuyingPower"))
-        or _f(bal.get("cashBuyingPower"))
-        or 0.0
-    )
+    # Prefer cash/settled BP; fall back through common sandbox + margin aliases
+    bp_candidates = [
+        computed.get("CashBuyingPower"), computed.get("cashBuyingPower"),
+        computed.get("MarginBuyingPower"), computed.get("marginBuyingPower"),
+        computed.get("BuyingPower"), computed.get("buyingPower"),
+        bp_details.get("cashBuyingPower"), bp_details.get("CashBuyingPower"),
+        bp_details.get("marginBuyingPower"), bp_details.get("MarginBuyingPower"),
+        bp_details.get("buyingPower"), bp_details.get("BuyingPower"),
+        bal.get("cashBuyingPower"), bal.get("CashBuyingPower"),
+        bal.get("buyingPower"), bal.get("BuyingPower"),
+        cash.get("fundsForTrading"), cash.get("settledCash"), cash.get("cashAvailableForInvestment"),
+        cash.get("moneyMktBalance"), computed.get("settledCash"), computed.get("SettledCash"),
+        computed.get("cashBalance"), computed.get("CashBalance"),
+        rt.get("totalCash"), rt.get("netMv"),
+    ]
+    bp = 0.0
+    for c in bp_candidates:
+        v = _f(c)
+        if v > 0:
+            bp = v
+            break
+    if equity <= 0:
+        equity = (
+            _f(computed.get("CashBuyingPower") or computed.get("cashBuyingPower"))
+            or bp
+            or 0.0
+        )
     if equity <= 0 and bp > 0:
         equity = bp
     return float(equity), float(bp)
@@ -777,6 +838,36 @@ def _extract_order_id(data):
         elif isinstance(node, list):
             stack.extend(node)
     return f"et-{uuid.uuid4().hex[:10]}"
+
+
+def _extract_etrade_order_fee(data, order_id):
+    """Pull estimatedCommission / estimatedFees from a matching ET order node."""
+    oid = str(order_id)
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if str(node.get("orderId") or node.get("order_id") or "") == oid:
+                for key in (
+                    "estimatedCommission",
+                    "estimatedFees",
+                    "commission",
+                    "Commission",
+                    "fees",
+                    "fee",
+                ):
+                    if node.get(key) is None:
+                        continue
+                    try:
+                        val = float(node.get(key))
+                        if val >= 0:
+                            return val
+                    except (TypeError, ValueError):
+                        continue
+            stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
 
 
 def _order_filled(data, order_id):

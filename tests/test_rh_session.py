@@ -65,5 +65,38 @@ class TestRobinhoodPickleRestore(unittest.TestCase):
         )
 
 
+class TestRobinhoodSellAllQty(unittest.TestCase):
+    def test_whole_share_detection(self):
+        from broker import RobinhoodAdapter
+
+        self.assertTrue(RobinhoodAdapter._qty_is_whole_shares(10))
+        self.assertTrue(RobinhoodAdapter._qty_is_whole_shares(10.0))
+        self.assertTrue(RobinhoodAdapter._qty_is_whole_shares("3"))
+        self.assertFalse(RobinhoodAdapter._qty_is_whole_shares(10.5))
+        self.assertFalse(RobinhoodAdapter._qty_is_whole_shares(0.5))
+        self.assertFalse(RobinhoodAdapter._qty_is_whole_shares(0.0))
+
+    def test_fractional_full_exit_does_not_int_truncate(self):
+        """Regression: shares>=1 used int(qty) and left fractional dust."""
+        from broker import RobinhoodAdapter
+
+        adapter = RobinhoodAdapter()
+        adapter._live_sellable_qty = MagicMock(return_value=10.37)
+        adapter.confirm_order = MagicMock(return_value=(True, "filled"))
+        with patch("broker.r") as mock_r:
+            mock_r.order_sell_fractional_by_quantity.return_value = {"id": "ord-frac", "state": "filled"}
+            mock_r.order_sell_limit = MagicMock()
+            status, oid = adapter.place_sell_order(
+                "AAPL", "Ready (Stock)", 200.0, 10.0, 0.001, False,
+                sell_all=True,
+            )
+        self.assertIn("Sell-All", status)
+        self.assertEqual(oid, "ord-frac")
+        mock_r.order_sell_limit.assert_not_called()
+        mock_r.order_sell_fractional_by_quantity.assert_called_once()
+        sold_qty = mock_r.order_sell_fractional_by_quantity.call_args.args[1]
+        self.assertAlmostEqual(float(sold_qty), 10.37, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

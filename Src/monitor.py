@@ -1,13 +1,22 @@
 """
-Local read-only web monitor for Market Advisor.
-Serves a status dashboard + JSON API on localhost (default :8791).
-No trade controls — observe only.
+Local / remote web monitor for Market Advisor.
+Serves a status dashboard + JSON API (default :8791).
+
+- Localhost HTTP is fine for on-PC viewing.
+- LAN / port-forward use HTTPS + required Basic Auth so user/pass are TLS-encrypted
+  in transit. Failed logins are rate-limited / locked out.
+- Optional authenticated POST /api/auto for companion arm/disarm.
+- Optional authenticated POST /api/halt for Panic Halt All.
+No buy/sell endpoints.
 """
 import json
 import threading
 import base64
+import ssl
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 try:
     from version import APP_NAME, display_name, __version__ as APP_VERSION
@@ -17,6 +26,11 @@ except ImportError:
     def display_name():
         return f"{APP_NAME} {APP_VERSION}"
 
+try:
+    import monitor_tls
+except ImportError:
+    monitor_tls = None
+
 _lock = threading.RLock()
 _status = {
     "updated_at": None,
@@ -25,6 +39,7 @@ _status = {
     "mode": "LIVE",
     "market": "Unknown",
     "auto_trader": {"Robinhood": False, "Coinbase": False, "E*TRADE": False},
+    "brokers": {},
     "banner": "Offline",
     "balances": {
         "Robinhood": {"equity": 0.0, "cash": 0.0, "day_pnl": 0.0},
@@ -36,12 +51,30 @@ _status = {
     "recent_trades": [],
     "recent_log": [],
     "holdings_count": {"Robinhood": 0, "Coinbase": 0, "E*TRADE": 0},
+    "controls_enabled": False,
+    "tls": False,
+    "cert_fingerprint": "",
 }
 
 _auth_user = ""
 _auth_pass = ""
+_auth_required = False
+_controls_enabled = False
+_control_handler = None
+_halt_handler = None
 _server = None
 _thread = None
+_tls_enabled = False
+_cert_fingerprint = ""
+
+# Brute-force guard: client_ip -> {fails, locked_until}
+_auth_fail_lock = threading.Lock()
+_auth_failures = {}
+_AUTH_MAX_FAILS = 5
+_AUTH_WINDOW_SEC = 300
+_AUTH_LOCK_SEC = 900
+
+VALID_BROKERS = ("Robinhood", "Coinbase", "E*TRADE")
 
 
 def update_status(payload: dict):
@@ -49,17 +82,121 @@ def update_status(payload: dict):
     with _lock:
         for k, v in payload.items():
             _status[k] = v
+        _status["controls_enabled"] = bool(_controls_enabled)
+        _status["tls"] = bool(_tls_enabled)
+        _status["cert_fingerprint"] = _cert_fingerprint
         _status["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
 
 def get_status() -> dict:
     with _lock:
-        return json.loads(json.dumps(_status))
+        snap = json.loads(json.dumps(_status))
+        snap["controls_enabled"] = bool(_controls_enabled)
+        snap["tls"] = bool(_tls_enabled)
+        snap["cert_fingerprint"] = _cert_fingerprint
+        return snap
 
 
-def _check_auth(handler):
+def get_cert_fingerprint() -> str:
+    return _cert_fingerprint
+
+
+def set_control_handler(handler):
+    """Register GUI callback: handler(broker, armed) -> {"ok": bool, "error"?: str}."""
+    global _control_handler
+    _control_handler = handler
+
+
+def set_halt_handler(handler):
+    """Register GUI callback for Panic Halt All: handler() -> {"ok": bool, ...}."""
+    global _halt_handler
+    _halt_handler = handler
+
+
+def configure_controls(enabled: bool):
+    global _controls_enabled
+    _controls_enabled = bool(enabled)
+    with _lock:
+        _status["controls_enabled"] = _controls_enabled
+
+
+def _client_ip(handler) -> str:
+    try:
+        return handler.client_address[0] if handler.client_address else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _auth_is_locked(ip: str) -> bool:
+    now = time.time()
+    with _auth_fail_lock:
+        info = _auth_failures.get(ip) or {}
+        locked_until = float(info.get("locked_until") or 0)
+        if locked_until > now:
+            return True
+        # Expire old fail window
+        fails = info.get("fails") or []
+        fails = [t for t in fails if now - t < _AUTH_WINDOW_SEC]
+        if fails:
+            _auth_failures[ip] = {"fails": fails, "locked_until": 0}
+        elif ip in _auth_failures:
+            _auth_failures.pop(ip, None)
+        return False
+
+
+def _auth_lockout_remaining(ip: str) -> int:
+    """Seconds remaining on auth lockout for ip (0 if not locked)."""
+    now = time.time()
+    with _auth_fail_lock:
+        info = _auth_failures.get(ip) or {}
+        locked_until = float(info.get("locked_until") or 0)
+        if locked_until > now:
+            return max(1, int(locked_until - now + 0.999))
+        return 0
+
+
+def _auth_register_failure(ip: str):
+    now = time.time()
+    with _auth_fail_lock:
+        info = _auth_failures.get(ip) or {"fails": [], "locked_until": 0}
+        fails = [t for t in (info.get("fails") or []) if now - t < _AUTH_WINDOW_SEC]
+        fails.append(now)
+        locked_until = 0
+        if len(fails) >= _AUTH_MAX_FAILS:
+            locked_until = now + _AUTH_LOCK_SEC
+            fails = []
+        _auth_failures[ip] = {"fails": fails, "locked_until": locked_until}
+
+
+def _auth_register_success(ip: str):
+    with _auth_fail_lock:
+        _auth_failures.pop(ip, None)
+
+
+def clear_auth_lockouts():
+    """Clear all client IP auth failure / lockout state (GUI / local only)."""
+    with _auth_fail_lock:
+        _auth_failures.clear()
+
+
+def is_running() -> bool:
+    return _server is not None
+
+
+def describe_runtime() -> dict:
+    """Live monitor process state (not draft Settings widgets)."""
+    return {
+        "running": _server is not None,
+        "tls": bool(_tls_enabled),
+        "controls_enabled": bool(_controls_enabled),
+        "has_auth": bool(_auth_user),
+        "fingerprint": _cert_fingerprint or "",
+    }
+
+
+def _credentials_ok(handler) -> bool:
     if not _auth_user:
-        return True
+        return not _auth_required
     header = handler.headers.get("Authorization", "")
     if not header.startswith("Basic "):
         return False
@@ -71,6 +208,26 @@ def _check_auth(handler):
         return False
 
 
+def _check_auth(handler) -> bool:
+    """Return True if request is allowed. Records lockouts on failure when auth is set."""
+    ip = _client_ip(handler)
+    if _auth_is_locked(ip):
+        return False
+    if not _auth_user:
+        return not _auth_required
+    if _credentials_ok(handler):
+        _auth_register_success(ip)
+        return True
+    _auth_register_failure(ip)
+    return False
+
+
+def _require_auth_for_controls(handler):
+    if not _auth_user:
+        return False
+    return _check_auth(handler)
+
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -79,20 +236,27 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>Market Advisor Monitor</title>
 <style>
   :root {
-    --bg: #0f1115; --panel: #1a1d24; --text: #e8eaed; --muted: #9aa0a6;
-    --blue: #5b9fd4; --green: #3dd68c; --red: #f07178; --amber: #e6b450; --line: #2a2f3a;
+    /* Match desktop dark theme (gui.py UI_ACCENT / theme_colors) */
+    --bg: #0f1115; --panel: #1a1d24; --top: #151820; --text: #e8eaed; --muted: #9aa0a6;
+    --accent: #1f8a70; --accent-hover: #26a69a; --green: #00e676; --red: #ff5252;
+    --amber: #ffb300; --line: #2a2f3a;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; font-family: "Segoe UI", system-ui, sans-serif;
-    background: radial-gradient(900px 500px at 10% -10%, #1a2332 0%, var(--bg) 55%);
+    background: radial-gradient(900px 480px at 8% -8%, #16352c 0%, var(--bg) 52%);
     color: var(--text); min-height: 100vh;
     padding: 16px;
     padding-left: max(16px, env(safe-area-inset-left));
     padding-right: max(16px, env(safe-area-inset-right));
     padding-bottom: max(20px, env(safe-area-inset-bottom));
   }
-  h1 { font-size: 1.2rem; margin: 0 0 4px; font-weight: 650; letter-spacing: 0.02em; }
+  .brand {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    margin: 0 0 4px;
+  }
+  h1 { font-size: 1.25rem; margin: 0; font-weight: 650; letter-spacing: 0.02em; color: var(--text); }
+  .brand .tag { color: var(--accent); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.04em; }
   .sub { color: var(--muted); font-size: 0.82rem; margin-bottom: 14px; line-height: 1.35; }
   .grid { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
   .grid.metrics { grid-template-columns: 1fr; }
@@ -107,7 +271,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .pos { color: var(--green); } .neg { color: var(--red); } .neu { color: var(--text); }
   .banner {
     margin: 12px 0; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
-    background: #141820; font-weight: 600; font-size: 0.92rem; line-height: 1.35;
+    background: var(--top); font-weight: 600; font-size: 0.92rem; line-height: 1.35;
   }
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin-top: 8px; }
   table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 0.82rem; }
@@ -121,11 +285,32 @@ HTML_PAGE = """<!DOCTYPE html>
   .off { background: #22262e; color: var(--muted); }
   .log { font-family: ui-monospace, Consolas, monospace; font-size: 0.72rem; color: var(--muted);
          max-height: 200px; overflow: auto; white-space: pre-wrap; }
-  a { color: var(--blue); }
+  a { color: var(--accent-hover); }
+  .cluster-row { margin-top: 10px; }
+  .cluster-row:first-child { margin-top: 6px; }
+  .cluster-top {
+    display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+    font-size: 0.88rem; font-weight: 650;
+  }
+  .cluster-meta { color: var(--muted); font-size: 0.78rem; font-weight: 600; }
+  .cluster-bar {
+    height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 5px;
+  }
+  .cluster-fill { height: 100%; border-radius: 4px; }
+  .cluster-fill.ok { background: var(--accent); }
+  .cluster-fill.full { background: var(--red); }
+  .cluster-held {
+    color: var(--muted); font-size: 0.75rem; margin-top: 4px; text-transform: none;
+    letter-spacing: 0; font-weight: 500;
+  }
+  .badge-full {
+    display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; background: #3a1515; color: var(--red);
+  }
 
   @media (min-width: 640px) {
     body { padding: 20px; }
-    h1 { font-size: 1.35rem; }
+    h1 { font-size: 1.4rem; }
     .sub { font-size: 0.9rem; margin-bottom: 18px; }
     .grid { gap: 14px; grid-template-columns: repeat(4, 1fr); }
     .grid.metrics { grid-template-columns: repeat(3, 1fr); }
@@ -140,8 +325,8 @@ HTML_PAGE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>Market Advisor Monitor</h1>
-  <div class="sub"><span id="appver">—</span> · read-only · auto-refreshes · <span id="updated">—</span></div>
+  <div class="brand"><h1>Market Advisor</h1><span class="tag">MONITOR</span></div>
+  <div class="sub"><span id="appver">—</span> · <span id="modehint">read-only</span> · auto-refreshes · <span id="updated">—</span></div>
 
   <div class="grid">
     <div class="card"><div class="label">Mode</div><div class="value sm" id="mode">—</div></div>
@@ -150,6 +335,25 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="grid autos" id="auto_cards" style="margin-top:10px"></div>
 
   <div class="banner" id="banner">Waiting for app…</div>
+  <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <button id="halt_btn" style="background:#B71C1C;color:#fff;border:0;padding:8px 14px;border-radius:6px;font-weight:700;cursor:pointer">HALT ALL</button>
+    <span id="risk_bits" class="label" style="opacity:.85">—</span>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="label">Cluster Heat</div>
+    <div id="clusters"><div class="value sm" style="opacity:.7;font-size:0.9rem">—</div></div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="label">Risk · Stops · Shadow · Frac</div>
+    <div id="risk_panel" class="value sm" style="font-size:0.9rem;line-height:1.45">—</div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="label">Walk-forward (journal · bar)</div>
+    <div id="wf_panel" class="value sm" style="font-size:0.85rem;line-height:1.4;opacity:.9">—</div>
+  </div>
 
   <div class="grid metrics" style="margin-top:14px">
     <div class="card">
@@ -206,6 +410,10 @@ async function refresh(){
     document.getElementById('updated').textContent = 'Updated ' + (d.updated_at || '—');
     document.getElementById('mode').textContent = d.mode || '—';
     document.getElementById('market').textContent = d.market || '—';
+    const bits = [];
+    if(d.tls) bits.push('HTTPS');
+    bits.push(d.controls_enabled ? 'companion controls on' : 'read-only');
+    document.getElementById('modehint').textContent = bits.join(' · ');
     document.getElementById('banner').textContent = d.banner || '—';
     const c = (d.balances||{}).combined || {};
     document.getElementById('eq').textContent = money(c.equity);
@@ -228,13 +436,106 @@ async function refresh(){
     bHost.innerHTML = '';
     names.forEach(n=>{
       const b = (d.balances||{})[n] || {};
+      const info = (d.brokers||{})[n] || {};
+      const bits = [];
+      if(info.reauth_needed) bits.push('REAUTH');
+      if(info.dd_pause) bits.push('DD pause');
+      if(info.armed) bits.push('armed');
+      if(n==='E*TRADE'){
+        if(info.sandbox_no_bp) bits.push('Sandbox/no BP');
+        else if(info.environment) bits.push(String(info.environment));
+        bits.push('stops N/A');
+      }
       const card = document.createElement('div');
       card.className = 'card';
-      card.innerHTML = '<div class="label">'+n+'</div><div class="value sm">'+
+      card.innerHTML = '<div class="label">'+n+(bits.length?' · '+bits.join(' · '):'')+'</div><div class="value sm">'+
         money(b.equity)+' · cash '+money(b.cash)+
         ' · <span class="'+pnlClass(b.day_pnl)+'">'+money(b.day_pnl)+'</span></div>';
       bHost.appendChild(card);
     });
+
+    const risk = document.getElementById('risk_bits');
+    if(risk){
+      const ph = d.protective_health || {};
+      const heat = ((d.portfolio_heat||{}).combined) || {};
+      const bits = [];
+      bits.push('Stops missing: '+(ph.missing_count||0));
+      if(ph.fractional_na_count) bits.push('frac N/A: '+ph.fractional_na_count);
+      if(heat.open_risk_pct != null) bits.push('open risk '+Number(heat.open_risk_pct).toFixed(1)+'%');
+      if(heat.session_risk_used_pct != null) bits.push('session '+Number(heat.session_risk_used_pct).toFixed(0)+'%');
+      if(heat.dd_paused) bits.push('DD pause');
+      if(d.halted) bits.push('HALTED');
+      risk.textContent = bits.join(' · ');
+    }
+    const riskPanel = document.getElementById('risk_panel');
+    if(riskPanel){
+      const ph = d.protective_health || {};
+      const heat = ((d.portfolio_heat||{}).combined) || {};
+      const sg = d.shadow_guard || {};
+      const fp = d.frac_policy || {};
+      const et = d.etrade || {};
+      const lines = [];
+      lines.push('Open risk ≈ $'+Number(heat.open_risk_dollars||0).toFixed(2)+
+        ' ('+Number(heat.open_risk_pct||0).toFixed(1)+'% eq) · session '+
+        Number(heat.session_risk_used_pct||0).toFixed(0)+'%');
+      lines.push('Stops missing '+(ph.missing_count||0)+
+        (ph.fractional_na_count ? (' · fractional N/A '+ph.fractional_na_count) : '')+
+        ' · Repair skips E*TRADE (stops N/A)');
+      lines.push('Shadow: '+(sg.status||sg.tip||'—')+
+        (sg.tighten ? (' · size×'+Number(sg.size_mult||1).toFixed(2)) : ''));
+      lines.push('Frac policy: prefer whole='+(fp.prefer_whole_shares?'yes':'no')+
+        ' · TTP-only frac='+(fp.allow_ttp_only?'yes':'no'));
+      if(et.note) lines.push('E*TRADE: '+et.note+(et.sandbox_no_bp?' (sandbox BP stub)':''));
+      lines.push('Mode '+(d.mode||'—')+(d.halted?' · HALTED':''));
+      riskPanel.textContent = lines.join('\\n');
+      riskPanel.style.whiteSpace = 'pre-wrap';
+    }
+    const wfPanel = document.getElementById('wf_panel');
+    if(wfPanel){
+      const wf = d.walk_forward || {};
+      const j = wf.journal || {};
+      const b = wf.bar || {};
+      const jn = j.note || (j.oos_steps!=null ? ('Journal folds: '+j.oos_steps+' OOS · net '+Number(j.oos_net_sum||0).toFixed(2)) : 'Journal folds: —');
+      const bn = b.note || (b.n_trades!=null ? ('Bar WF: '+b.n_trades+' trades · OOS '+Number(b.oos_net_sum||0).toFixed(2)) : 'Bar walk-forward: —');
+      wfPanel.textContent = jn + '\\n' + bn;
+      wfPanel.style.whiteSpace = 'pre-wrap';
+    }
+    const cHost = document.getElementById('clusters');
+    if(cHost){
+      const ch = (d.cluster_heat || []).filter(x => x && (x.count > 0 || x.full));
+      if(!ch.length){
+        cHost.innerHTML = '<div class="value sm" style="opacity:.7;font-size:0.9rem">No holdings in tracked clusters…</div>';
+      } else {
+        cHost.innerHTML = ch.map(x => {
+          const mx = Math.max(1, Number(x.max)||2);
+          const n = Math.min(mx, Number(x.count)||0);
+          const pct = Math.round(100 * n / mx);
+          const full = !!x.full || n >= mx;
+          const held = (x.held || []).join(', ') || '—';
+          return '<div class="cluster-row">' +
+            '<div class="cluster-top"><span>'+x.name+
+            (full ? '<span class="badge-full">FULL</span>' : '')+
+            '</span><span class="cluster-meta">'+n+'/'+mx+
+            (full ? '' : ' · room')+'</span></div>' +
+            '<div class="cluster-bar"><div class="cluster-fill '+(full?'full':'ok')+
+            '" style="width:'+pct+'%"></div></div>' +
+            '<div class="cluster-held">'+held+'</div></div>';
+        }).join('');
+      }
+    }
+    const haltBtn = document.getElementById('halt_btn');
+    if(haltBtn && !haltBtn._bound){
+      haltBtn._bound = true;
+      haltBtn.onclick = async ()=>{
+        if(!confirm('Panic Halt All brokers?')) return;
+        try{
+          const r = await fetch('/api/halt', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+          const j = await r.json();
+          alert(j.ok ? 'Halted' : ('Halt failed: '+(j.error||r.status)));
+          refresh();
+        }catch(e){ alert('Halt failed: '+e); }
+      };
+    }
 
     const tb = document.getElementById('trades');
     tb.innerHTML = '';
@@ -261,23 +562,71 @@ setInterval(refresh, 3000);
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        # Keep console quiet unless errors
         if self.path.startswith("/api") and "404" in str(args):
             return
         return
 
-    def _unauthorized(self):
+    def _unauthorized(self, locked=False):
+        remaining = _auth_lockout_remaining(_client_ip(self)) if locked else 0
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="MarketAdvisor Monitor"')
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/json")
+        if locked and remaining > 0:
+            self.send_header("Retry-After", str(remaining))
         self.end_headers()
-        self.wfile.write(b"Unauthorized")
+        if locked:
+            msg = {
+                "ok": False,
+                "error": (
+                    f"Too many failed logins — try again in {remaining}s"
+                    if remaining > 0
+                    else "Too many failed logins — try again later"
+                ),
+            }
+            if remaining > 0:
+                msg["lockout_seconds"] = remaining
+        else:
+            msg = {"ok": False, "error": "Unauthorized"}
+        self.wfile.write(json.dumps(msg).encode("utf-8"))
+
+    def _json_response(self, code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0 or length > 65536:
+            return None
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
 
     def do_GET(self):
-        if not _check_auth(self):
-            self._unauthorized()
+        path = urlparse(self.path).path
+        # Public: cert fingerprint for companion TOFU / pin check (not a secret)
+        if path.startswith("/api/tls"):
+            self._json_response(200, {
+                "tls": bool(_tls_enabled),
+                "fingerprint": _cert_fingerprint,
+                "algo": "sha256",
+            })
             return
-        if self.path in ("/", "/index.html"):
+
+        ip = _client_ip(self)
+        if _auth_is_locked(ip):
+            self._unauthorized(locked=True)
+            return
+        if not _check_auth(self):
+            self._unauthorized(locked=_auth_is_locked(ip))
+            return
+        if path in ("/", "/index.html"):
             body = HTML_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -285,7 +634,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if self.path.startswith("/api/status"):
+        if path.startswith("/api/status"):
             body = json.dumps(get_status()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -297,21 +646,181 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in ("/api/auto", "/api/halt"):
+            self.send_response(404)
+            self.end_headers()
+            return
 
-def start_monitor(host="127.0.0.1", port=8791, username="", password=""):
-    """Start the monitor HTTP server in a daemon thread. Returns (ok, message)."""
-    global _server, _thread, _auth_user, _auth_pass
+        if not _controls_enabled:
+            self._json_response(403, {
+                "ok": False,
+                "error": "Remote controls are disabled. Enable Companion Controls in Settings.",
+            })
+            return
+
+        ip = _client_ip(self)
+        if _auth_is_locked(ip):
+            self._unauthorized(locked=True)
+            return
+        if not _require_auth_for_controls(self):
+            self._unauthorized(locked=_auth_is_locked(ip))
+            return
+
+        if path == "/api/halt":
+            handler = _halt_handler
+            if handler is None:
+                self._json_response(503, {"ok": False, "error": "App halt handler not ready"})
+                return
+            try:
+                result = handler()
+            except Exception as e:
+                self._json_response(500, {"ok": False, "error": str(e)})
+                return
+            if not isinstance(result, dict):
+                result = {"ok": bool(result)}
+            code = 200 if result.get("ok") else 400
+            self._json_response(code, result)
+            return
+
+        data = self._read_json_body()
+        if not isinstance(data, dict):
+            self._json_response(400, {"ok": False, "error": "Expected JSON body"})
+            return
+
+        handler = _control_handler
+        if handler is None:
+            self._json_response(503, {"ok": False, "error": "App control handler not ready"})
+            return
+
+        # Batch: {"brokers": {"Robinhood": true, "Coinbase": false}}
+        # Single: {"broker": "Robinhood", "armed"|"enabled": true}
+        brokers_map = data.get("brokers")
+        if isinstance(brokers_map, dict) and brokers_map:
+            results = {}
+            all_ok = True
+            for name, want in brokers_map.items():
+                broker = str(name).strip()
+                if broker not in VALID_BROKERS:
+                    results[broker] = {
+                        "ok": False,
+                        "error": f"broker must be one of: {', '.join(VALID_BROKERS)}",
+                    }
+                    all_ok = False
+                    continue
+                armed = bool(want)
+                try:
+                    result = handler(broker, armed)
+                except Exception as e:
+                    result = {"ok": False, "error": str(e)}
+                if not isinstance(result, dict):
+                    result = {"ok": bool(result)}
+                results[broker] = result
+                if not result.get("ok"):
+                    all_ok = False
+            self._json_response(
+                200 if all_ok else 400,
+                {"ok": all_ok, "results": results},
+            )
+            return
+
+        broker = str(data.get("broker", "")).strip()
+        if broker not in VALID_BROKERS:
+            self._json_response(400, {
+                "ok": False,
+                "error": f"broker must be one of: {', '.join(VALID_BROKERS)}",
+            })
+            return
+
+        if "armed" in data:
+            armed = bool(data.get("armed"))
+        elif "enabled" in data:
+            armed = bool(data.get("enabled"))
+        else:
+            self._json_response(
+                400,
+                {"ok": False, "error": "Missing boolean field 'armed' (or 'enabled')"},
+            )
+            return
+
+        try:
+            result = handler(broker, armed)
+        except Exception as e:
+            self._json_response(500, {"ok": False, "error": str(e)})
+            return
+
+        if not isinstance(result, dict):
+            result = {"ok": bool(result)}
+        code = 200 if result.get("ok") else 400
+        self._json_response(code, result)
+
+
+def start_monitor(
+    host="127.0.0.1",
+    port=8791,
+    username="",
+    password="",
+    controls_enabled=False,
+    use_tls=False,
+):
+    """Start the monitor HTTP(S) server in a daemon thread. Returns (ok, message)."""
+    global _server, _thread, _auth_user, _auth_pass, _controls_enabled
+    global _auth_required, _tls_enabled, _cert_fingerprint
     if _server is not None:
-        return True, f"Monitor already running on http://{host}:{port}"
+        scheme = "https" if _tls_enabled else "http"
+        return True, f"Monitor already running on {scheme}://{host}:{port}"
 
+    host = (host or "127.0.0.1").strip()
+    remote_bind = host not in ("127.0.0.1", "localhost", "::1")
     _auth_user = (username or "").strip()
     _auth_pass = password or ""
+    _auth_required = bool(remote_bind) or bool(use_tls)
+    if _auth_required and not _auth_user:
+        return False, "Remote / HTTPS monitor requires User + Pass (refused to start open)"
+
+    # Force TLS for anything reachable beyond loopback
+    want_tls = bool(use_tls) or remote_bind
+    _tls_enabled = False
+    _cert_fingerprint = ""
+    if want_tls:
+        if monitor_tls is None:
+            return False, "HTTPS requested but monitor_tls module missing"
+        try:
+            cert_file, key_file, fp = monitor_tls.ensure_tls_material()
+            _cert_fingerprint = fp
+        except Exception as e:
+            return False, f"TLS cert setup failed: {e}"
+
+    _controls_enabled = bool(controls_enabled) and bool(_auth_user)
+    with _lock:
+        _status["controls_enabled"] = _controls_enabled
+        _status["tls"] = False
+        _status["cert_fingerprint"] = _cert_fingerprint
 
     try:
         _server = ThreadingHTTPServer((host, int(port)), _Handler)
+        if want_tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+            _server.socket = ctx.wrap_socket(_server.socket, server_side=True)
+            _tls_enabled = True
     except OSError as e:
         _server = None
         return False, f"Monitor bind failed: {e}"
+    except Exception as e:
+        try:
+            if _server is not None:
+                _server.server_close()
+        except Exception:
+            pass
+        _server = None
+        return False, f"Monitor TLS wrap failed: {e}"
+
+    with _lock:
+        _status["tls"] = _tls_enabled
+        _status["cert_fingerprint"] = _cert_fingerprint
 
     def _run():
         try:
@@ -321,12 +830,15 @@ def start_monitor(host="127.0.0.1", port=8791, username="", password=""):
 
     _thread = threading.Thread(target=_run, name="MA-Monitor", daemon=True)
     _thread.start()
+    scheme = "https" if _tls_enabled else "http"
     auth_note = " (Basic Auth on)" if _auth_user else ""
-    return True, f"Monitor at http://{host}:{port}/{auth_note}"
+    ctrl_note = " · controls on" if _controls_enabled else ""
+    tls_note = f" · pin {_cert_fingerprint[:17]}…" if _cert_fingerprint else ""
+    return True, f"Monitor at {scheme}://{host}:{port}/{auth_note}{ctrl_note}{tls_note}"
 
 
 def stop_monitor():
-    global _server, _thread
+    global _server, _thread, _tls_enabled
     if _server is not None:
         try:
             _server.shutdown()
@@ -338,3 +850,4 @@ def stop_monitor():
             pass
         _server = None
         _thread = None
+        _tls_enabled = False

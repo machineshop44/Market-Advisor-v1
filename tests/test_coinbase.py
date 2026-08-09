@@ -97,6 +97,95 @@ class TestCbLiveTradingGate(unittest.TestCase):
         self.assertIsNone(sell_oid)
         cb.client.market_order_buy.assert_not_called()
         cb.client.market_order_sell.assert_not_called()
+        cb.client.close_position.assert_not_called()
+
+
+class TestCbSellAll(unittest.TestCase):
+    def test_sell_all_prefers_close_position(self):
+        from broker import CoinbaseAdapter
+
+        cb = CoinbaseAdapter()
+        cb.is_connected = True
+        cb.live_trading_enabled = True
+        cb.client = MagicMock()
+        cb._fetch_all_accounts = MagicMock(return_value=[
+            {"currency": "BTC", "available_balance": {"value": "0.01234567"}, "hold": {"value": "0"}},
+        ])
+        cb._get_product_limits = MagicMock(return_value={
+            "base_increment": 0.00000001,
+            "base_min_size": 0.00000001,
+            "quote_min_size": 1.0,
+        })
+        cb.confirm_order = MagicMock(return_value=(True, "filled"))
+        cb.client.close_position.return_value = {
+            "success": True,
+            "success_response": {"order_id": "close-1"},
+        }
+        status, oid = cb.place_sell_order(
+            "BTC", "crypto", 50000.0, 0.01, 0.0, False, sell_all=True,
+        )
+        self.assertIn("Sell-All", status)
+        self.assertEqual(oid, "close-1")
+        cb.client.close_position.assert_called_once()
+        kwargs = cb.client.close_position.call_args.kwargs
+        self.assertEqual(kwargs.get("product_id"), "BTC-USD")
+        self.assertTrue(float(kwargs.get("size") or 0) > 0)
+        cb.client.market_order_sell.assert_not_called()
+
+    def test_sell_all_falls_back_to_market_sell(self):
+        from broker import CoinbaseAdapter
+
+        cb = CoinbaseAdapter()
+        cb.is_connected = True
+        cb.live_trading_enabled = True
+        cb.client = MagicMock()
+        cb._fetch_all_accounts = MagicMock(return_value=[
+            {"currency": "ETH", "available_balance": {"value": "0.5"}, "hold": {"value": "0"}},
+        ])
+        cb._get_product_limits = MagicMock(return_value={
+            "base_increment": 0.0001,
+            "base_min_size": 0.0001,
+            "quote_min_size": 1.0,
+        })
+        cb.confirm_order = MagicMock(return_value=(True, "filled"))
+        cb.client.close_position.return_value = {"success": False, "error_response": "unsupported"}
+        cb.client.market_order_sell.return_value = {
+            "success": True,
+            "success_response": {"order_id": "mkt-9"},
+        }
+        status, oid = cb.place_sell_order(
+            "ETH", "crypto", 3000.0, 0.4, 0.0, False, sell_all=True,
+        )
+        self.assertIn("Sell-All", status)
+        self.assertEqual(oid, "mkt-9")
+        cb.client.market_order_sell.assert_called_once()
+        base = cb.client.market_order_sell.call_args.kwargs.get("base_size")
+        self.assertAlmostEqual(float(base), 0.5, places=6)
+
+    def test_partial_sell_skips_close_position(self):
+        from broker import CoinbaseAdapter
+
+        cb = CoinbaseAdapter()
+        cb.is_connected = True
+        cb.live_trading_enabled = True
+        cb.client = MagicMock()
+        cb._get_product_limits = MagicMock(return_value={
+            "base_increment": 0.0001,
+            "base_min_size": 0.0001,
+            "quote_min_size": 1.0,
+        })
+        cb.confirm_order = MagicMock(return_value=(True, "filled"))
+        cb.client.market_order_sell.return_value = {
+            "success": True,
+            "success_response": {"order_id": "partial-1"},
+        }
+        status, oid = cb.place_sell_order(
+            "BTC", "crypto", 50000.0, 0.01, 0.0, False, sell_all=False,
+        )
+        self.assertIn("Coinbase Sell", status)
+        self.assertNotIn("Sell-All", status)
+        cb.client.close_position.assert_not_called()
+        cb.client.market_order_sell.assert_called_once()
 
 
 class TestCbRetryHelper(unittest.TestCase):

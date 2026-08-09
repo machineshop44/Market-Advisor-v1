@@ -6,4 +6,6 @@ coinbase-advanced-py
 finvizfinance
 requests
 requests-oauthlib
-keyring
+cryptography
+qrcode[pil]
+Pillow

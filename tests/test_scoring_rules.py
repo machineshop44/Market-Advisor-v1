@@ -45,17 +45,25 @@ class TestHardStopCooldown(unittest.TestCase):
 class TestAtrSizingStop(unittest.TestCase):
     def test_sizing_widens_toward_atr(self):
         import scoring
-        base = scoring.get_stop_distance_pct("ROBINHOOD", ticker="SPY", asset_type="stock")
-        with patch("scoring._atr_pct", return_value=0.04):
+        # Fee-profile base (no ATR) — don't call live yfinance
+        with patch("scoring._atr_pct", return_value=None):
+            base = scoring.get_stop_distance_pct(
+                "ROBINHOOD", ticker="SPY", asset_type="stock"
+            )
+        atr = 0.04
+        with patch("scoring._atr_pct", return_value=atr):
             widened = scoring.get_stop_distance_pct(
                 "ROBINHOOD", ticker="SPY", asset_type="stock", for_sizing=True
             )
+            # Exits share the same ATR widen (for_sizing is informational only)
+            exit_d = scoring.get_stop_distance_pct(
+                "ROBINHOOD", ticker="SPY", asset_type="stock", for_sizing=False
+            )
+        expected = min(max(base, atr * scoring.ATR_SIZING_MULT), base * scoring.ATR_SIZING_CAP_MULT)
         self.assertGreater(widened, base)
         self.assertLessEqual(widened, base * scoring.ATR_SIZING_CAP_MULT)
-        # Exit hard-stop distance unchanged when for_sizing=False
-        with patch("scoring._atr_pct", return_value=0.04):
-            exit_d = scoring.get_stop_distance_pct("ROBINHOOD", ticker="SPY", asset_type="stock")
-        self.assertAlmostEqual(exit_d, base)
+        self.assertAlmostEqual(widened, expected)
+        self.assertAlmostEqual(exit_d, widened)
 
     def test_evaluate_holding_tags_hard_stop(self):
         import scoring
