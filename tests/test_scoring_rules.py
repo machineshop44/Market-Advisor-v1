@@ -80,6 +80,32 @@ class TestAtrSizingStop(unittest.TestCase):
         cool = scoring._cooldown_memory["ROBINHOOD"].get("META") or {}
         self.assertEqual(cool.get("reason"), "hard_stop")
 
+    def test_evaluate_holding_dust_basis_not_mega_roi_sell(self):
+        """Dust RH cost_bases must not invent TTP / time-green mega-wins."""
+        import scoring
+        for bid in scoring._KNOWN_BROKER_IDS:
+            scoring._cooldown_memory[bid] = {}
+            scoring._portfolio_memory[bid] = {}
+            scoring._loss_streak[bid] = {"events": [], "pause_until": 0.0}
+        with patch("scoring.save_state"):
+            action = scoring.evaluate_holding(
+                "SOL", avg_cost=0.0007, broker_id="ROBINHOOD",
+                asset_type="cryptocurrency", live_price=150.0,
+            )
+        self.assertNotIn("TTP Armed", action)
+        self.assertNotIn("TTP Triggered", action)
+        self.assertNotIn("Time-Green", action)
+        self.assertNotIn("Time-Stop", action)
+        self.assertIn("HOLD", action)
+        self.assertIn("Unknown Cost", action)
+        self.assertNotRegex(action, r"\+[0-9]{4,}")
+
+    def test_usable_holding_cost_dust(self):
+        import scoring
+        self.assertEqual(scoring._usable_holding_cost(0.001, 100.0), 0.0)
+        self.assertAlmostEqual(scoring._usable_holding_cost(99.0, 100.0), 99.0)
+        self.assertEqual(scoring._usable_holding_cost(0, 100.0), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -401,7 +401,7 @@ def format_reports_hero(
     window_label: str = "",
 ) -> str:
     """
-    Lifetime / window P&L story first; counts secondary.
+    Hero = net after fees first (money honesty), then fee drag + trade count.
     money_fmt(x) -> currency string; defaults to plain $ formatting.
     """
     def _m(x):
@@ -418,15 +418,25 @@ def format_reports_hero(
     hold = s.get("avg_hold_min")
     hold_txt = f"{hold:.0f}m" if hold is not None else "—"
     win_lbl = f" · {window_label}" if window_label else ""
+    buys = int(s.get("buys") or 0)
+    sells = int(s.get("sells") or 0)
+    rotates = int(s.get("rotates") or 0)
+    trades = buys + sells
+    net = s.get("net_after_fees")
+    if net is None:
+        try:
+            net = float(s.get("realized_pnl") or 0) - float(s.get("fee_est") or 0)
+        except (TypeError, ValueError):
+            net = 0.0
     hero = (
-        f"Realized P&L {_m(s.get('realized_pnl'))}{win_lbl} · "
-        f"Est. fees {_m(s.get('fee_est'))} "
+        f"Net≈ {_m(net)}{win_lbl} · "
+        f"Realized {_m(s.get('realized_pnl'))} − fees {_m(s.get('fee_est'))} "
         f"({float(s.get('fee_drag_pct') or 0):.2f}% drag) · "
-        f"Net≈ {_m(s.get('net_after_fees'))}"
+        f"{trades} trades"
     )
     secondary = (
-        f"Buys {s.get('buys', 0)} · Sells {s.get('sells', 0)} · "
-        f"Rotates {s.get('rotates', 0)} · Win rate {wr_txt} · Avg hold {hold_txt} · "
+        f"Buys {buys} · Sells {sells} · Rotates {rotates} · "
+        f"Win rate {wr_txt} · Avg hold {hold_txt} · "
         f"Turnover {_m(s.get('turnover'))}"
     )
     return f"{hero}\n{secondary}"

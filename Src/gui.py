@@ -88,7 +88,10 @@ ACTIVITY_LOG_DISK_CHECK_EVERY = 100  # rotate check every N disk appends
 _STOP_REPAIR_PASS_COOLDOWN_SEC = 180
 _STOP_REPAIR_TICKER_COOLDOWN_SEC = 1800
 _STOP_REPAIR_MAX_PER_PASS = 8
-KNOWN_CRYPTOS = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
+KNOWN_CRYPTOS = {
+    "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
+    "FET", "AMP", "ADA", "DOT", "MATIC", "ATOM", "LTC", "BCH", "XRP", "NEAR", "AAVE",
+}
 BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
 
 
@@ -203,13 +206,14 @@ def load_settings():
         "exit_roi_scale": 1.0,
         "exit_time_scale": 1.0,
         "ttp_arm_scale": 1.0,
+        "allow_flat_time_banks": False,  # Safer/Balanced: TTP trail only
         "limit_offset_pct": 0.1,
         "risk_pct_per_trade": 0.75,
         "max_open_risk_pct": 6.0,
         "daily_profit_target": 0.0,
         "daily_loss_limit": 8.0,
         "max_open_positions": 8,
-        "max_buys_per_cycle": 2,
+        "max_buys_per_cycle": 1,
         "interval_crypto": 45,
         "interval_penny": 60,
         "interval_core": 300,
@@ -1247,6 +1251,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._buy_skip_throttle = {}  # (broker, kind) -> last log ts (BP/rotate spam)
         self._scan_drop_throttle = {}  # (broker, engine, ticker) -> last log ts
         self._cost_unknown_logged = set()  # "Broker:TICKER" cost-basis unknown once
+        self._cost_seeded_logged = set()  # "Broker:TICKER:source" seeded-once log
         self._sell_fail_backoff = {}  # (broker, ticker) -> {reason, ts} hopeless sell defer
         self._sell_fail_backoff_ttl_sec = 1800  # 30m TTL; also clears when fail reason changes
         self._frac_buy_defer_log = {}  # (broker, ticker, session) -> True once-per-session
@@ -1255,7 +1260,11 @@ class MarketAdvisorGUI(QMainWindow):
         self._last_idle_balance_refresh = 0.0
         self._startup_connect_finished = False
         self.cost_basis_cache = _blank_broker_map(lambda: {})
+        self._cost_basis_persist_ts = 0.0
+        self._journal_basis_rows = None  # lazy journal snapshot for VWAP seed
+        self._journal_basis_rows_ts = 0.0
         self._scoring_state_loaded = False
+        self._restore_cost_basis_cache()
         self.last_crypto_time = _blank_broker_map(0)
         self.last_penny_time = _blank_broker_map(0)
         self.last_core_time = _blank_broker_map(0)
@@ -1867,18 +1876,29 @@ class MarketAdvisorGUI(QMainWindow):
     # ---------------------------------------------------------
     #  SYNCHRONIZATION & DISCORD
     # ---------------------------------------------------------
-    def is_locked(self, ticker):
+    def is_locked(self, ticker, is_crypto=False):
         key = f"{self.cycle_broker_name}:{ticker}"
-        if key in self.trade_locks:
-            if time.time() - self.trade_locks[key] < 300: 
-                return True
-            else:
-                del self.trade_locks[key]
+        if key not in self.trade_locks:
+            return False
+        crypto_flag = bool(is_crypto) or bool(self.trade_locks.get(f"{key}:crypto"))
+        try:
+            from scoring import trade_lock_seconds
+            lock_sec = trade_lock_seconds(is_crypto=crypto_flag)
+        except Exception:
+            lock_sec = 600 if crypto_flag else 300
+        if time.time() - self.trade_locks[key] < lock_sec:
+            return True
+        del self.trade_locks[key]
+        self.trade_locks.pop(f"{key}:crypto", None)
         return False
 
-    def set_lock(self, ticker):
+    def set_lock(self, ticker, is_crypto=False):
         key = f"{self.cycle_broker_name}:{ticker}"
         self.trade_locks[key] = time.time()
+        if is_crypto:
+            self.trade_locks[f"{key}:crypto"] = 1
+        else:
+            self.trade_locks.pop(f"{key}:crypto", None)
 
     def _persist_session_baselines(self):
         """Save day-start equity so Day P&L survives app restarts."""
@@ -1887,6 +1907,50 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["pnl_baseline_cb"] = self.session_starts.get("Coinbase")
         self.settings["pnl_baseline_et"] = self.session_starts.get("E*TRADE")
         save_settings(self.settings)
+
+    def _restore_cost_basis_cache(self):
+        """Load last-known avg costs so crypto bags can trail-ride after restart."""
+        try:
+            import cost_basis as cb_mod
+            raw = self.settings.get("cost_basis_cache") or {}
+            restored = cb_mod.normalize_cache_map(raw)
+            for broker, tickers in restored.items():
+                bucket = self.cost_basis_cache.setdefault(broker, {})
+                for t, c in tickers.items():
+                    if c > 0 and float(bucket.get(t) or 0) <= 0:
+                        bucket[t] = float(c)
+        except Exception:
+            pass
+
+    def _persist_cost_basis_cache(self, *, force: bool = False):
+        """Throttle-write last-known cost basis into settings (survives restart)."""
+        now = time.time()
+        last = float(getattr(self, "_cost_basis_persist_ts", 0.0) or 0.0)
+        if not force and (now - last) < 20.0:
+            return
+        try:
+            import cost_basis as cb_mod
+            payload = cb_mod.cache_to_persistable(self.cost_basis_cache)
+            self.settings["cost_basis_cache"] = payload
+            save_settings(self.settings)
+            self._cost_basis_persist_ts = now
+        except Exception:
+            pass
+
+    def _journal_rows_for_basis(self, *, max_age_sec: float = 90.0):
+        """Cached journal snapshot for inventory VWAP seeding."""
+        now = time.time()
+        rows = getattr(self, "_journal_basis_rows", None)
+        ts = float(getattr(self, "_journal_basis_rows_ts", 0.0) or 0.0)
+        if rows is not None and (now - ts) < max_age_sec:
+            return rows
+        try:
+            rows = journal.read_since_days(days=-1, limit=8000)
+        except Exception:
+            rows = []
+        self._journal_basis_rows = rows
+        self._journal_basis_rows_ts = now
+        return rows
 
     def _restore_session_baselines(self):
         today = str(datetime.now().date())
@@ -1972,44 +2036,82 @@ class MarketAdvisorGUI(QMainWindow):
             assets = normalized
         elif not isinstance(assets, list):
             assets = list(assets) if assets else []
-        # Coinbase API has no reliable avg cost — overlay tracked buys from cost_basis_cache only.
-        # Never invent live price as cost (that zeros ROI and enables bad scale-ins).
-        # RH/ET: seed cost_basis_cache from broker-reported avg cost when present.
+        # Prefer sane broker avg (RH cost_basis / CB portfolio breakdown); else
+        # journal VWAP → tracked → last-known. Never invent live mark as cost.
+        import cost_basis as cb_mod
         cache = self.cost_basis_cache.setdefault(broker_name, {})
         unknown_log = getattr(self, "_cost_unknown_logged", None)
         if unknown_log is None:
             self._cost_unknown_logged = set()
             unknown_log = self._cost_unknown_logged
+        seeded_log = getattr(self, "_cost_seeded_logged", None)
+        if seeded_log is None:
+            self._cost_seeded_logged = set()
+            seeded_log = self._cost_seeded_logged
+        journal_rows = None
+        cache_dirty = False
         for a in assets:
             if not isinstance(a, dict):
                 continue
             ticker = a.get("ticker")
             if not ticker:
                 continue
-            tu = str(ticker).upper()
+            tu = cb_mod.normalize_ticker(ticker)
+            a["ticker"] = tu
             try:
                 cost = float(a.get("cost") or 0.0)
             except (TypeError, ValueError):
                 cost = 0.0
-            cached = 0.0
+            cached = cb_mod.cache_lookup(self.cost_basis_cache, broker_name, tu)
             try:
-                cached = float(cache.get(ticker) or cache.get(tu) or 0.0)
+                mark = float(a.get("price") or a.get("mark") or a.get("live_price") or 0.0)
             except (TypeError, ValueError):
-                cached = 0.0
-            if cost > 0:
-                # Prefer live broker avg cost; keep cache in sync for TTP/scale-in
-                cache[ticker] = cost
-                if tu != ticker:
-                    cache[tu] = cost
-            elif cached > 0:
-                a["cost"] = cached
-                cost = cached
-            # else: leave cost at 0 — scale-in / ROI stay gated until a real basis exists
+                mark = 0.0
+            # Lazy journal VWAP only when broker+cache can't supply a sane basis
+            jvwap = 0.0
+            if cb_mod.usable_cost(cost, mark) <= 0 and cb_mod.usable_cost(cached, mark) <= 0:
+                if journal_rows is None:
+                    journal_rows = self._journal_rows_for_basis()
+                try:
+                    jvwap = float(
+                        cb_mod.inventory_vwap_from_journal(journal_rows, broker_name, tu) or 0.0
+                    )
+                except Exception:
+                    jvwap = 0.0
+            resolved, source = cb_mod.resolve_holding_cost(
+                broker_cost=cost,
+                tracked_cache=cached,
+                journal_vwap=jvwap,
+                last_known=cached,  # persisted last-known already merged into cache
+                mark=mark,
+            )
+            if resolved > 0:
+                a["cost"] = resolved
+                cost = resolved
+                prev = float(cache.get(tu) or 0.0)
+                cache[tu] = resolved
+                if abs(prev - resolved) > max(1e-8, resolved * 1e-6):
+                    cache_dirty = True
+                if source in ("broker", "journal_vwap", "tracked", "last_known"):
+                    skey = f"{broker_name}:{tu}:{source}"
+                    if skey not in seeded_log:
+                        seeded_log.add(skey)
+                        try:
+                            self.log_event(
+                                f"[{broker_name}] Cost basis seeded for {tu} via {source} "
+                                f"@ {format_currency(resolved)} — TTP/ROI unlocked"
+                            )
+                        except Exception:
+                            pass
+            else:
+                a["cost"] = 0.0
+                cost = 0.0
             is_crypto = (
                 "crypto" in str(a.get("type") or "").lower()
                 or tu in KNOWN_CRYPTOS
+                or broker_name == "Coinbase"
             )
-            if cost <= 0 and (is_crypto or broker_name == "Coinbase"):
+            if cost <= 0 and is_crypto:
                 ukey = f"{broker_name}:{tu}"
                 if ukey not in unknown_log:
                     unknown_log.add(ukey)
@@ -2017,10 +2119,17 @@ class MarketAdvisorGUI(QMainWindow):
                         self.log_event(
                             f"[{broker_name}] Cost basis unknown for {tu} — "
                             f"TTP/scale-in/ROI gated until avg cost is available "
-                            f"(tracked buys fill the cache; broker avg preferred when present)"
+                            f"(broker avg / journal VWAP / tracked / last-known). "
+                            f"Paste avg from the broker app in Settings → Cost basis "
+                            f"(e.g. {broker_name}:{tu}=<avg>)"
                         )
                     except Exception:
                         pass
+        if cache_dirty:
+            try:
+                self._persist_cost_basis_cache(force=True)
+            except Exception:
+                pass
         return [a for a in assets if isinstance(a, dict) and a.get("ticker")]
 
     def _record_buy_cost(self, broker_name, ticker, price, shares_bought):
@@ -2037,6 +2146,16 @@ class MarketAdvisorGUI(QMainWindow):
             cache[ticker] = ((prior_shares * prev_cost) + (shares_bought * price)) / (prior_shares + shares_bought)
         else:
             cache[ticker] = price
+        tu = str(ticker).upper()
+        if tu != ticker:
+            cache[tu] = cache[ticker]
+        try:
+            self._persist_cost_basis_cache(force=False)
+        except Exception:
+            pass
+        # Invalidate journal VWAP snapshot so next holdings pull sees this buy
+        self._journal_basis_rows = None
+        self._journal_basis_rows_ts = 0.0
 
     def _journal_fill(
         self,
@@ -2148,6 +2267,22 @@ class MarketAdvisorGUI(QMainWindow):
             entry["slippage_bps"] = round(float(slip_bps), 2)
         if fee_est is not None:
             entry["fee_est"] = round(float(fee_est), 4)
+        # Prefer net-of-cost metrics on sells (FinRL reward = Δ equity − friction)
+        if str(side).upper() == "SELL":
+            try:
+                from scoring import net_roi_after_fees, estimate_round_trip_fee_pct
+                gross = self._sell_roi(broker_name, ticker, fp or price)
+                if gross is not None:
+                    entry["roi_gross"] = round(float(gross), 6)
+                    net = net_roi_after_fees(gross, broker_id, ticker, asset_type)
+                    if net is not None:
+                        entry["roi_net"] = round(float(net), 6)
+                    entry["fee_rt_pct"] = round(
+                        float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type)) * 100.0,
+                        4,
+                    )
+            except Exception:
+                pass
         try:
             if fee_paid is not None and float(fee_paid) >= 0:
                 entry["fee_paid"] = round(float(fee_paid), 4)
@@ -2392,14 +2527,61 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _avg_cost_for(self, broker_name, ticker):
         """Look up tracked avg cost (cost_basis_cache stores plain floats per ticker)."""
-        cache = self.cost_basis_cache.get(broker_name) or {}
-        entry = cache.get(ticker)
-        if entry is None and ticker:
-            entry = cache.get(str(ticker).upper())
         try:
-            return float(entry or 0)
-        except (TypeError, ValueError):
-            return 0.0
+            import cost_basis as cb_mod
+            return float(cb_mod.cache_lookup(self.cost_basis_cache, broker_name, ticker) or 0.0)
+        except Exception:
+            cache = self.cost_basis_cache.get(broker_name) or {}
+            entry = cache.get(ticker)
+            if entry is None and ticker:
+                entry = cache.get(str(ticker).replace("-USD", "").upper())
+            try:
+                return float(entry or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+    def _apply_pasted_cost_basis(self):
+        """Merge Settings paste lines into cost_basis_cache and persist."""
+        import cost_basis as cb_mod
+        text = ""
+        if hasattr(self, "cost_basis_paste"):
+            text = self.cost_basis_paste.toPlainText()
+        parsed = cb_mod.parse_manual_basis_lines(text)
+        if not parsed:
+            QMessageBox.information(
+                self,
+                "Cost basis",
+                "No valid lines found.\nUse: Coinbase:ETH=2450   or   Robinhood SHIB 0.000012",
+            )
+            return
+        n = 0
+        for broker, tickers in parsed.items():
+            bucket = self.cost_basis_cache.setdefault(broker, {})
+            for t, c in tickers.items():
+                bucket[t] = float(c)
+                n += 1
+                # Allow re-log of seeded / clear unknown flag
+                ukey = f"{broker}:{t}"
+                getattr(self, "_cost_unknown_logged", set()).discard(ukey)
+                for src in ("broker", "journal_vwap", "tracked", "last_known", "manual"):
+                    getattr(self, "_cost_seeded_logged", set()).discard(f"{broker}:{t}:{src}")
+                try:
+                    self.log_event(
+                        f"[{broker}] Cost basis seeded for {t} via manual "
+                        f"@ {format_currency(c)} — TTP/ROI unlocked"
+                    )
+                except Exception:
+                    pass
+        try:
+            self._persist_cost_basis_cache(force=True)
+        except Exception:
+            pass
+        self.log_event(f"Applied {n} pasted avg cost(s) — refreshing holdings.")
+        try:
+            self.manual_portfolio_reload(and_score=False, force=True)
+        except Exception:
+            pass
+        QMessageBox.information(self, "Cost basis", f"Saved {n} avg cost(s).")
 
     def _sell_roi(self, broker_name, ticker, price, avg_cost=None):
         """Return ROI fraction for a sell, or None if unknown."""
@@ -2415,6 +2597,10 @@ class MarketAdvisorGUI(QMainWindow):
         except (TypeError, ValueError):
             return None
         if px <= 0 or cost <= 0:
+            return None
+        # Dust / bogus basis (e.g. RH cost_bases total ≈ $0.0007 ÷ qty) invents
+        # mega-% Discord BIG WINs where ($) ≈ proceeds, not profit. Treat unknown.
+        if cost < px * 0.01:  # implies ROI > ~9,900%
             return None
         return (px - cost) / cost
 
@@ -4676,8 +4862,8 @@ class MarketAdvisorGUI(QMainWindow):
             f"padding: {ui_px(2)}px {ui_px(8)}px;"
         )
         self.home_cb_basis_chip.setToolTip(
-            "Coinbase API has no reliable avg cost. Tracked app buys fill the cache; "
-            "unknown basis shows cost ? and gates TTP/scale-in/ROI."
+            "Coinbase avg entry from portfolio breakdown when available; "
+            "else journal / tracked / Settings paste. Unknown basis gates TTP/scale-in/ROI."
         )
         _pack_broker_metrics(
             cb_layout,
@@ -4777,10 +4963,11 @@ class MarketAdvisorGUI(QMainWindow):
         self.home_loss_chip = QLabel("$-loss: ok")
         self.home_stops_chip = QLabel("Stops: —")
         self.home_shadow_chip = QLabel("Shadow: —")
+        self.home_fill_chip = QLabel("Fill: —")
         self.home_frac_chip = QLabel("Frac: —")
         for chip in (
             self.home_dd_chip, self.home_loss_chip, self.home_stops_chip,
-            self.home_shadow_chip, self.home_frac_chip,
+            self.home_shadow_chip, self.home_fill_chip, self.home_frac_chip,
         ):
             chip.setStyleSheet(
                 f"font-size: {ui_px(11)}px; font-weight: 600; padding: {ui_px(2)}px {ui_px(8)}px;"
@@ -5367,7 +5554,7 @@ class MarketAdvisorGUI(QMainWindow):
         layout.addLayout(header_bar)
 
         hint = QLabel(
-            "Hero = realized P&L · fees · fee drag · Net≈. "
+            "Hero = Net≈ (realized − fees) · fee drag · trade count. "
             "Fee confidence rises when broker invoice fields land on fills. "
             "Bar WF = multi-symbol OHLCV · fee-aware (not QuantConnect)."
         )
@@ -5809,6 +5996,42 @@ class MarketAdvisorGUI(QMainWindow):
 
         brokers_group.setLayout(brokers_outer)
         layout.addWidget(brokers_group)
+
+        # Cost basis — manual paste for pre-app bags when broker/journal can't seed
+        basis_group = QGroupBox("Cost basis")
+        basis_outer = QVBoxLayout()
+        basis_outer.setSpacing(ui_px(6))
+        basis_hint = QLabel(
+            "Pre-app bags need avg cost for TTP/ROI. Brokers are tried first "
+            "(RH cost_basis / Coinbase portfolio entry). If still unknown, paste "
+            "one line per bag from the broker app, then Apply."
+        )
+        basis_hint.setObjectName("settingsHint")
+        basis_hint.setWordWrap(True)
+        basis_hint.setStyleSheet(
+            f"color: {theme_colors(self.dark_mode)['muted']}; font-size: {ui_px(11)}px;"
+        )
+        basis_outer.addWidget(basis_hint)
+        self.cost_basis_paste = QTextEdit()
+        self.cost_basis_paste.setPlaceholderText(
+            "# examples\nCoinbase:ETH=2450.00\nRobinhood SHIB 0.000012\nCB FET 0.55"
+        )
+        self.cost_basis_paste.setMaximumHeight(ui_px(90))
+        self.cost_basis_paste.setToolTip(
+            "Format: Broker TICKER avg   or   Broker:TICKER=avg   (CB/RH aliases ok)"
+        )
+        basis_outer.addWidget(self.cost_basis_paste)
+        basis_btn_row = QHBoxLayout()
+        self.cost_basis_apply_btn = QPushButton("Apply pasted avg costs")
+        self.cost_basis_apply_btn.setToolTip(
+            "Merge into cost_basis_cache, persist, and unlock TTP for those tickers"
+        )
+        self.cost_basis_apply_btn.clicked.connect(self._apply_pasted_cost_basis)
+        basis_btn_row.addWidget(self.cost_basis_apply_btn)
+        basis_btn_row.addStretch(1)
+        basis_outer.addLayout(basis_btn_row)
+        basis_group.setLayout(basis_outer)
+        layout.addWidget(basis_group)
 
         self._build_broker_login_dialogs()
         self._build_discord_webhook_dialog()
@@ -8054,10 +8277,74 @@ class MarketAdvisorGUI(QMainWindow):
             self._last_cluster_heat = clusters
             self._last_protective_health = health
             self._refresh_cb_basis_chip()
+            self._refresh_fill_chip()
         except Exception:
             pass
 
         self._update_reauth_banner()
+
+    def _refresh_fill_chip(self):
+        """Home fill-slip / fee feedback chip (execution quality visibility)."""
+        if not hasattr(self, "home_fill_chip"):
+            return
+        try:
+            from scoring import get_execution_feedback
+            fb = get_execution_feedback() or {}
+        except Exception:
+            fb = {}
+        bump = float(fb.get("offset_bump_pct") or 0.0)
+        size_m = float(fb.get("size_mult") or 1.0)
+        n = int(fb.get("recent_count") or 0)
+        note = str(fb.get("last_note") or "")
+        avg_bps = None
+        try:
+            rows = journal.read_recent(40)
+            slips = []
+            for r in rows or []:
+                if not isinstance(r, dict):
+                    continue
+                if r.get("slippage_bps") is None:
+                    continue
+                try:
+                    slips.append(float(r["slippage_bps"]))
+                except (TypeError, ValueError):
+                    continue
+            if slips:
+                avg_bps = sum(slips) / len(slips)
+                if n <= 0:
+                    n = len(slips)
+        except Exception:
+            pass
+        if avg_bps is None and n <= 0 and bump <= 0 and size_m >= 0.999:
+            self.home_fill_chip.setText("Fill: —")
+            self.home_fill_chip.setStyleSheet(
+                f"font-size: {ui_px(11)}px; font-weight: 600; padding: {ui_px(2)}px {ui_px(8)}px;"
+            )
+            self.home_fill_chip.setToolTip(
+                "Fill quality: avg slippage vs quote appears after confirmed fills. "
+                "Adverse clusters temporarily bump limit offset / shrink size."
+            )
+            return
+        avg_t = f"{avg_bps:.0f}bps" if avg_bps is not None else "—"
+        adj = ""
+        warn = bump > 0.001 or size_m < 0.999
+        if warn:
+            adj = f" · adj +{bump:.2f}%/×{size_m:.2f}"
+        self.home_fill_chip.setText(f"Fill: {avg_t}{adj}" if n else f"Fill: {avg_t}")
+        if warn:
+            self.home_fill_chip.setStyleSheet(
+                f"font-size: {ui_px(11)}px; font-weight: 600; color: #EF6C00; "
+                f"padding: {ui_px(2)}px {ui_px(8)}px;"
+            )
+        else:
+            self.home_fill_chip.setStyleSheet(
+                f"font-size: {ui_px(11)}px; font-weight: 600; padding: {ui_px(2)}px {ui_px(8)}px;"
+            )
+        tip = (
+            f"Recent fills with slip meta: {n}. Avg slippage {avg_t} (positive = adverse). "
+            + (note or "No active fill-quality size/offset adjustment.")
+        )
+        self.home_fill_chip.setToolTip(tip)
 
     def _refresh_cb_basis_chip(self):
         """Home Coinbase chip: unknown cost-basis count for honesty."""
@@ -8891,7 +9178,7 @@ class MarketAdvisorGUI(QMainWindow):
             if _cost <= 0:
                 cost_item.setToolTip(
                     "Cost basis unknown — TTP/scale-in/ROI gated until avg cost is available "
-                    "(Coinbase API has no reliable avg cost; tracked buys fill the cache)."
+                    "(broker portfolio entry / journal / tracked / Settings → Cost basis paste)."
                 )
             self.portfolio_table.setItem(row, 3, cost_item)
             self.portfolio_table.setItem(row, 4, QTableWidgetItem(format_currency(price)))
@@ -9544,10 +9831,11 @@ class MarketAdvisorGUI(QMainWindow):
             row_broker = ticker_item.data(Qt.UserRole + 1) or (
                 self.portfolio_table.item(row, 0).text() if self.portfolio_table.item(row, 0) else self.cycle_broker_name
             )
-            if self.is_locked(ticker):
+            asset_type = ticker_item.data(Qt.UserRole) or ""
+            is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
+            if self.is_locked(ticker, is_crypto=is_crypto):
                 self.log_event(f"[{row_broker}] Skipped [{ticker}]: trade lock active")
                 continue
-            asset_type = ticker_item.data(Qt.UserRole) or ""
             try:
                 price = float(self.portfolio_table.item(row, 4).text().replace('$', '').replace(',', '') or 0.0)
             except Exception:
@@ -9630,7 +9918,9 @@ class MarketAdvisorGUI(QMainWindow):
         filtered = []
         for c in candidates:
             ticker = c.get("ticker") or ""
-            if self.is_locked(ticker):
+            asset_type = c.get("asset_type") or ""
+            is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
+            if self.is_locked(ticker, is_crypto=is_crypto):
                 self.log_event(f"[{self.cycle_broker_name}] Skipped [{ticker}]: trade lock active")
                 continue
             filtered.append(c)
@@ -9683,6 +9973,7 @@ class MarketAdvisorGUI(QMainWindow):
             opportunity_swap_enabled, pick_rotation_funding, mark_opportunity_swap_exit,
             get_risk_posture_profile, last_rotation_reject_reason, record_rotation,
             entry_regime_ok, broker_min_notional, RH_CRYPTO_MIN_NOTIONAL,
+            crypto_new_entry_ok,
         )
         broker_name = self.cycle_broker_name
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
@@ -9737,6 +10028,13 @@ class MarketAdvisorGUI(QMainWindow):
         broker = self.brokers.get(broker_name)
         # Coinbase (crypto-only): skip equity-wide crypto book cap — BP util is the cash rail
         crypto_only_broker = not bool(getattr(broker, "supports_equities", True))
+        prefer_equity_rth = False
+        if not crypto_only_broker:
+            try:
+                sess = self.get_equity_session_info()
+                prefer_equity_rth = str(sess.get("label") or "") == "REGULAR"
+            except Exception:
+                prefer_equity_rth = False
         for a in holdings:
             if not isinstance(a, dict):
                 continue
@@ -9798,6 +10096,7 @@ class MarketAdvisorGUI(QMainWindow):
                                     holdings_meta=holdings_meta, portfolio_value=equity,
                                     scale_in_candidate=True,
                                     crypto_only_broker=crypto_only_broker,
+                                    prefer_equity_rth=prefer_equity_rth,
                                 ))
                                 notes.append(
                                     f"[{broker_name}] "
@@ -9817,6 +10116,7 @@ class MarketAdvisorGUI(QMainWindow):
                                 ticker, is_crypto=is_crypto, held_tickers=held,
                                 holdings_meta=holdings_meta, portfolio_value=equity,
                                 crypto_only_broker=crypto_only_broker,
+                                prefer_equity_rth=prefer_equity_rth,
                             ))
                     except Exception:
                         c["score"] = float(c.get("score") or 0.0)
@@ -10098,6 +10398,23 @@ class MarketAdvisorGUI(QMainWindow):
                 )
                 continue
 
+            # FinRL hold-bias: crypto new entries (not scale-in) must clear score bar
+            # before we burn a cycle on sizing / rotate (thin-ticket check after size).
+            if is_crypto and tu not in held:
+                ok_ce, why_ce = crypto_new_entry_ok(
+                    broker_id, ticker, score=cand_score, notional=None, skip_turbulence=True,
+                )
+                if not ok_ce:
+                    notes.append(f"[{broker_name}] Hold bias skip [{ticker}]: {why_ce}")
+                    execute_skips.append(f"{ticker}: hold bias ({why_ce})")
+                    self._log_decision(
+                        broker=broker_name, ticker=ticker, action="SKIP",
+                        score=cand_score, reason=f"hold_bias:{why_ce}",
+                        posture=posture, open_count=open_count, max_open=max_positions,
+                        is_crypto=True, regime_ok=True,
+                    )
+                    continue
+
             bought = False
             for _attempt in range(2):
                 is_held = tu in held
@@ -10262,6 +10579,23 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                     break
 
+                # FinRL: don't spray thin crypto tickets when edge ≪ ~2% RT
+                if is_crypto and (not scale_in):
+                    ok_thin, why_thin = crypto_new_entry_ok(
+                        broker_id, ticker, score=cand_score, notional=row_dollars,
+                        skip_turbulence=True,
+                    )
+                    if not ok_thin:
+                        notes.append(f"[{broker_name}] Thin-ticket skip [{ticker}]: {why_thin}")
+                        execute_skips.append(f"{ticker}: thin ticket ({why_thin})")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason=f"thin_ticket:{why_thin}",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=True, regime_ok=True,
+                        )
+                        break
+
                 blocked, reason = concentration_blocks_buy(
                     ticker, held, holdings_meta=holdings_meta, portfolio_value=equity,
                     proposed_dollars=row_dollars, is_crypto=is_crypto,
@@ -10418,7 +10752,10 @@ class MarketAdvisorGUI(QMainWindow):
             ticker = fill.get("ticker")
             status = fill.get("status") or ""
             if fill.get("ok") and not fill.get("rotate_sell"):
-                self.set_lock(ticker)
+                self.set_lock(ticker, is_crypto=bool(
+                    "crypto" in str(fill.get("asset_type") or "").lower()
+                    or str(ticker or "").upper() in KNOWN_CRYPTOS
+                ))
             if fill.get("rotate_sell"):
                 tag = "ROTATE-SELL "
                 self.log_event(f"[{broker}] Execution [{ticker}]: {tag}{status}")
@@ -10484,6 +10821,21 @@ class MarketAdvisorGUI(QMainWindow):
                     avg_cost = 0.0
                 if avg_cost <= 0:
                     avg_cost = self._avg_cost_for(row_broker, ticker)
+                # Dust RH basis: prefer tracked VWAP; else leave unknown for Discord ROI
+                try:
+                    px_chk = float(price or 0)
+                except (TypeError, ValueError):
+                    px_chk = 0.0
+                if (
+                    avg_cost > 0
+                    and px_chk > 0
+                    and avg_cost < px_chk * 0.01
+                ):
+                    tracked = float(self._avg_cost_for(row_broker, ticker) or 0.0)
+                    if tracked > 0 and tracked >= px_chk * 0.01:
+                        avg_cost = tracked
+                    else:
+                        avg_cost = 0.0
 
                 if row_broker == "Robinhood" and not is_crypto:
                     if not equity_open:
@@ -10560,7 +10912,11 @@ class MarketAdvisorGUI(QMainWindow):
             broker = fill.get("broker") or self.cycle_broker_name
             status = fill.get("status") or ""
             if fill.get("ok"):
-                self.set_lock(ticker)
+                self.set_lock(
+                    ticker,
+                    is_crypto="crypto" in str(fill.get("asset_type") or fill.get("type") or "").lower()
+                    or str(ticker or "").upper() in KNOWN_CRYPTOS,
+                )
                 try:
                     from scoring import clear_scale_in_count
                     bid = getattr(self.brokers.get(broker), "broker_id", None) or str(broker).upper()
@@ -10574,8 +10930,26 @@ class MarketAdvisorGUI(QMainWindow):
                     roi = self._sell_roi(
                         broker, ticker, fill.get("price"), fill.get("avg_cost"),
                     )
-                if fill.get("ok") and self._is_big_win_roi(roi):
-                    gain_pct = float(roi) * 100.0
+                # Prefer net-of-fee ROI for BIG WIN gate (no fee-negative celebrations)
+                win_roi = roi
+                if roi is not None:
+                    try:
+                        from scoring import net_roi_after_fees
+                        bid = getattr(self.brokers.get(broker), "broker_id", None) or str(broker).upper()
+                        asset_type = fill.get("asset_type") or fill.get("type") or ""
+                        net = net_roi_after_fees(roi, bid, ticker, asset_type)
+                        if net is not None:
+                            win_roi = net
+                    except Exception:
+                        pass
+                if fill.get("ok") and self._is_big_win_roi(win_roi):
+                    gain_pct = float(roi) * 100.0 if roi is not None else float(win_roi) * 100.0
+                    net_part = ""
+                    try:
+                        if win_roi is not None and roi is not None and abs(win_roi - roi) > 1e-9:
+                            net_part = f" net≈{float(win_roi)*100:.1f}%"
+                    except Exception:
+                        net_part = ""
                     dollar_part = ""
                     try:
                         shares = float(fill.get("shares") or 0)
@@ -10586,7 +10960,7 @@ class MarketAdvisorGUI(QMainWindow):
                     except (TypeError, ValueError):
                         dollar_part = ""
                     self.send_discord_alert(
-                        f"🎉 BIG WIN SELL {ticker}: +{gain_pct:.1f}%{dollar_part} — {status}",
+                        f"🎉 BIG WIN SELL {ticker}: +{gain_pct:.1f}%{net_part}{dollar_part} — {status}",
                         is_trade=True,
                         urgent=True,
                     )
@@ -10643,7 +11017,16 @@ class MarketAdvisorGUI(QMainWindow):
         return items
 
     def _bg_score_portfolio(self, items):
-        from scoring import evaluate_holding, flush_state
+        from scoring import (
+            evaluate_holding,
+            flush_state,
+            get_risk_posture_profile,
+            normalize_risk_posture,
+        )
+        _exit_prof = get_risk_posture_profile(
+            normalize_risk_posture(self.settings.get("risk_posture", "balanced"))
+        )
+        allow_flat_banks = bool(_exit_prof.get("allow_flat_time_banks", False))
         results = []
         with SuppressPrints():
             for row, ticker, shares, avg_cost, asset_type, *rest in items:
@@ -10673,6 +11056,7 @@ class MarketAdvisorGUI(QMainWindow):
                     exit_roi_scale=float(self.settings.get("exit_roi_scale", 1.0) or 1.0),
                     exit_time_scale=float(self.settings.get("exit_time_scale", 1.0) or 1.0),
                     ttp_arm_scale=float(self.settings.get("ttp_arm_scale", 1.0) or 1.0),
+                    allow_flat_time_banks=allow_flat_banks,
                 )
                 results.append((row, price, action, asset_type, None))
         flush_state()
@@ -10768,6 +11152,13 @@ class MarketAdvisorGUI(QMainWindow):
         }
         broker = self.brokers.get(broker_name)
         crypto_only_broker = not bool(getattr(broker, "supports_equities", True))
+        prefer_equity_rth = False
+        if not crypto_only_broker:
+            try:
+                sess = self.get_equity_session_info()
+                prefer_equity_rth = str(sess.get("label") or "") == "REGULAR"
+            except Exception:
+                prefer_equity_rth = False
         holdings_meta = []
         holdings_by_ticker = {}
         for a in holdings:
@@ -10838,6 +11229,7 @@ class MarketAdvisorGUI(QMainWindow):
                             holdings_meta=holdings_meta, portfolio_value=equity,
                             scale_in_candidate=True,
                             crypto_only_broker=crypto_only_broker,
+                            prefer_equity_rth=prefer_equity_rth,
                         ))
                         buy_candidates.append({
                             "ticker": ticker,
@@ -10853,6 +11245,7 @@ class MarketAdvisorGUI(QMainWindow):
                         ticker, is_crypto=is_crypto, held_tickers=held,
                         holdings_meta=holdings_meta, portfolio_value=equity,
                         crypto_only_broker=crypto_only_broker,
+                        prefer_equity_rth=prefer_equity_rth,
                     ))
                 except Exception:
                     score = 0.0
@@ -11230,6 +11623,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["exit_roi_scale"] = float(prof["exit_roi_scale"])
         self.settings["exit_time_scale"] = float(prof["exit_time_scale"])
         self.settings["ttp_arm_scale"] = float(prof["ttp_arm_scale"])
+        self.settings["allow_flat_time_banks"] = bool(prof.get("allow_flat_time_banks", False))
         self.settings["risk_posture"] = key
         self.settings["advanced_scale_in_override"] = False
         if hasattr(self, "allow_scale_in_chk"):
@@ -11366,6 +11760,9 @@ class MarketAdvisorGUI(QMainWindow):
         self.settings["exit_roi_scale"] = float(_prof["exit_roi_scale"])
         self.settings["exit_time_scale"] = float(_prof["exit_time_scale"])
         self.settings["ttp_arm_scale"] = float(_prof["ttp_arm_scale"])
+        self.settings["allow_flat_time_banks"] = bool(
+            _prof.get("allow_flat_time_banks", False)
+        )
         self.settings["limit_offset_pct"] = self.offset_spin.value()
         self.settings["daily_profit_target"] = self.profit_spin.value()
         self.settings["daily_loss_limit"] = self.loss_spin.value()

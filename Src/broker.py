@@ -143,17 +143,54 @@ class BaseBroker:
             return True, "invalid size/price"
         return False, ""
 
-def _rh_crypto_avg_cost(pos, qty):
-    """
-    Per-unit avg cost from a Robinhood crypto position payload.
-    Prefer cost_bases[].direct_cost_basis (total) / qty; fall back to per-unit fields.
-    Returns 0.0 when unknown — never invents a price.
-    """
+# Per-unit cost below this fraction of mark ⇒ dust / bogus RH cost_bases (unknown).
+COST_BASIS_DUST_FRAC = 0.01
+
+
+def cost_basis_is_dust(cost, mark_price, *, min_frac=COST_BASIS_DUST_FRAC):
+    """True when cost is missing or absurdly small vs live mark (fake mega-ROI)."""
     try:
-        qty = float(qty or 0.0)
+        c = float(cost or 0.0)
+        px = float(mark_price or 0.0)
     except (TypeError, ValueError):
-        qty = 0.0
-    if qty <= 0 or not isinstance(pos, dict):
+        return True
+    if c <= 0:
+        return True
+    if px > 0 and c < px * float(min_frac):
+        return True
+    return False
+
+
+def usable_avg_cost(cost, mark_price, *, min_frac=COST_BASIS_DUST_FRAC):
+    """Return cost when sane vs mark; else 0.0 (unknown — do not invent ROI)."""
+    try:
+        c = float(cost or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if cost_basis_is_dust(c, mark_price, min_frac=min_frac):
+        return 0.0
+    return c
+
+def _get_seeded_cost(broker_id, ticker):
+    """Tier 4: Last-known (Seed) fallback for missing crypto cost basis."""
+    import json
+    import os
+    try:
+        seed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed.json")
+        if os.path.exists(seed_path):
+            with open(seed_path, "r", encoding="utf-8") as f:
+                seeds = json.load(f)
+            broker_seeds = seeds.get(broker_id.upper(), {})
+            clean_ticker = str(ticker).replace("-USD", "").upper().strip()
+            if clean_ticker in broker_seeds:
+                return float(broker_seeds[clean_ticker])
+    except Exception:
+        pass
+    return 0.0
+
+def _rh_pos_mark_price(pos):
+    """Best-effort mark from a RH crypto position payload (no network)."""
+    if not isinstance(pos, dict):
         return 0.0
 
     def _f(v):
@@ -162,70 +199,10 @@ def _rh_crypto_avg_cost(pos, qty):
         except (TypeError, ValueError):
             return 0.0
 
-    cb = pos.get("cost_bases")
-    if cb is None:
-        cb = pos.get("cost_basis")
-    if isinstance(cb, list) and cb:
-        total = 0.0
-        found = False
-        for entry in cb:
-            if not isinstance(entry, dict):
-                continue
-            entry_hit = False
-            for key in (
-                "direct_cost_basis", "directCostBasis",
-                "cost_basis", "costBasis",
-                "marked_cost_basis", "markedCostBasis",
-                "intraday_cost_basis", "intradayCostBasis",
-            ):
-                raw = entry.get(key)
-                if raw is None:
-                    continue
-                if isinstance(raw, dict):
-                    v = _f(raw.get("amount") or raw.get("value"))
-                else:
-                    v = _f(raw)
-                if v > 0:
-                    total += v
-                    found = True
-                    entry_hit = True
-                    break
-            if entry_hit:
-                continue
-            for nest_key in ("direct_cost_basis", "cost_basis", "amount"):
-                nested = entry.get(nest_key)
-                if isinstance(nested, dict):
-                    v = _f(nested.get("amount") or nested.get("value"))
-                    if v > 0:
-                        total += v
-                        found = True
-                        break
-        if found and total > 0:
-            return total / qty
-    elif isinstance(cb, dict):
-        for key in (
-            "direct_cost_basis", "directCostBasis",
-            "cost_basis", "costBasis",
-            "amount", "value",
-        ):
-            raw = cb.get(key)
-            if isinstance(raw, dict):
-                v = _f(raw.get("amount") or raw.get("value"))
-            else:
-                v = _f(raw)
-            if v > 0:
-                return v / qty
-    elif cb is not None and not isinstance(cb, (list, dict)):
-        v = _f(cb)
-        if v > 0:
-            return v / qty
-
-    # Explicit per-unit fields (do not invent from mark price)
     for key in (
-        "average_cost", "averageCost",
-        "average_buy_price", "averageBuyPrice",
-        "avg_cost", "avgCost",
-        "average_entry_price", "averageEntryPrice",
+        "mark_price", "markPrice",
+        "current_price", "currentPrice",
+        "last_trade_price", "lastTradePrice",
     ):
         raw = pos.get(key)
         if isinstance(raw, dict):
@@ -234,21 +211,195 @@ def _rh_crypto_avg_cost(pos, qty):
             v = _f(raw)
         if v > 0:
             return v
+    return 0.0
 
-    # Total cost fields (divide by qty)
+
+def _rh_parse_money_total(raw):
+    """Parse RH money leaf (string/number/{amount|value}) to float; 0 if missing."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, dict):
+        try:
+            return float(raw.get("amount") or raw.get("value") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rh_cost_bases_list_total(cb_list):
+    """Sum direct/marked cost totals from cost_bases[] entries."""
+    if not isinstance(cb_list, list) or not cb_list:
+        return 0.0
+    total = 0.0
+    found = False
+    for entry in cb_list:
+        if not isinstance(entry, dict):
+            continue
+        entry_hit = False
+        for key in (
+            "direct_cost_basis", "directCostBasis",
+            "cost_basis", "costBasis",
+            "marked_cost_basis", "markedCostBasis",
+            "intraday_cost_basis", "intradayCostBasis",
+        ):
+            v = _rh_parse_money_total(entry.get(key))
+            if v > 0:
+                total += v
+                found = True
+                entry_hit = True
+                break
+        if entry_hit:
+            continue
+        for nest_key in ("direct_cost_basis", "cost_basis", "amount"):
+            nested = entry.get(nest_key)
+            if isinstance(nested, dict):
+                v = _rh_parse_money_total(nested)
+                if v > 0:
+                    total += v
+                    found = True
+                    break
+    return total if found else 0.0
+
+
+def _rh_crypto_avg_cost(pos, qty, mark_price=None):
+    """
+    Per-unit avg cost from a Robinhood crypto position payload.
+
+    Prefer cost_bases[].direct_cost_basis (total) / qty, then singular top-level
+    cost_basis (robin_stocks documents this key), then per-unit fields.
+    Empty cost_bases[] must NOT block singular cost_basis.
+
+    Returns 0.0 when unknown or dust vs mark — never invents a price / mega-ROI basis.
+    """
+    try:
+        qty = float(qty or 0.0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    if qty <= 0 or not isinstance(pos, dict):
+        return 0.0
+
+    try:
+        mark = float(mark_price) if mark_price is not None else 0.0
+    except (TypeError, ValueError):
+        mark = 0.0
+    if mark <= 0:
+        mark = _rh_pos_mark_price(pos)
+
+    def _accept(per_unit):
+        return usable_avg_cost(per_unit, mark)
+
+    # 1) cost_bases list (may be empty — fall through)
+    list_total = _rh_cost_bases_list_total(pos.get("cost_bases"))
+    if list_total > 0:
+        accepted = _accept(list_total / qty)
+        if accepted > 0:
+            return accepted
+
+    # 2) Singular cost_basis (total USD) — RH holdings API / robin_stocks docs
+    singular = pos.get("cost_basis")
+    if isinstance(singular, list):
+        st = _rh_cost_bases_list_total(singular)
+        if st > 0:
+            accepted = _accept(st / qty)
+            if accepted > 0:
+                return accepted
+    elif isinstance(singular, dict):
+        v = 0.0
+        for key in (
+            "direct_cost_basis", "directCostBasis",
+            "cost_basis", "costBasis",
+            "amount", "value",
+        ):
+            v = _rh_parse_money_total(singular.get(key))
+            if v > 0:
+                break
+        if v <= 0:
+            v = _rh_parse_money_total(singular)
+        if v > 0:
+            accepted = _accept(v / qty)
+            if accepted > 0:
+                return accepted
+    elif singular is not None:
+        v = _rh_parse_money_total(singular)
+        if v > 0:
+            accepted = _accept(v / qty)
+            if accepted > 0:
+                return accepted
+
+    # 3) Explicit per-unit fields (do not invent from mark price)
+    for key in (
+        "average_cost", "averageCost",
+        "average_buy_price", "averageBuyPrice",
+        "avg_cost", "avgCost",
+        "average_entry_price", "averageEntryPrice",
+    ):
+        v = _rh_parse_money_total(pos.get(key))
+        if v > 0:
+            accepted = _accept(v)
+            if accepted > 0:
+                return accepted
+
+    # 4) Other total cost fields (divide by qty)
     for key in (
         "total_cost_basis", "totalCostBasis",
         "cost_basis_total", "costBasisTotal",
     ):
-        raw = pos.get(key)
-        if isinstance(raw, dict):
-            v = _f(raw.get("amount") or raw.get("value"))
-        else:
-            v = _f(raw)
+        v = _rh_parse_money_total(pos.get(key))
         if v > 0:
-            return v / qty
+            accepted = _accept(v / qty)
+            if accepted > 0:
+                return accepted
     return 0.0
 
+
+def _cb_position_avg_entry(pos):
+    """
+    Per-unit avg entry from a Coinbase portfolio spot_positions row.
+    Prefers average_entry_price; else cost_basis / qty. Dust-filters vs implied mark.
+    Returns (cost, mark) with cost=0 when unknown/dust.
+    """
+    if not isinstance(pos, dict) or pos.get("is_cash"):
+        return 0.0, 0.0
+    asset = str(pos.get("asset") or "").replace("-USD", "").upper().strip()
+    if not asset or asset in ("USD", "USDC", "USDT", "DAI"):
+        return 0.0, 0.0
+    try:
+        qty = float(pos.get("total_balance_crypto") or 0.0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    if qty <= 0:
+        try:
+            qty = float(pos.get("available_to_trade_crypto") or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+    entry = _money_value(pos.get("average_entry_price"))
+    if entry <= 0 and qty > 0:
+        total_basis = _money_value(pos.get("cost_basis"))
+        if total_basis > 0:
+            entry = total_basis / qty
+
+    mark = 0.0
+    try:
+        fiat = float(pos.get("total_balance_fiat") or 0.0)
+        if fiat > 0 and qty > 0:
+            mark = fiat / qty
+    except (TypeError, ValueError):
+        mark = 0.0
+
+    entry = usable_avg_cost(entry, mark)
+    
+    # --- 1.30.1 SEED FIX (COINBASE) ---
+    if entry <= 0.0:
+        seeded = _get_seeded_cost("COINBASE", asset)
+        if seeded > 0:
+            entry = seeded
+            print(f"[Coinbase] Cost basis seeded for {asset}: ${entry}")
+    # ----------------------------------
+    
+    return (entry, mark) if entry > 0 else (0.0, mark)
 
 def robinhood_pickle_path(pickle_name=""):
     """Default robin_stocks session file: ~/.tokens/robinhood.pickle"""
@@ -418,7 +569,12 @@ class RobinhoodAdapter(BaseBroker):
                     qty = float(data.get('quantity', 0) or 0)
                     if qty > 0:
                         cost = float(data.get('average_buy_price', 0) or 0)
-                        assets.append({'ticker': ticker, 'shares': qty, 'cost': cost, 'type': 'Ready (Stock)'})
+                        assets.append({
+                            'ticker': str(ticker).replace("-USD", "").upper(),
+                            'shares': qty,
+                            'cost': cost,
+                            'type': 'Ready (Stock)',
+                        })
         except Exception: pass
 
         try:
@@ -443,13 +599,37 @@ class RobinhoodAdapter(BaseBroker):
                             symbol = str(cur or "")
                         if not symbol:
                             continue
-                        avg_cost = _rh_crypto_avg_cost(pos, qty)
-                        assets.append({
-                            'ticker': symbol,
+                        mark = _rh_pos_mark_price(pos)
+                        if mark <= 0:
+                            try:
+                                q = r.crypto.get_crypto_quote(symbol)
+                                if isinstance(q, dict):
+                                    mp = q.get("mark_price")
+                                    if mp is not None and float(mp) > 0:
+                                        mark = float(mp)
+                            except Exception:
+                                pass
+
+                        avg_cost = _rh_crypto_avg_cost(pos, qty, mark_price=mark)
+                        
+                        # --- 1.30.1 SEED FIX (ROBINHOOD) ---
+                        if avg_cost <= 0.0:
+                            seeded = _get_seeded_cost("ROBINHOOD", symbol)
+                            if seeded > 0:
+                                avg_cost = seeded
+                                print(f"[Robinhood] Cost basis seeded for {str(symbol).replace('-USD', '').upper()}: ${avg_cost}")
+                        # -----------------------------------
+
+                        row = {
+                            'ticker': str(symbol).replace("-USD", "").upper(),
                             'shares': qty,
                             'cost': avg_cost,
                             'type': 'Ready (Crypto)',
-                        })
+                        }
+                        if mark > 0:
+                            row['price'] = mark
+                            row['mark'] = mark
+                        assets.append(row)
         except Exception: pass
         return assets
 
@@ -1205,12 +1385,78 @@ class CoinbaseAdapter(BaseBroker):
             print(f"Coinbase get_account_balances error: {e}")
             raise
 
+    def _cb_spot_avg_costs(self):
+        """
+        Map asset symbol → {"cost": per-unit avg, "mark": optional mark}.
+        Prefers average_entry_price; else cost_basis total / crypto qty.
+        Returns {} when portfolios API unavailable / unauthorized.
+        """
+        out = {}
+        if not self.is_connected or not self.client:
+            return out
+        try:
+            plist = self._cb_payload(self._cb_call(self.client.get_portfolios))
+        except Exception:
+            return out
+        portfolios = _as_list(plist.get("portfolios"))
+        if not portfolios:
+            return out
+
+        def _ptype(p):
+            return str((p or {}).get("type") or "").upper()
+
+        ordered = sorted(
+            [p for p in portfolios if isinstance(p, dict)],
+            key=lambda p: (0 if _ptype(p) == "DEFAULT" else 1, str(p.get("name") or "")),
+        )
+        for port in ordered:
+            uuid = str(port.get("uuid") or "").strip()
+            if not uuid:
+                continue
+            try:
+                br = self._cb_payload(
+                    self._cb_call(
+                        self.client.get_portfolio_breakdown,
+                        portfolio_uuid=uuid,
+                        currency="USD",
+                    )
+                )
+            except Exception:
+                try:
+                    br = self._cb_payload(
+                        self._cb_call(self.client.get_portfolio_breakdown, portfolio_uuid=uuid)
+                    )
+                except Exception:
+                    continue
+            breakdown = br.get("breakdown") if isinstance(br.get("breakdown"), dict) else br
+            spots = _as_list(
+                (breakdown or {}).get("spot_positions")
+                if isinstance(breakdown, dict)
+                else None
+            )
+            for pos in spots:
+                entry, mark = _cb_position_avg_entry(pos)
+                if entry <= 0:
+                    continue
+                asset = str(pos.get("asset") or "").replace("-USD", "").upper().strip()
+                if not asset:
+                    continue
+                prev = out.get(asset)
+                if not prev or float(prev.get("cost") or 0) <= 0:
+                    out[asset] = {"cost": entry, "mark": mark}
+        return out
+
     def get_current_holdings(self):
         assets = []
         if not self.is_connected:
             return assets
         try:
             accounts = self._fetch_all_accounts()
+            avg_by_asset = {}
+            try:
+                avg_by_asset = self._cb_spot_avg_costs() or {}
+            except Exception:
+                avg_by_asset = {}
 
             for acc in accounts:
                 if not isinstance(acc, dict):
@@ -1218,17 +1464,28 @@ class CoinbaseAdapter(BaseBroker):
                 avail = _money_value(acc.get("available_balance"))
                 hold = _money_value(acc.get("hold"))
                 total_qty = avail + hold
-                currency = acc.get("currency")
+                currency = str(acc.get("currency") or "").replace("-USD", "").upper().strip()
 
-                if total_qty > 0 and currency not in ["USD", "USDC"]:
-                    # Do NOT use live price as cost — that zeros out ROI and blocks sells.
-                    # GUI overlays tracked buy cost via cost_basis_cache.
-                    assets.append({
+                if total_qty > 0 and currency not in ["USD", "USDC", "USDT", "DAI"]:
+                    meta = avg_by_asset.get(currency) or {}
+                    try:
+                        broker_cost = float(meta.get("cost") or 0.0)
+                    except (TypeError, ValueError):
+                        broker_cost = 0.0
+                    try:
+                        mark = float(meta.get("mark") or 0.0)
+                    except (TypeError, ValueError):
+                        mark = 0.0
+                    row = {
                         "ticker": currency,
                         "shares": total_qty,
-                        "cost": 0.0,
+                        "cost": float(broker_cost or 0.0),
                         "type": "Ready (Crypto)",
-                    })
+                    }
+                    if mark > 0:
+                        row["price"] = mark
+                        row["mark"] = mark
+                    assets.append(row)
         except Exception as e:
             print(f"Coinbase get_current_holdings error: {e}")
             pass

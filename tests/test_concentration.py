@@ -10,7 +10,7 @@ if SRC not in sys.path:
 
 class TestCryptoBookCap(unittest.TestCase):
     def test_multi_asset_blocks_over_cap(self):
-        """Robinhood-style: crypto may not exceed ~40% of that broker's equity."""
+        """Robinhood-style: crypto may not exceed ~30% of that broker's equity."""
         from scoring import concentration_blocks_buy, MAX_CRYPTO_BOOK_FRAC
 
         equity = 33.0
@@ -18,7 +18,7 @@ class TestCryptoBookCap(unittest.TestCase):
             {"ticker": "SHIB", "value": 6.19, "is_crypto": True},
             {"ticker": "BONK", "value": 6.18, "is_crypto": True},
         ]
-        # Holdings alone ~37.5%; +$6 proposed → ~56% > 40%
+        # Holdings alone ~37.5%; +$6 proposed → ~56% > 30%
         blocked, reason = concentration_blocks_buy(
             "AVAX",
             held_tickers={"SHIB", "BONK"},

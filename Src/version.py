@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.29.0"
+__version__ = "1.30.1"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "ET honesty · broker fees · bar WF · rotate-to-clear RH $5 floor · Inno+Plex packaging"
+    "CB/RH cost-basis seed fix · Settings paste · empty cost_bases fallthrough"
 )
 
 

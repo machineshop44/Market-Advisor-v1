@@ -32,42 +32,53 @@ except ImportError:
 # =========================================================================
 # Minimum net edge over estimated round-trip fees for discretionary profit exits.
 MIN_PROFIT_OVER_FEES_PCT = 0.01  # 100 bps (1.0%)
+# FinRL lesson (rules, not RL): NEW discretionary entries also clear RT + edge.
+MIN_ENTRY_EDGE_OVER_FEES_PCT = 0.01  # 100 bps beyond RT before spraying tickets
+
+# Flat time banks must clear TTP arm by this multiple so they cannot fire before trail arms.
+FLAT_TIME_BANK_ARM_MULT = 1.25
 
 FEE_PROFILES = {
+    # Desk posture: ride uptrends — primary green exit is TTP trail-from-peak (turn-based).
+    # Hierarchy: hard stop → TTP arm+trail → rare flat time banks (Aggressive only, after turn) → stale.
+    # Do NOT jump out of a winner for a quick buck while price is still near the local high.
+    # ATR may widen arm/trail/time rails together (see atr_adapt_exit_fees).
     "ROBINHOOD_STOCK": {
-        # Est. RT ~0.20% → floor fee_rt+1% = +1.2%
-        "ttp_arm": 0.012,          # +1.2% arms trail
-        "ttp_trail": 0.008,        # -0.8% trail (post-arm lock-in; may exit below floor)
+        # Est. RT ~0.20% → floor fee_rt+1% = +1.2% (rails sit above floor)
+        "ttp_arm": 0.020,          # +2.0% arms trail — let winners develop
+        "ttp_trail": 0.010,        # -1.0% from peak
         "hard_stop": -0.035,       # -3.5% — clear disaster cut, not noise
-        "time_30m_target": 0.012,  # +1.2% (≥ fee_rt + 1%)
-        "time_60m_target": 0.012,  # +1.2%
-        "time_green_min": 45,      # minutes
-        "time_green_roi": 0.012,   # +1.2% — no penny "wins" after friction
+        "time_30m_target": 0.040,  # +4.0% rare flat bank (Aggressive + trend turned)
+        "time_60m_target": 0.035,  # +3.5%
+        "time_green_min": 90,      # minutes — patience before any flat green escape
+        "time_green_roi": 0.030,   # +3.0% — well above arm; no ~1–2% jump-ship
         "stale_minutes": 180,      # 3h same-session (2h/−1% was twitchy on META/TSLA)
         "stale_roi": -0.015,       # -1.5%
     },
     "ROBINHOOD_CRYPTO": {
         # Est. one-way 0.95% (MM spread rebate ≈ exchange tier <$50K) → RT 1.90% → floor +2.90%
-        "ttp_arm": 0.029,          # +2.9%
-        "ttp_trail": 0.010,
+        # Slightly more patient than stocks (fees) but still rides uptrends via TTP.
+        "ttp_arm": 0.035,          # +3.5% — trail primary over flat fee-floor TP
+        "ttp_trail": 0.012,        # -1.2% from peak
         "hard_stop": -0.040,       # -4.0% — crypto vol needs a wider disaster line
-        "time_30m_target": 0.029,  # +2.9%
-        "time_60m_target": 0.029,  # +2.9%
-        "time_green_min": 45,
-        "time_green_roi": 0.029,   # +2.9% min green — no thin crypto "wins"
-        "stale_minutes": 120,      # crypto stays tighter than equities
+        "time_30m_target": 0.055,  # +5.5%
+        "time_60m_target": 0.050,  # +5.0%
+        "time_green_min": 75,      # more patient than equities on flat green escape
+        "time_green_roi": 0.045,   # +4.5% — no thin crypto "wins"
+        "stale_minutes": 120,      # crypto stays tighter than equities on dead money
         "stale_roi": -0.012,       # -1.2%
     },
     "COINBASE": {
-        # Intro 1 taker 1.2% one-way (small-book default) → 2.4% RT → floor = +3.4%
+        # Intro 1: maker 0.60% / taker 1.20% — MA market exits use taker.
+        # Taker 1.2% one-way → 2.4% RT → floor = +3.4%.
         # Higher tiers (Intro 2 / Advanced) can lower _FEE_ONE_WAY_PCT if volume rises.
-        "ttp_arm": 0.034,          # +3.4% arms trail
-        "ttp_trail": 0.010,        # -1.0% trail → exit still ~+2.4%+ once armed above peak
+        "ttp_arm": 0.040,          # +4.0% arms trail
+        "ttp_trail": 0.012,        # -1.2% trail
         "hard_stop": -0.040,
-        "time_30m_target": 0.034,  # +3.4% (≥ fee_rt + 1%)
-        "time_60m_target": 0.034,  # +3.4%
-        "time_green_min": 45,
-        "time_green_roi": 0.034,   # +3.4% — never take a CB "win" that fees wipe out
+        "time_30m_target": 0.060,  # +6.0%
+        "time_60m_target": 0.055,  # +5.5%
+        "time_green_min": 75,
+        "time_green_roi": 0.050,   # +5.0% — never take a CB "win" that fees wipe out
         "stale_minutes": 120,
         "stale_roi": -0.012,
     },
@@ -78,13 +89,13 @@ FEE_PROFILES = {
     # Market Advisor never places ET crypto (supports_crypto=False; equity orders only).
     # (Own profile so ET can diverge from RH later. OTC $6.95 / options $0.65 not modeled.)
     "ETRADE_STOCK": {
-        "ttp_arm": 0.012,          # +1.2% arms trail
-        "ttp_trail": 0.008,        # -0.8% trail
+        "ttp_arm": 0.020,          # +2.0% arms trail (match RH stock desk rails)
+        "ttp_trail": 0.010,        # -1.0% trail
         "hard_stop": -0.035,       # -3.5%
-        "time_30m_target": 0.012,  # +1.2%
-        "time_60m_target": 0.012,  # +1.2%
-        "time_green_min": 45,
-        "time_green_roi": 0.012,   # +1.2% min green exit
+        "time_30m_target": 0.040,  # +4.0%
+        "time_60m_target": 0.035,  # +3.5%
+        "time_green_min": 90,
+        "time_green_roi": 0.030,   # +3.0%
         "stale_minutes": 180,
         "stale_roi": -0.015,
     },
@@ -92,12 +103,23 @@ FEE_PROFILES = {
 
 CRYPTO_TICKERS = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
 
-CRYPTO_COOLDOWN = 10 * 60   # 10 minutes after selling crypto
+# Hold bias / less churn (FinRL: prefer no-trade; crypto OW fees ~0.95–1.2%)
+CRYPTO_COOLDOWN = 20 * 60   # 20 minutes after selling crypto (was 10m)
 STOCK_COOLDOWN = 20 * 60    # 20 minutes after selling stocks
+CRYPTO_TRADE_LOCK_SEC = 600  # post-fill lock — longer for crypto
+STOCK_TRADE_LOCK_SEC = 300   # equities stay at 5m
 HARD_STOP_COOLDOWN_MULT = 2.0  # hard-stop exits get a longer per-ticker lockout
 LOSS_STREAK_WINDOW_SEC = 90 * 60
 LOSS_STREAK_TRIGGER = 3        # hard stops in window → broker-wide new-buy pause
 LOSS_STREAK_PAUSE_SEC = 45 * 60
+
+# Crypto entry bar: don't spray $5 tickets when edge ≪ ~2% RT
+CRYPTO_MIN_SCORE_FOR_ENTRY = 55.0
+CRYPTO_THIN_MIN_SCORE = 70.0       # near broker floor needs stronger conviction
+CRYPTO_THIN_TICKET_MULT = 1.5      # ≤ 1.5× broker min = "thin"
+# BTC 1H ATR% above this → pause NEW crypto buys (all postures; no liquidate)
+CRYPTO_TURBULENCE_ATR_PCT = 0.025  # 2.5% — elevated chop, not a crash liquidate
+SCALE_IN_REPEAT_COOLDOWN_SEC = 45 * 60  # mute repeat scale-in noise on same name
 
 RSI_PERIOD = 14
 RSI_CEILING = 70            # 70 is standard; 60 was blocking too many real trends
@@ -122,7 +144,11 @@ DEFAULT_MAX_OPEN_RISK_PCT = 0.06  # soft book heat: sum of stop-risk $ ≤ 6% eq
 CASH_RESERVE_PCT = 0.12           # leave 12% buying power undeployed (overridden by target_bp_utilization)
 DEFAULT_TARGET_BP_UTILIZATION = 0.88  # deploy most usable BP; idle cash does not earn
 DEFAULT_SIZING_FOCUS_SLOTS = 6    # size as if filling next N tickets — not all max_open slots
-MAX_CRYPTO_BOOK_FRAC = 0.40       # max crypto share on multi-asset brokers (RH); skipped on crypto-only (CB)
+MAX_CRYPTO_BOOK_FRAC = 0.30       # max crypto share on multi-asset brokers (RH); ~$34 on a $115 book
+# Soft prefer-equity during RTH (multi-asset only): boost stocks / penalize more crypto
+RTH_EQUITY_RANK_BOOST = 12.0
+RTH_CRYPTO_RANK_PENALTY = 10.0
+SMALL_BOOK_EQUITY = 500.0         # below this, crypto soft penalties start earlier
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
 MAX_SINGLE_NAME_EQUITY_FRAC = 0.15  # soft cap: one name ≤ ~15% of equity
 # Fill-quality feedback (conservative; throttled)
@@ -161,21 +187,23 @@ RISK_POSTURE_PROFILES = {
     "safer": {
         "label": "Safer",
         "hint": (
-            "Diversified book, 25% cash buffer, banks winners sooner, no averaging-down, "
-            "no opportunity-swap — BTC uptrend required for crypto. Day DD pause ~3%."
+            "Diversified book, 25% cash buffer, rides winners via TTP trail "
+            "(no flat early green takes), no averaging-down, "
+            "no opportunity-swap — BTC uptrend + turbulence pause for crypto. Day DD pause ~3%."
         ),
         "require_crypto_regime": True,
         "target_bp_utilization_pct": 75.0,
         "sizing_focus_slots": 8,
         "max_open_positions": 10,
-        "max_buys_per_cycle": 2,
+        "max_buys_per_cycle": 1,
         "risk_pct_per_trade": 0.50,       # % of equity risked to hard stop per new ticket
         "max_open_risk_pct": 4.0,         # book heat soft cap (% equity)
         "max_single_name_equity_pct": 10.0,
         "conviction_alloc_mult_max": 1.25,
-        "exit_roi_scale": 0.80,   # lower time-exit ROI targets → take profits sooner
-        "exit_time_scale": 0.85,  # shorter green wait before banking
-        "ttp_arm_scale": 0.85,    # arm trail earlier
+        "exit_roi_scale": 1.0,
+        "exit_time_scale": 1.15,  # slightly more patient green wait
+        "ttp_arm_scale": 1.0,
+        "allow_flat_time_banks": False,  # TTP trail only for green exits
         "allow_scale_in": False,
         "scale_in_size_frac": 0.40,
         "scale_in_max_adds": 1,
@@ -192,13 +220,14 @@ RISK_POSTURE_PROFILES = {
         "label": "Balanced",
         "hint": (
             "Focus 6 slots, ~88% util, scale-in near support, opportunity-swap on with "
-            "fee gates — crypto uses each coin's trend (no BTC gate). Day DD pause ~5%."
+            "fee gates — rides winners via TTP trail (no flat early green takes). "
+            "BTC regime + turbulence pause for new crypto. Day DD pause ~5%."
         ),
-        "require_crypto_regime": False,
+        "require_crypto_regime": True,  # extended Safer BTC gate for live Balanced
         "target_bp_utilization_pct": 88.0,
         "sizing_focus_slots": 6,
         "max_open_positions": 8,
-        "max_buys_per_cycle": 2,
+        "max_buys_per_cycle": 1,
         "risk_pct_per_trade": 0.75,
         "max_open_risk_pct": 6.0,
         "max_single_name_equity_pct": 15.0,
@@ -206,6 +235,7 @@ RISK_POSTURE_PROFILES = {
         "exit_roi_scale": 1.0,
         "exit_time_scale": 1.0,
         "ttp_arm_scale": 1.0,
+        "allow_flat_time_banks": False,  # TTP trail only for green exits
         "allow_scale_in": True,
         "scale_in_size_frac": 0.50,
         "scale_in_max_adds": 1,
@@ -221,10 +251,11 @@ RISK_POSTURE_PROFILES = {
     "aggressive": {
         "label": "Aggressive",
         "hint": (
-            "Concentrated (≤20% name), high util, patient exits, deeper scale-in & rotates — "
-            "still hard-stopped. Day DD pause ~8%. Not a 'max stocks' robo mix."
+            "Concentrated (≤20% name), high util, patient TTP exits, rare flat banks only "
+            "after a local turn, deeper scale-in & rotates — still hard-stopped; "
+            "BTC turbulence pauses new crypto (no full regime gate). Day DD pause ~8%."
         ),
-        "require_crypto_regime": False,
+        "require_crypto_regime": False,  # coin trend + turbulence only
         "target_bp_utilization_pct": 95.0,
         "sizing_focus_slots": 3,
         "max_open_positions": 5,
@@ -233,9 +264,10 @@ RISK_POSTURE_PROFILES = {
         "max_open_risk_pct": 10.0,
         "max_single_name_equity_pct": 20.0,  # soft-capped vs prior 25%
         "conviction_alloc_mult_max": 1.75,
-        "exit_roi_scale": 1.35,   # need more gain before time-exit
+        "exit_roi_scale": 1.35,   # need more gain before rare time-exit
         "exit_time_scale": 1.30,  # wait longer before time-green
         "ttp_arm_scale": 1.25,    # arm trail later — let winners run
+        "allow_flat_time_banks": True,  # high-bar escape only after local turn
         "allow_scale_in": True,
         "scale_in_size_frac": 0.60,
         "scale_in_max_adds": 1,
@@ -262,22 +294,125 @@ def get_risk_posture_profile(name=None):
 
 
 def crypto_regime_required(posture=None):
-    """Only Safer posture requires the broad BTC regime gate for crypto entries."""
+    """Safer + Balanced require the broad BTC regime gate for crypto entries."""
     return bool(get_risk_posture_profile(posture).get("require_crypto_regime", False))
+
+
+def crypto_turbulence_ok():
+    """
+    FinRL-style turbulence pause: block NEW crypto buys when BTC 1H ATR% is elevated.
+    Does NOT liquidate holdings — pause entries only. Fail-open when ATR unavailable
+    (regime / score gates still apply).
+    Returns (ok: bool, reason: str).
+    """
+    atr = _atr_pct("BTC")
+    if atr is None or atr <= 0:
+        return True, ""
+    if float(atr) >= float(CRYPTO_TURBULENCE_ATR_PCT):
+        return False, (
+            f"DO NOT BUY (Turbulence: BTC ATR {float(atr)*100:.1f}% elevated — "
+            f"pause new crypto)"
+        )
+    return True, ""
 
 
 def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False):
     """
     Hard gate for NEW entries (scan + execute). Matches evaluate_* posture rules:
       - Equities: always require SPY regime unless allow_when_blocked
-      - Crypto: BTC regime only when posture.require_crypto_regime (Safer)
+      - Crypto: BTC turbulence pause (all postures); BTC regime when
+        posture.require_crypto_regime (Safer + Balanced)
     Returns (ok: bool, reason: str). Override setting defaults OFF for live.
     """
     if allow_when_blocked:
         return True, "override:allow_buys_when_regime_blocked"
-    if is_crypto and not crypto_regime_required(posture):
-        return True, ""
+    if is_crypto:
+        tok, tw = crypto_turbulence_ok()
+        if not tok:
+            return False, tw
+        if not crypto_regime_required(posture):
+            return True, ""
     return market_regime_ok(is_crypto=bool(is_crypto))
+
+
+def trade_lock_seconds(is_crypto=False):
+    """Post-fill lock duration — crypto longer to cut OW-fee churn."""
+    return int(CRYPTO_TRADE_LOCK_SEC if is_crypto else STOCK_TRADE_LOCK_SEC)
+
+
+def min_entry_edge_pct(broker_id, ticker=None, asset_type=""):
+    """Minimum expected edge for NEW discretionary buys/rotates: RT fees + buffer."""
+    return float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type)) + float(
+        MIN_ENTRY_EDGE_OVER_FEES_PCT
+    )
+
+
+def net_roi_after_fees(gross_roi, broker_id, ticker=None, asset_type=""):
+    """
+    Net ROI fraction after estimated round-trip fees (FinRL reward = Δ equity − costs).
+    Returns None when gross_roi is unknown.
+    """
+    if gross_roi is None:
+        return None
+    try:
+        g = float(gross_roi)
+    except (TypeError, ValueError):
+        return None
+    return g - float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type))
+
+
+def estimated_signal_edge_pct(score, *, is_crypto=False):
+    """
+    Map buy_rank score → rough expected edge for fee gates.
+    Conservative: crypto needs more score points to clear ~2% RT.
+    """
+    try:
+        sc = float(score or 0.0)
+    except (TypeError, ValueError):
+        sc = 0.0
+    base = 40.0
+    per_pt = 0.0010 if is_crypto else 0.0005
+    return max(0.0, (sc - base) * per_pt)
+
+
+def crypto_new_entry_ok(broker_id, ticker, score=0.0, notional=None, *, skip_turbulence=False):
+    """
+    FinRL hold-bias for NEW crypto buys (not scale-in / not protective).
+    Raises the bar vs hold; blocks thin $5 tickets when edge ≪ RT+edge.
+    Returns (ok: bool, reason: str).
+    """
+    if not skip_turbulence:
+        tok, tw = crypto_turbulence_ok()
+        if not tok:
+            return False, tw
+    try:
+        sc = float(score or 0.0)
+    except (TypeError, ValueError):
+        sc = 0.0
+    if sc < float(CRYPTO_MIN_SCORE_FOR_ENTRY):
+        return False, (
+            f"DO NOT BUY (Hold bias: score {sc:.0f} < "
+            f"{CRYPTO_MIN_SCORE_FOR_ENTRY:.0f})"
+        )
+    need = min_entry_edge_pct(broker_id, ticker, "cryptocurrency")
+    edge = estimated_signal_edge_pct(sc, is_crypto=True)
+    floor = broker_min_notional(broker_id, is_crypto=True)
+    try:
+        notion = float(notional) if notional is not None else None
+    except (TypeError, ValueError):
+        notion = None
+    if notion is not None and notion > 0 and notion <= floor * float(CRYPTO_THIN_TICKET_MULT):
+        if sc < float(CRYPTO_THIN_MIN_SCORE):
+            return False, (
+                f"DO NOT BUY (Thin ${notion:.2f} ticket: score {sc:.0f} < "
+                f"{CRYPTO_THIN_MIN_SCORE:.0f} — edge ≪ ~{need*100:.1f}% RT+edge)"
+            )
+        if edge + 1e-12 < need:
+            return False, (
+                f"DO NOT BUY (Thin ticket: est edge {edge*100:.2f}% < "
+                f"need {need*100:.2f}% RT+edge)"
+            )
+    return True, ""
 
 
 def get_scale_in_params(posture=None, settings=None):
@@ -374,7 +509,10 @@ def apply_exit_posture(fees, exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_sc
 
 def atr_adapt_exit_fees(fees, ticker=None):
     """
-    Widen hard_stop (and ttp_trail / ttp_arm) toward ATR%, capped at 2× fee base.
+    Widen hard_stop (and trail / arm / time-profit rails) toward ATR%, capped at 2× fee base.
+
+    Time-profit targets scale with the same factor as ttp_arm so ATR volatility does
+    not push the arm above flat +1–2% time banks (that caused ~fee-floor jump-ships).
     Returns a copy; no-op when ticker missing or ATR unavailable.
     """
     out = dict(fees or {})
@@ -394,7 +532,13 @@ def atr_adapt_exit_fees(fees, ticker=None):
     widened = min(widened, base_hs * ATR_SIZING_CAP_MULT)
     scale = widened / base_hs if base_hs > 0 else 1.0
     out["hard_stop"] = -widened
-    for key in ("ttp_trail", "ttp_arm"):
+    for key in (
+        "ttp_trail",
+        "ttp_arm",
+        "time_30m_target",
+        "time_60m_target",
+        "time_green_roi",
+    ):
         if key in out and out[key] is not None:
             try:
                 out[key] = float(out[key]) * scale
@@ -429,6 +573,59 @@ def enforce_min_profit_over_fees(fees, broker_id, ticker=None, asset_type=""):
     return out
 
 
+def ensure_flat_banks_above_ttp_arm(fees):
+    """
+    Keep flat time-bank ROI targets strictly above TTP arm so ~fee-floor / posture
+    scaling cannot reintroduce jump-ships before the trail is allowed to arm.
+    """
+    out = dict(fees or {})
+    try:
+        arm = float(out.get("ttp_arm") or 0.0)
+    except (TypeError, ValueError):
+        arm = 0.0
+    if arm <= 0:
+        return out
+    floor = arm * float(FLAT_TIME_BANK_ARM_MULT)
+    for key in ("time_green_roi", "time_30m_target", "time_60m_target"):
+        if key in out and out[key] is not None:
+            try:
+                out[key] = max(float(out[key]), floor)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _still_riding_local_uptrend(current_price, highest, fees, ticker=None):
+    """
+    True while the local move has not turned — suppress flat green banks.
+
+    Near position high (within TTP trail) counts as still riding. Slightly further
+    off the high still rides if short-term price > EMA20 (when chart data available).
+    """
+    try:
+        px = float(current_price or 0.0)
+        hi = float(highest or 0.0)
+        trail = float((fees or {}).get("ttp_trail") or 0.01)
+    except (TypeError, ValueError):
+        return False
+    if px <= 0 or hi <= 0:
+        return False
+    trail = max(0.005, trail)
+    # Within trail of local high — turn not confirmed; ride it
+    if px >= hi * (1.0 - trail):
+        return True
+    # Soft band: EMA still up → do not flat-bank a climbing name
+    soft = hi * (1.0 - trail * 1.75)
+    if px >= soft and ticker:
+        try:
+            _, uptrend, _, _ = _get_trend_data(ticker, interval="5m", period="1d")
+            if uptrend:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def resolve_exit_fees(
     broker_id,
     ticker=None,
@@ -437,7 +634,7 @@ def resolve_exit_fees(
     exit_time_scale=1.0,
     ttp_arm_scale=1.0,
 ):
-    """Fee profile → ATR exit adapt → posture scales → min profit-over-fees floor."""
+    """Fee profile → ATR exit adapt → posture scales → fee floor → time banks above arm."""
     fees = atr_adapt_exit_fees(
         _resolve_fee_profile(broker_id, ticker, asset_type),
         ticker,
@@ -448,7 +645,8 @@ def resolve_exit_fees(
         exit_time_scale=exit_time_scale,
         ttp_arm_scale=ttp_arm_scale,
     )
-    return enforce_min_profit_over_fees(fees, broker_id, ticker, asset_type)
+    fees = enforce_min_profit_over_fees(fees, broker_id, ticker, asset_type)
+    return ensure_flat_banks_above_ttp_arm(fees)
 
 
 # Practical concentration heuristics (maintainable, no quant library)
@@ -507,6 +705,7 @@ _portfolio_memory = {b: {} for b in _KNOWN_BROKER_IDS}
 _cooldown_memory = {b: {} for b in _KNOWN_BROKER_IDS}
 _protective_orders = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> {order_id, kind, ...}
 _scale_in_counts = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> adds already taken
+_scale_in_last_ts = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> last scale-in attempt/fill ts
 # broker -> {"events": [ts, ...], "pause_until": float}
 _loss_streak = {b: {"events": [], "pause_until": 0.0} for b in _KNOWN_BROKER_IDS}
 # Per-broker equity high-water + day open for drawdown pauses
@@ -579,6 +778,8 @@ def _auto_detect_sales(broker_id):
         del _portfolio_memory[broker_id][t]
         if broker_id in _scale_in_counts:
             _scale_in_counts[broker_id].pop(t, None)
+        if broker_id in _scale_in_last_ts:
+            _scale_in_last_ts[broker_id].pop(t, None)
 
 
 def _apply_cooldown(broker_id, ticker, sell_price, reason="", record_streak=False):
@@ -723,7 +924,10 @@ def record_scale_in(broker_id, ticker):
     key = str(ticker or "").replace("-USD", "").upper()
     if bid not in _scale_in_counts:
         _scale_in_counts[bid] = {}
+    if bid not in _scale_in_last_ts:
+        _scale_in_last_ts[bid] = {}
     _scale_in_counts[bid][key] = get_scale_in_count(bid, key) + 1
+    _scale_in_last_ts[bid][key] = time.time()
     save_state(force=True)
     return _scale_in_counts[bid][key]
 
@@ -733,6 +937,8 @@ def clear_scale_in_count(broker_id, ticker):
     key = str(ticker or "").replace("-USD", "").upper()
     if bid in _scale_in_counts:
         _scale_in_counts[bid].pop(key, None)
+    if bid in _scale_in_last_ts:
+        _scale_in_last_ts[bid].pop(key, None)
 
 
 def _calculate_macd(df, fast=12, slow=26, signal=9):
@@ -871,6 +1077,7 @@ def save_state(force=False):
             "cooldown": _cooldown_memory,
             "protective": _protective_orders,
             "scale_in_counts": _scale_in_counts,
+            "scale_in_last_ts": _scale_in_last_ts,
             "loss_streak": _loss_streak,
             "equity_dd": _equity_dd,
             "regime_last_good": _regime_last_good,
@@ -896,6 +1103,7 @@ def flush_state():
 def load_state():
     """Restore TTP/cooldown/protective/regime memory from disk."""
     global _portfolio_memory, _cooldown_memory, _protective_orders, _scale_in_counts
+    global _scale_in_last_ts
     global _loss_streak, _regime_last_good, _broker_hourly_closes, _rotate_day_counts
     global _equity_dd
     if not os.path.exists(STATE_FILE):
@@ -907,6 +1115,7 @@ def load_state():
         cool = data.get("cooldown") or {}
         prot = data.get("protective") or {}
         sic = data.get("scale_in_counts") or {}
+        silt = data.get("scale_in_last_ts") or {}
         rdc = data.get("rotate_day_counts") or {}
         if isinstance(rdc, dict):
             _rotate_day_counts.clear()
@@ -925,6 +1134,14 @@ def load_state():
                 for k, v in raw.items():
                     try:
                         _scale_in_counts[bid][str(k).upper()] = int(v)
+                    except (TypeError, ValueError):
+                        pass
+            raw_ts = silt.get(bid, {}) if isinstance(silt, dict) else {}
+            _scale_in_last_ts[bid] = {}
+            if isinstance(raw_ts, dict):
+                for k, v in raw_ts.items():
+                    try:
+                        _scale_in_last_ts[bid][str(k).upper()] = float(v)
                     except (TypeError, ValueError):
                         pass
         ls = data.get("loss_streak") or {}
@@ -1592,7 +1809,7 @@ def concentration_blocks_buy(ticker, held_tickers, holdings_meta=None, portfolio
 
 def portfolio_buy_rank_adjust(ticker, held_tickers, holdings_meta=None, portfolio_value=0.0,
                               is_crypto=False, scale_in_candidate=False,
-                              crypto_only_broker=False):
+                              crypto_only_broker=False, prefer_equity_rth=False):
     """
     Soft ranking delta so new buys prefer names that fit the *current* book.
     Hard blocks stay in concentration_blocks_buy — this only reshuffles priority
@@ -1602,6 +1819,8 @@ def portfolio_buy_rank_adjust(ticker, held_tickers, holdings_meta=None, portfoli
     entries instead of the hard -1000 bury.
 
     crypto_only_broker: skip crypto-share soft penalties (book is expected to be ~all crypto).
+    prefer_equity_rth: multi-asset + regular hours — boost equities / soft-penalize crypto
+    so a ~$115 RH book prefers stocks when the cash session is open.
     """
     clean = str(ticker or "").replace("-USD", "").upper()
     held = {str(t).replace("-USD", "").upper() for t in (held_tickers or []) if t}
@@ -1634,19 +1853,27 @@ def portfolio_buy_rank_adjust(ticker, held_tickers, holdings_meta=None, portfoli
         if h.get("is_crypto") or str(h.get("ticker", "")).upper() in CRYPTO_TICKERS:
             crypto_val += float(h.get("value") or 0.0)
     pv = float(portfolio_value or 0.0)
+    want_crypto = bool(is_crypto) or clean in CRYPTO_TICKERS
     if pv > 0:
         frac = crypto_val / pv
-        want_crypto = bool(is_crypto) or clean in CRYPTO_TICKERS
+        # Small books: start soft-penalizing crypto earlier (book discipline)
+        early = 0.85 if pv < SMALL_BOOK_EQUITY else 1.0
         if want_crypto:
-            if frac >= MAX_CRYPTO_BOOK_FRAC * 0.75:  # ≥30%
+            if frac >= MAX_CRYPTO_BOOK_FRAC * 0.75 * early:  # ≥~22.5% on small / 22.5%→30%*0.75
                 delta -= 15.0
-            elif frac >= MAX_CRYPTO_BOOK_FRAC * 0.5:  # ≥20%
+            elif frac >= MAX_CRYPTO_BOOK_FRAC * 0.5 * early:  # ≥15%
                 delta -= 6.0
-            elif frac < 0.10:
+            elif frac < 0.08:
                 delta += 8.0
         else:
-            if frac >= MAX_CRYPTO_BOOK_FRAC * 0.75:
+            if frac >= MAX_CRYPTO_BOOK_FRAC * 0.75 * early:
                 delta += 10.0
+
+    if prefer_equity_rth:
+        if want_crypto:
+            delta -= float(RTH_CRYPTO_RANK_PENALTY)
+        else:
+            delta += float(RTH_EQUITY_RANK_BOOST)
 
     return delta
 
@@ -2173,11 +2400,21 @@ def evaluate_scale_in(ticker, current_price, avg_cost, broker_id="ROBINHOOD",
         result["reason"] = f"max adds reached ({result['adds_used']}/{max_adds})"
         return result
 
+    # Mute repeat scale-in noise (FinRL: fewer actions / prefer hold)
+    bid = _normalize_broker_id(broker_id)
+    last_ts = float((_scale_in_last_ts.get(bid) or {}).get(clean, 0) or 0)
+    if last_ts > 0:
+        elapsed = time.time() - last_ts
+        if elapsed < float(SCALE_IN_REPEAT_COOLDOWN_SEC):
+            mins = int((SCALE_IN_REPEAT_COOLDOWN_SEC - elapsed) / 60) + 1
+            result["reason"] = f"scale-in cooldown ({mins}m left)"
+            return result
+
     try:
         px = float(current_price or 0.0)
-        cost = float(avg_cost or 0.0)
     except (TypeError, ValueError):
-        px, cost = 0.0, 0.0
+        px = 0.0
+    cost = _usable_holding_cost(avg_cost, px)
     if px <= 0:
         result["reason"] = "missing price"
         return result
@@ -2203,6 +2440,22 @@ def evaluate_scale_in(ticker, current_price, avg_cost, broker_id="ROBINHOOD",
     if roi > roi_max:
         result["reason"] = f"not in add ROI band ({roi*100:.2f}% > {roi_max*100:.1f}%)"
         return result
+
+    # Crypto scale-ins must still clear net-of-cost discipline on the add notional path
+    if bool(is_crypto) or clean in CRYPTO_TICKERS:
+        need = min_entry_edge_pct(broker_id, clean, asset_type or "cryptocurrency")
+        try:
+            sc_probe = float(signal_score) if signal_score is not None else None
+        except (TypeError, ValueError):
+            sc_probe = None
+        if sc_probe is not None:
+            edge = estimated_signal_edge_pct(sc_probe, is_crypto=True)
+            if edge + 1e-12 < need * 0.75:
+                result["reason"] = (
+                    f"crypto add edge thin ({edge*100:.2f}% < "
+                    f"~{need * 0.75 * 100:.1f}% of RT+edge need)"
+                )
+                return result
 
     near_pct = float(params["scale_in_near_pct"])
     ok_sup, level, detail = find_support_revisit(
@@ -2276,7 +2529,7 @@ def buy_rank_score(ticker, is_crypto=True):
 
 def buy_rank_score_for_book(ticker, is_crypto=True, held_tickers=None, holdings_meta=None,
                             portfolio_value=0.0, scale_in_candidate=False,
-                            crypto_only_broker=False):
+                            crypto_only_broker=False, prefer_equity_rth=False):
     """Signal quality + soft portfolio-fit adjustment for this book."""
     base = buy_rank_score(ticker, is_crypto=is_crypto)
     adj = portfolio_buy_rank_adjust(
@@ -2284,6 +2537,7 @@ def buy_rank_score_for_book(ticker, is_crypto=True, held_tickers=None, holdings_
         portfolio_value=portfolio_value, is_crypto=is_crypto,
         scale_in_candidate=scale_in_candidate,
         crypto_only_broker=crypto_only_broker,
+        prefer_equity_rth=prefer_equity_rth,
     )
     return base + adj
 
@@ -2303,11 +2557,11 @@ def opportunity_swap_params(posture=None):
             "enabled": False,
             "roi_floor": 0.0,
             "score_gap": 999.0,
-            "min_hold_crypto_min": 45.0,
+            "min_hold_crypto_min": 90.0,
             "min_hold_equity_min": 90.0,
             "hard_stop_buffer": 0.005,
             "max_rotates_per_day": 0,
-            "fee_buffer_pct": MIN_PROFIT_OVER_FEES_PCT,
+            "fee_buffer_pct": max(MIN_PROFIT_OVER_FEES_PCT, MIN_ENTRY_EDGE_OVER_FEES_PCT),
             "score_to_edge_pct": 0.0015,
             "freeze_on_regime_fail": True,
         }
@@ -2315,26 +2569,26 @@ def opportunity_swap_params(posture=None):
         return {
             "enabled": True,
             "roi_floor": -0.03,
-            "score_gap": 8.0,
-            "min_hold_crypto_min": 45.0,
+            "score_gap": 10.0,
+            "min_hold_crypto_min": 60.0,
             "min_hold_equity_min": 90.0,
             "hard_stop_buffer": 0.005,
-            "max_rotates_per_day": 3,
-            "fee_buffer_pct": MIN_PROFIT_OVER_FEES_PCT,
-            "score_to_edge_pct": 0.0015,
+            "max_rotates_per_day": 2,
+            "fee_buffer_pct": max(MIN_PROFIT_OVER_FEES_PCT, 0.015),
+            "score_to_edge_pct": 0.0012,  # need larger score gap to clear fees
             "freeze_on_regime_fail": True,
         }
-    # balanced
+    # balanced — tighter hold bias / fewer rotates (FinRL fewer actions)
     return {
         "enabled": True,
         "roi_floor": -0.015,
-        "score_gap": 12.0,
-        "min_hold_crypto_min": 45.0,
+        "score_gap": 15.0,
+        "min_hold_crypto_min": 90.0,
         "min_hold_equity_min": 90.0,
         "hard_stop_buffer": 0.005,
-        "max_rotates_per_day": 2,
-        "fee_buffer_pct": MIN_PROFIT_OVER_FEES_PCT,
-        "score_to_edge_pct": 0.0015,
+        "max_rotates_per_day": 1,
+        "fee_buffer_pct": max(MIN_PROFIT_OVER_FEES_PCT, 0.015),
+        "score_to_edge_pct": 0.0012,
         "freeze_on_regime_fail": True,
     }
 
@@ -2354,13 +2608,13 @@ def opportunity_swap_enabled(posture=None):
 #   MM routing (default / API v1): RH rebate ~$0.95/$100 embedded in spread ≈ 0.95% one-way.
 #   Smart exchange routing (in-app opt-in): Andrew's tiers show <$50K = 0.95% one-way.
 #   Prefer not underestimating small books → Est. 0.95% one-way either path.
-# Coinbase: Intro 1 taker = 1.2% one-way (small-book default; autotrader uses market/taker).
+# Coinbase Intro 1: maker 0.60% / taker 1.20% — MA uses market/taker → 1.2% one-way.
 # Intro 2 (0.40%/0.80% @ $10K) / Advanced 1 (0.25%/0.50% @ $25K) — lower later if volume rises.
 _FEE_ONE_WAY_PCT = {
-    "ROBINHOOD_STOCK": 0.0010,
-    "ROBINHOOD_CRYPTO": 0.0095,
-    "COINBASE": 0.0120,
-    "ETRADE_STOCK": 0.0010,
+    "ROBINHOOD_STOCK": 0.0010,   # listed $0 commission; 10 bps SEC/spread est.
+    "ROBINHOOD_CRYPTO": 0.0095,  # Est. ~0.95% smart-exchange / MM rebate tier
+    "COINBASE": 0.0120,          # Intro 1 taker (not maker 0.60%)
+    "ETRADE_STOCK": 0.0010,      # listed $0 stocks/ETFs; 10 bps friction est.
 }
 
 
@@ -2479,14 +2733,35 @@ def holding_held_minutes(broker_id, ticker, now=None):
         return None
 
 
-def is_ttp_armed_holding(broker_id, ticker, avg_cost, current_price, asset_type="",
-                         exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0):
-    """True when trailing take-profit is armed (do not rotate out winners under trail)."""
+# Cost < this fraction of live price ⇒ dust / bogus basis (same honesty as Discord _sell_roi).
+_COST_BASIS_DUST_FRAC = 0.01
+
+
+def _usable_holding_cost(avg_cost, current_price):
+    """
+    Return a usable avg cost, or 0.0 when unknown/dust.
+    Dust RH cost_bases invent mega-ROI and must not arm TTP / profit exits.
+    """
     try:
         cost = float(avg_cost or 0.0)
         px = float(current_price or 0.0)
     except (TypeError, ValueError):
+        return 0.0
+    if cost <= 0:
+        return 0.0
+    if px > 0 and cost < px * _COST_BASIS_DUST_FRAC:
+        return 0.0
+    return cost
+
+
+def is_ttp_armed_holding(broker_id, ticker, avg_cost, current_price, asset_type="",
+                         exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0):
+    """True when trailing take-profit is armed (do not rotate out winners under trail)."""
+    try:
+        px = float(current_price or 0.0)
+    except (TypeError, ValueError):
         return False
+    cost = _usable_holding_cost(avg_cost, px)
     if cost <= 0 or px <= 0:
         return False
     fees = resolve_exit_fees(
@@ -2603,11 +2878,12 @@ def pick_rotation_funding(
     gap = float(params["score_gap"])
     roi_floor = float(params["roi_floor"])
     buf = float(params["hard_stop_buffer"])
-    # Discretionary rotate edge must clear recycle fees + MIN_PROFIT_OVER_FEES_PCT
+    # Discretionary rotate edge must clear recycle fees + entry edge floor
     # (posture fee_buffer_pct is kept ≥ that floor; never grind pennies after friction).
     fee_buf = max(
         float(params.get("fee_buffer_pct") or 0.0),
         float(MIN_PROFIT_OVER_FEES_PCT),
+        float(MIN_ENTRY_EDGE_OVER_FEES_PCT),
     )
     edge_per_pt = float(params.get("score_to_edge_pct") or 0.0015)
     tnow = float(now if now is not None else time.time())
@@ -2641,9 +2917,10 @@ def pick_rotation_funding(
         except (TypeError, ValueError):
             px = 0.0
         try:
-            cost = float(h.get("avg_cost") or 0.0)
+            raw_cost = float(h.get("avg_cost") or 0.0)
         except (TypeError, ValueError):
-            cost = 0.0
+            raw_cost = 0.0
+        cost = _usable_holding_cost(raw_cost, px)
         try:
             val = float(h.get("value") or 0.0)
         except (TypeError, ValueError):
@@ -2757,23 +3034,34 @@ def last_rotation_reject_reason():
 # =========================================================================
 
 def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", live_price=None,
-                     exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0):
+                     exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0,
+                     allow_flat_time_banks=False):
     """
     Trailing take-profit / hard stop / time-stop.
     Fee thresholds change by broker so CB doesn't take thin RH-style exits.
-    ATR may widen hard_stop / trail / arm (capped at 2×); posture scales time / TTP-arm.
-    Profit-taking rails (TTP arm, time-green, time targets) are floored at
-    estimated RT fees + MIN_PROFIT_OVER_FEES_PCT. Hard stop and stale (red) exits
-    remain exempt so disasters / dead money can still clear.
+    ATR may widen hard_stop / trail / arm / time rails (capped at 2×); posture scales time / TTP-arm.
+
+    Primary green exit is peak-aware TTP trail (arm, then trail from local high).
+    Flat Time-Green / Time-Stop are off for Safer/Balanced (allow_flat_time_banks=False).
+    When enabled (Aggressive), they only fire after a local turn — never while still
+    riding near the position high / short-term EMA up. Hard stop + stale (red) stay on.
+
+    Unknown / dust cost basis: TTP and flat green exits stay gated (honesty). Hard stop
+    and stale use a live-price reference so bags are not unmanaged forever.
     """
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "HOLD (Awaiting Price)"
 
-    # Coinbase (and some RH crypto) often has no avg cost — seed at live price so
-    # TTP/time-stop can still manage the position from "now" instead of never selling.
-    if avg_cost <= 0:
-        avg_cost = current_price
+    # Coinbase / RH dust cost_bases: unknown basis — do not invent mega-ROI "wins".
+    try:
+        avg_cost = float(avg_cost or 0.0)
+    except (TypeError, ValueError):
+        avg_cost = 0.0
+    avg_cost = _usable_holding_cost(avg_cost, current_price)
+    unknown_basis = avg_cost <= 0
+    if unknown_basis:
+        avg_cost = current_price  # protective reference only
 
     fees = resolve_exit_fees(
         broker_id, ticker, asset_type,
@@ -2811,6 +3099,17 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
         save_state(force=True)
         return f"SELL (Hard Stop: {roi*100:.2f}%)"
 
+    if unknown_basis:
+        # Stale red management only — no TTP / time-green without a real basis
+        stale_min = float(fees.get("stale_minutes", 120) or 120)
+        if held_time_minutes >= stale_min and roi < fees["stale_roi"]:
+            save_state(force=True)
+            hrs = stale_min / 60.0
+            hrs_lbl = f"{hrs:.0f}h" if abs(hrs - round(hrs)) < 1e-9 else f"{hrs:.1f}h"
+            return f"SELL (Stale > {hrs_lbl}, Unknown Cost)"
+        save_state()
+        return "HOLD (Unknown Cost — TTP/ROI gated)"
+
     peak_roi = (highest - avg_cost) / avg_cost
     if peak_roi >= fees["ttp_arm"]:
         trail_trigger_price = highest * (1.0 - fees["ttp_trail"])
@@ -2820,12 +3119,16 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
         save_state()
         return f"HOLD (TTP Armed - Peak: +{peak_roi*100:.2f}%)"
 
-    # Green time-exit: bank modest winners that never reach TTP arm (was a profit dead-zone)
-    green_min = float(fees.get("time_green_min", 45) or 45)
-    green_roi = float(fees.get("time_green_roi", 0.005) or 0.005)
-    if held_time_minutes >= green_min and roi >= green_roi:
-        save_state(force=True)
-        return f"SELL (Time-Green > {green_min:.0f}m, +{roi*100:.2f}%)"
+    # Flat time banks: Safer/Balanced off. Aggressive only after local turn (not still climbing).
+    riding = _still_riding_local_uptrend(current_price, highest, fees, ticker=ticker)
+    flat_ok = bool(allow_flat_time_banks) and not riding
+
+    if flat_ok:
+        green_min = float(fees.get("time_green_min", 45) or 45)
+        green_roi = float(fees.get("time_green_roi", 0.005) or 0.005)
+        if held_time_minutes >= green_min and roi >= green_roi:
+            save_state(force=True)
+            return f"SELL (Time-Green > {green_min:.0f}m, +{roi*100:.2f}%)"
 
     stale_min = float(fees.get("stale_minutes", 120) or 120)
     if held_time_minutes >= stale_min and roi < fees["stale_roi"]:
@@ -2833,10 +3136,10 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
         hrs = stale_min / 60.0
         hrs_lbl = f"{hrs:.0f}h" if abs(hrs - round(hrs)) < 1e-9 else f"{hrs:.1f}h"
         return f"SELL (Stale > {hrs_lbl}, ROI: {roi*100:.2f}%)"
-    elif held_time_minutes >= 60 and roi >= fees["time_60m_target"]:
+    elif flat_ok and held_time_minutes >= 60 and roi >= fees["time_60m_target"]:
         save_state(force=True)
         return f"SELL (Time-Stop > 1h, +{fees['time_60m_target']*100:.1f}% Target Hit)"
-    elif held_time_minutes >= 30 and roi >= fees["time_30m_target"]:
+    elif flat_ok and held_time_minutes >= 30 and roi >= fees["time_30m_target"]:
         save_state(force=True)
         return f"SELL (Time-Stop > 30m, +{fees['time_30m_target']*100:.1f}% Target Hit)"
 
@@ -2849,8 +3152,10 @@ def evaluate_crypto_opportunity(ticker, broker_id="ROBINHOOD", live_price=None, 
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "DO NOT BUY (Awaiting Price)"
 
-    # Safer requires broad BTC risk-on confirmation. Balanced/Aggressive deliberately
-    # bypass only this broad gate; all ticker-specific entry gates below still apply.
+    # Turbulence pause (all postures) + Safer/Balanced BTC regime gate
+    tok, turbulence_why = crypto_turbulence_ok()
+    if not tok:
+        return turbulence_why
     if crypto_regime_required(posture):
         ok, reason = market_regime_ok(is_crypto=True)
         if not ok: return reason
@@ -2869,7 +3174,17 @@ def evaluate_crypto_opportunity(ticker, broker_id="ROBINHOOD", live_price=None, 
     if not has_volume: return "DO NOT BUY (Low Volume Fakeout)"
 
     if micro_bullish:
-        return f"BUY (MTF Confirmed | RSI: {rsi:.1f})"
+        # Hold bias: weak scores stay HOLD — prefer no-trade vs OW-fee churn
+        try:
+            sc = float(buy_rank_score(ticker, is_crypto=True))
+        except Exception:
+            sc = 0.0
+        if sc < float(CRYPTO_MIN_SCORE_FOR_ENTRY):
+            return (
+                f"DO NOT BUY (Hold bias: score {sc:.0f} < "
+                f"{CRYPTO_MIN_SCORE_FOR_ENTRY:.0f})"
+            )
+        return f"BUY (MTF Confirmed | RSI: {rsi:.1f} | Score: {sc:.0f})"
 
     return "DO NOT BUY (Consolidating)"
 
