@@ -1,9 +1,7 @@
 {
   "COINBASE": {
-    "DOGE": 0.0710,
-    "LINK": 8.44,
-    "ETH": 1941.00,
-    "SHIB": 0.00000481
+    "FET": 0.0,
+    "AMP": 0.0,
   },
   "ROBINHOOD": {
     "SHIB": 0.000015
