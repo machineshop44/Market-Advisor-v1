@@ -76,7 +76,15 @@ class TestAutoCycleCoachThrottle(unittest.TestCase):
         self.assertIn("no_actionable:missing_cost", key)
         self.assertIn("cost basis", tip)
 
-    def test_no_actionable_note(self):
+    def test_regime_idle_coach_tip(self):
+        key, tip = ac.regime_idle_coach_tip(
+            "Robinhood", "CORE", idle_sec=3700,
+            regime_reason="DO NOT BUY (Regime: SPY 1H Downtrend)",
+        )
+        self.assertIn("regime_idle:blocked", key)
+        self.assertIn("61m", tip)
+        self.assertIn("Regime", tip)
+
         line = ac.format_no_actionable_scan_note(
             "Coinbase", "CRYPTO", 3, visible=["ETH (held)"], suppressed=1,
         )
@@ -88,6 +96,46 @@ class TestAutoCycleCoachThrottle(unittest.TestCase):
                 "Coinbase", "CRYPTO", 2, visible=[], suppressed=2,
             )
         )
+
+    def test_filter_affordable_buy_candidates(self):
+        cands = [{"ticker": "ETH", "asset_type": "crypto", "price": 3000, "score": 70}]
+        ok, dropped = ac.filter_affordable_buy_candidates(
+            cands,
+            buying_power=3.0,
+            equity=200.0,
+            broker_id="ROBINHOOD",
+            settings={"min_trade_dollars": 5.0, "target_bp_utilization_pct": 88.0},
+        )
+        self.assertEqual(len(ok), 0)
+        self.assertTrue(dropped[0].startswith("ETH (unaffordable:"))
+        ok2, dropped2 = ac.filter_affordable_buy_candidates(
+            cands,
+            buying_power=100.0,
+            equity=200.0,
+            broker_id="ROBINHOOD",
+            settings={"min_trade_dollars": 5.0, "target_bp_utilization_pct": 88.0},
+        )
+        self.assertEqual(len(ok2), 1)
+        self.assertEqual(dropped2, [])
+
+    def test_locked_capital_summary_goevq(self):
+        holdings = [
+            {
+                "broker": "Robinhood",
+                "ticker": "GOEVQ",
+                "shares": 10,
+                "price": 0.0,
+                "value": 0.0,
+            }
+        ]
+        s = ac.locked_capital_summary(holdings)
+        self.assertEqual(s["count"], 1)
+        self.assertIn("GOEVQ", s["rows"][0]["ticker"])
+
+    def test_effective_book_equity(self):
+        self.assertAlmostEqual(ac.effective_book_equity(207.0, 12.5), 194.5)
+        self.assertAlmostEqual(ac.effective_book_equity(50.0, 100.0), 0.0)
+        self.assertAlmostEqual(ac.effective_book_equity(0.0, 5.0), 0.0)
 
     def test_scale_in_skip_throttle(self):
         store = {}

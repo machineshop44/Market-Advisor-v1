@@ -936,12 +936,23 @@ def _drawdown_block(broker_id):
     return True, ""
 
 
-def get_drawdown_status(broker_id):
+def get_drawdown_status(broker_id, equity=None):
     """Snapshot for UI / monitor."""
     broker_id = _normalize_broker_id(broker_id)
     st = dict(_equity_dd.get(broker_id) or {})
     now = time.time()
     st["paused"] = float(st.get("pause_until") or 0) > now
+    try:
+        eq = float(equity) if equity is not None else 0.0
+    except (TypeError, ValueError):
+        eq = 0.0
+    if eq > 0:
+        day_open = float(st.get("day_open") or eq)
+        peak = float(st.get("peak") or eq)
+        if day_open > 0:
+            st["day_dd_pct"] = (eq - day_open) / day_open
+        if peak > 0:
+            st["peak_dd_pct"] = (eq - peak) / peak
     return st
 
 
@@ -1318,6 +1329,9 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
         "day_pnl": 0.0,
         "dd_paused": False,
         "dd_reason": "",
+        "dd_mins_left": 0,
+        "dd_brokers": [],
+        "peak_dd_worst_pct": 0.0,
         "loss_disarmed": False,
         "loss_room": 0.0 if loss_limit > 0 else None,
         "session_risk_used_pct": 0.0,
@@ -1337,12 +1351,20 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
         except (TypeError, ValueError):
             eq, bp, pnl = 0.0, 0.0, 0.0
         armed = bool(row.get("armed"))
-        dd = get_drawdown_status(bid)
+        dd = get_drawdown_status(bid, equity=eq)
         dd_paused = bool(dd.get("paused"))
         dd_reason = str(dd.get("pause_reason") or "")
         mins_left = 0
         if dd_paused:
             mins_left = int(max(0.0, float(dd.get("pause_until") or 0.0) - now) / 60.0) + 1
+        try:
+            peak_dd_pct = float(dd.get("peak_dd_pct") or 0.0)
+        except (TypeError, ValueError):
+            peak_dd_pct = 0.0
+        try:
+            day_dd_pct = float(dd.get("day_dd_pct") or 0.0)
+        except (TypeError, ValueError):
+            day_dd_pct = 0.0
 
         risk_dollars = 0.0
         for h in row.get("holdings") or []:
@@ -1387,6 +1409,8 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
             "dd_paused": dd_paused,
             "dd_reason": dd_reason,
             "dd_mins_left": mins_left,
+            "peak_dd_pct": peak_dd_pct,
+            "day_dd_pct": day_dd_pct,
             "armed": armed,
             "loss_limit": loss_limit,
             "loss_room": loss_room,
@@ -1402,8 +1426,14 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
         combined["day_pnl"] += pnl
         if dd_paused:
             combined["dd_paused"] = True
+            combined["dd_mins_left"] = max(int(combined.get("dd_mins_left") or 0), mins_left)
+            combined["dd_brokers"].append(name or bid)
             if not combined["dd_reason"]:
                 combined["dd_reason"] = dd_reason
+        combined["peak_dd_worst_pct"] = min(
+            float(combined.get("peak_dd_worst_pct") or 0.0),
+            peak_dd_pct,
+        )
         if snap["loss_disarmed"]:
             combined["loss_disarmed"] = True
         if armed:
@@ -2872,6 +2902,54 @@ def effective_min_dollars(broker_id, equity, is_crypto, settings_min=5.0):
     if is_crypto and pv > 0 and pv < SMALL_BOOK_EQUITY:
         min_d = max(min_d, float(SMALL_BOOK_CRYPTO_MIN_DOLLARS))
     return min_d
+
+
+def buy_candidate_affordable(
+    *,
+    buying_power,
+    price,
+    is_crypto,
+    broker_id,
+    equity,
+    settings=None,
+    scale_in=False,
+    prefer_whole_shares=False,
+) -> tuple[bool, str]:
+    """
+    Pre-rank gate: skip promoting names the book cannot fund at min ticket / whole share.
+    Lightweight vs full risk_sizing_breakdown — avoids ranking ETH(70) when BP is $4.
+    """
+    settings = settings or {}
+    try:
+        bp = float(buying_power or 0.0)
+    except (TypeError, ValueError):
+        bp = 0.0
+    try:
+        px = float(price or 0.0)
+    except (TypeError, ValueError):
+        px = 0.0
+    min_d = effective_min_dollars(
+        broker_id, equity, is_crypto, settings.get("min_trade_dollars", 5.0)
+    )
+    try:
+        util = float(settings.get("target_bp_utilization_pct", 88.0))
+        if util > 1.0:
+            util = util / 100.0
+    except (TypeError, ValueError):
+        util = 0.88
+    util = min(0.99, max(0.50, util))
+    deployable = max(0.0, bp * util)
+    if deployable + 1e-9 < min_d:
+        return False, f"deployable ${deployable:.2f} < min ${min_d:.2f}"
+    if (
+        not is_crypto
+        and not scale_in
+        and prefer_whole_shares
+        and px > 0
+        and int(deployable / px) < 1
+    ):
+        return False, f"cannot afford 1 whole share @ ${px:.2f}"
+    return True, ""
 
 
 def resolve_journal_fee_key(fee_profile, broker_id=None, ticker=None, asset_type=""):

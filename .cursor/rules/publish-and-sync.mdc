@@ -9,7 +9,7 @@ When shipping a coherent version bump or meaningful feature/fix batch on any And
 
 ## Windows EXE / installer
 
-- After building a frozen EXE or installer, **always run the project publish script** (e.g. `publish-exe-to-drive.ps1`) so artifacts land on **`G:\My Drive\exe\`** with versioned names + SHA256 checksums.
+- After building, run `publish-exe-to-drive.ps1` (default: **installer only**) so **`MarketAdvisor-<ver>-x64.exe`** + SHA256 land on **`G:\My Drive\exe\`**. Skip portable zip unless desk migrate (`-IncludePortable`).
 - Do not leave a build only in `release/` or `dist/` without copying to Drive.
 - Tell Andrew the Drive paths and checksum file when done.
 

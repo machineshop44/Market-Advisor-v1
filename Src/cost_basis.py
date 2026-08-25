@@ -18,8 +18,11 @@ COST_BASIS_DUST_FRAC = 0.01
 
 
 def normalize_ticker(ticker: str | None) -> str:
-    """ETH-USD / eth → ETH for journal ↔ holdings matching."""
-    return str(ticker or "").replace("-USD", "").strip().upper()
+    """ETH-USD / eth-usd / eth → ETH for journal ↔ holdings matching."""
+    t = str(ticker or "").strip().upper()
+    if t.endswith("-USD"):
+        t = t[:-4]
+    return t
 
 
 def cost_is_dust(cost: float, mark: float, *, frac: float = COST_BASIS_DUST_FRAC) -> bool:
@@ -280,3 +283,52 @@ def cache_to_persistable(cache: dict | None) -> dict[str, dict[str, float]]:
         if clean:
             out[str(broker)] = clean
     return out
+
+
+_SEED_BROKER_ALIASES = {
+    "CB": "Coinbase",
+    "COINBASE": "Coinbase",
+    "RH": "Robinhood",
+    "ROBINHOOD": "Robinhood",
+    "ET": "E*TRADE",
+    "ETRADE": "E*TRADE",
+    "E*TRADE": "E*TRADE",
+}
+
+
+def load_seed_file(path: str | None = None) -> dict[str, dict[str, float]]:
+    """
+    Optional seed.json beside cost_basis.py — {BROKER: {TICKER: avg_cost}}.
+    Skips zero/negative placeholders. Prefer Settings cost-basis paste (persists in settings).
+    """
+    import json
+    import os
+
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed.json")
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    return normalize_cache_map(_normalize_seed_brokers(raw))
+
+
+def _normalize_seed_brokers(raw: dict) -> dict:
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for broker_key, tickers in raw.items():
+        b = _SEED_BROKER_ALIASES.get(str(broker_key or "").strip().upper(), str(broker_key or ""))
+        if isinstance(tickers, dict):
+            out[b] = tickers
+    return out
+
+
+def seed_lookup(broker: str, ticker: str, seeds: dict | None = None) -> float:
+    """Tier-4 last-known avg from optional seed.json map."""
+    if seeds is None:
+        seeds = load_seed_file()
+    return cache_lookup(seeds, broker, ticker)

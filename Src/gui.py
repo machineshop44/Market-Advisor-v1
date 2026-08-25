@@ -260,14 +260,32 @@ def load_settings():
     if defaults.get("interval_core", 300) < 120: defaults["interval_core"] = 300
     if defaults.get("interval_portfolio", 60) < 30: defaults["interval_portfolio"] = 30
     if defaults.get("interval_balance_refresh", 60) < 30: defaults["interval_balance_refresh"] = 30
+
+    try:
+        import credentials as cred_mod
+        if cred_mod.migrate_settings_secrets(defaults):
+            try:
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(cred_mod.scrub_settings_for_disk(defaults), f, indent=4)
+            except Exception:
+                pass
+    except Exception:
+        pass
         
     return defaults
 
 
 def save_settings(settings):
     try:
+        payload = dict(settings or {})
+        try:
+            import credentials as cred_mod
+            payload = cred_mod.scrub_settings_for_disk(payload)
+        except Exception:
+            payload.pop("rh_password", None)
+            payload.pop("cb_api_secret", None)
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(settings, f, indent=4)
+            json.dump(payload, f, indent=4)
     except Exception as e:
         print(f"Error saving settings: {e}")
 
@@ -1249,6 +1267,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._last_stop_repair_pass = 0.0
         self._heat_holdings_by_broker = _blank_broker_map(lambda: [])
         self._coach_tip_keys = set()  # one [COACH] tip per skip-reason per cycle
+        self._scan_idle_since = {}  # f"{broker}:{engine}" -> ts of last raw BUY signal
         self._buy_skip_throttle = {}  # (broker, kind) -> last log ts (BP/rotate spam)
         self._scan_drop_throttle = {}  # (broker, engine, ticker) -> last log ts
         self._cost_unknown_logged = set()  # "Broker:TICKER" cost-basis unknown once
@@ -1266,6 +1285,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._journal_basis_rows_ts = 0.0
         self._scoring_state_loaded = False
         self._restore_cost_basis_cache()
+        self._merge_seed_cost_basis()
         self.last_crypto_time = _blank_broker_map(0)
         self.last_penny_time = _blank_broker_map(0)
         self.last_core_time = _blank_broker_map(0)
@@ -1923,6 +1943,19 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             pass
 
+    def _merge_seed_cost_basis(self):
+        """Optional seed.json → cost_basis_cache (Settings paste is preferred long-term)."""
+        try:
+            import cost_basis as cb_mod
+            seeds = cb_mod.load_seed_file()
+            for broker, tickers in (seeds or {}).items():
+                bucket = self.cost_basis_cache.setdefault(broker, {})
+                for t, c in tickers.items():
+                    if float(c or 0) > 0 and float(bucket.get(t) or 0) <= 0:
+                        bucket[t] = float(c)
+        except Exception:
+            pass
+
     def _persist_cost_basis_cache(self, *, force: bool = False):
         """Throttle-write last-known cost basis into settings (survives restart)."""
         now = time.time()
@@ -2011,6 +2044,36 @@ class MarketAdvisorGUI(QMainWindow):
             if float(cached.get("p_val") or 0.0) > 0 or float(cached.get("bp") or 0.0) > 0:
                 return float(cached.get("p_val") or 0.0), float(cached.get("bp") or 0.0)
             raise
+
+    def _locked_capital_value(self, broker_name=None):
+        """OTC/dust/no-quote notional for one broker (cached from Home refresh when possible)."""
+        broker_name = broker_name or self.cycle_broker_name
+        by_b = getattr(self, "_last_locked_by_broker", None) or {}
+        if broker_name in by_b:
+            return float(by_b.get(broker_name) or 0.0)
+        holdings = []
+        for a in getattr(self, "_last_assets_snapshot", None) or []:
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("broker") or "") == broker_name:
+                holdings.append(a)
+        if not holdings:
+            try:
+                for a in self.get_broker_holdings(broker_name) or []:
+                    row = dict(a)
+                    row.setdefault("broker", broker_name)
+                    holdings.append(row)
+            except Exception:
+                pass
+        return _auto_cycle.locked_value_from_holdings(holdings)
+
+    def get_effective_balances(self, broker_name=None):
+        """(effective_equity, buying_power, locked_value) — equity net of locked bags."""
+        broker_name = broker_name or self.cycle_broker_name
+        p_val, bp = self.get_broker_balances(broker_name)
+        locked = self._locked_capital_value(broker_name)
+        eff = _auto_cycle.effective_book_equity(p_val, locked)
+        return eff, bp, locked
 
     def get_broker_holdings(self, broker_name=None):
         """Returns a list of holding dicts for either the sandbox or the real broker."""
@@ -4847,6 +4910,19 @@ class MarketAdvisorGUI(QMainWindow):
         brokers_layout.setSpacing(ui_px(8))
         self._home_brokers_layout = brokers_layout
 
+        self.home_basis_nudge = QLabel("")
+        self.home_basis_nudge.setWordWrap(True)
+        self.home_basis_nudge.setVisible(False)
+        self.home_basis_nudge.setStyleSheet(
+            f"color: #F9A825; font-size: {ui_px(12)}px; font-weight: 600; "
+            f"padding: {ui_px(4)}px {ui_px(8)}px;"
+        )
+        self.home_basis_nudge.setToolTip(
+            "Holdings with unknown avg cost cannot use honest TTP/ROI/scale-in. "
+            "Fix via Settings → Cost basis paste (e.g. Robinhood:SHIB=0.000012)."
+        )
+        brokers_layout.addWidget(self.home_basis_nudge)
+
         def _pack_broker_metrics(hbox, labels):
             """Keep portfolio / BP / P&L grouped — don't fling them to opposite edges on wide windows."""
             for lbl in labels:
@@ -4871,9 +4947,19 @@ class MarketAdvisorGUI(QMainWindow):
         self.home_rh_bp_lbl.setStyleSheet(f"font-size: {ui_px(13)}px;")
         self.home_rh_pl_lbl = QLabel("Day P&L: $0.00")
         self.home_rh_pl_lbl.setStyleSheet(f"font-size: {ui_px(13)}px;")
+        self.home_rh_basis_chip = QLabel("Basis: —")
+        self.home_rh_basis_chip.setObjectName("homeBrokerMetric")
+        tc_rh = theme_colors(self.dark_mode)
+        self.home_rh_basis_chip.setStyleSheet(
+            f"font-size: {ui_px(11)}px; font-weight: 700; color: {tc_rh['muted']}; "
+            f"padding: {ui_px(2)}px {ui_px(8)}px;"
+        )
+        self.home_rh_basis_chip.setToolTip(
+            "Robinhood avg cost from broker when available; else journal / Settings paste / seed.json."
+        )
         _pack_broker_metrics(
             rh_layout,
-            (self.home_rh_val_lbl, self.home_rh_bp_lbl, self.home_rh_pl_lbl),
+            (self.home_rh_val_lbl, self.home_rh_bp_lbl, self.home_rh_pl_lbl, self.home_rh_basis_chip),
         )
         self.rh_card.setLayout(rh_layout)
         brokers_layout.addWidget(self.rh_card)
@@ -5004,9 +5090,11 @@ class MarketAdvisorGUI(QMainWindow):
         self.home_shadow_chip = QLabel("Shadow: —")
         self.home_fill_chip = QLabel("Fill: —")
         self.home_frac_chip = QLabel("Frac: —")
+        self.home_locked_chip = QLabel("Locked: —")
         for chip in (
             self.home_dd_chip, self.home_loss_chip, self.home_stops_chip,
             self.home_shadow_chip, self.home_fill_chip, self.home_frac_chip,
+            self.home_locked_chip,
         ):
             chip.setStyleSheet(
                 f"font-size: {ui_px(11)}px; font-weight: 600; padding: {ui_px(2)}px {ui_px(8)}px;"
@@ -5027,7 +5115,19 @@ class MarketAdvisorGUI(QMainWindow):
         self.home_session_meter_lbl = QLabel("Session risk: —")
         self.home_session_meter_lbl.setStyleSheet(f"font-size: {ui_px(11)}px;")
         chip_row.addWidget(self.home_session_meter_lbl)
+        self.home_locked_chip.setToolTip(
+            "OTC/delisted (*Q), dust, and no-quote holdings — not deployable capital "
+            "(excluded from rotate/sizing honesty)."
+        )
         heat_lay.addWidget(self.home_heat_lbl)
+        self.home_locked_nudge = QLabel("")
+        self.home_locked_nudge.setWordWrap(True)
+        self.home_locked_nudge.setVisible(False)
+        self.home_locked_nudge.setStyleSheet(
+            f"color: #EF6C00; font-size: {ui_px(11)}px; font-weight: 600; "
+            f"padding: {ui_px(2)}px 0;"
+        )
+        heat_lay.addWidget(self.home_locked_nudge)
         heat_lay.addLayout(chip_row)
         self.heat_card.setLayout(heat_lay)
         right_lay.addWidget(self.heat_card)
@@ -6601,7 +6701,12 @@ class MarketAdvisorGUI(QMainWindow):
         rh_form.setSpacing(ui_px(8))
         self.rh_dialog_status_lbl = QLabel("🔴 Disconnected")
         self.rh_email_input = QLineEdit(self.settings.get("rh_email", ""))
-        self.rh_pass_input = QLineEdit(self.settings.get("rh_password", ""))
+        try:
+            import credentials as cred_mod
+            _rh_pwd = cred_mod.load_rh_password() or self.settings.get("rh_password", "")
+        except Exception:
+            _rh_pwd = self.settings.get("rh_password", "")
+        self.rh_pass_input = QLineEdit(_rh_pwd)
         self.rh_pass_input.setEchoMode(QLineEdit.Password)
         self.rh_connect_btn = QPushButton("Connect Robinhood")
         self.rh_connect_btn.setProperty("uiBtnKind", "primary")
@@ -6630,7 +6735,12 @@ class MarketAdvisorGUI(QMainWindow):
         cb_form.setSpacing(ui_px(8))
         self.cb_dialog_status_lbl = QLabel("🔴 Disconnected")
         self.cb_key_input = QLineEdit(self.settings.get("cb_api_key", ""))
-        self.cb_secret_input = QLineEdit(self.settings.get("cb_api_secret", ""))
+        try:
+            import credentials as cred_mod
+            _cb_secret = cred_mod.load_cb_api_secret() or self.settings.get("cb_api_secret", "")
+        except Exception:
+            _cb_secret = self.settings.get("cb_api_secret", "")
+        self.cb_secret_input = QLineEdit(_cb_secret)
         self.cb_secret_input.setEchoMode(QLineEdit.Password)
         self.cb_live_trading_chk = QCheckBox("Enable live order placement (kill switch)")
         self.cb_live_trading_chk.setChecked(bool(self.settings.get("coinbase_live_trading", True)))
@@ -7438,7 +7548,16 @@ class MarketAdvisorGUI(QMainWindow):
         if ok:
             self._set_broker_status("Robinhood", "🟢 Connected", "color: #00E676; font-weight: bold;")
             self.settings["rh_email"] = email
-            self.settings["rh_password"] = password
+            try:
+                import credentials as cred_mod
+                if password and cred_mod.store_rh_password(password):
+                    self.settings["rh_password"] = ""
+                elif password:
+                    self.settings["rh_password"] = password
+                else:
+                    self.settings["rh_password"] = ""
+            except Exception:
+                self.settings["rh_password"] = password
             save_settings(self.settings)
             # Confirm robin_stocks wrote/kept ~/.tokens/robinhood.pickle for next launch
             try:
@@ -7514,7 +7633,17 @@ class MarketAdvisorGUI(QMainWindow):
         if result.get("ok"):
             self._set_broker_status("Coinbase", "🟢 Connected", "color: #00E676; font-weight: bold;")
             self.settings["cb_api_key"] = result.get("key") or ""
-            self.settings["cb_api_secret"] = result.get("secret") or ""
+            secret = result.get("secret") or ""
+            try:
+                import credentials as cred_mod
+                if secret and cred_mod.store_cb_api_secret(secret):
+                    self.settings["cb_api_secret"] = ""
+                elif secret:
+                    self.settings["cb_api_secret"] = secret
+                else:
+                    self.settings["cb_api_secret"] = ""
+            except Exception:
+                self.settings["cb_api_secret"] = secret
             if "live" in result:
                 self.settings["coinbase_live_trading"] = bool(result.get("live"))
             elif hasattr(self, "cb_live_trading_chk"):
@@ -7559,14 +7688,25 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             result["rh_ok"] = False
         if not result["rh_ok"]:
-            if self.settings.get("rh_email") and self.settings.get("rh_password"):
+            try:
+                import credentials as cred_mod
+                rh_pwd = cred_mod.load_rh_password() or self.settings.get("rh_password", "")
+            except Exception:
+                rh_pwd = self.settings.get("rh_password", "")
+            if self.settings.get("rh_email") and rh_pwd:
                 result["rh_needs_password"] = True
 
-        if self.settings.get("cb_api_key") and self.settings.get("cb_api_secret"):
+        cb_secret = ""
+        try:
+            import credentials as cred_mod
+            cb_secret = cred_mod.load_cb_api_secret() or self.settings.get("cb_api_secret", "")
+        except Exception:
+            cb_secret = self.settings.get("cb_api_secret", "")
+        if self.settings.get("cb_api_key") and cb_secret:
             try:
                 ok, _ = self.brokers["Coinbase"].login({
                     "api_key": self.settings["cb_api_key"],
-                    "api_secret": self.settings["cb_api_secret"],
+                    "api_secret": cb_secret,
                     "live_trading_enabled": bool(self.settings.get("coinbase_live_trading", True)),
                 })
                 result["cb_ok"] = bool(ok)
@@ -7597,7 +7737,15 @@ class MarketAdvisorGUI(QMainWindow):
         """
         if hasattr(self, "rh_email_input"):
             email = self.rh_email_input.text().strip() or self.settings.get("rh_email", "")
-            password = self.rh_pass_input.text().strip() or self.settings.get("rh_password", "")
+            try:
+                import credentials as cred_mod
+                password = (
+                    self.rh_pass_input.text().strip()
+                    or cred_mod.load_rh_password()
+                    or self.settings.get("rh_password", "")
+                )
+            except Exception:
+                password = self.rh_pass_input.text().strip() or self.settings.get("rh_password", "")
             self.rh_email_input.setText(email)
             self.rh_pass_input.setText(password)
         self.connect_robinhood()
@@ -8375,13 +8523,17 @@ class MarketAdvisorGUI(QMainWindow):
         for name in BROKER_NAMES:
             p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
             bp = float(totals.get(name, {}).get("bp", 0.0) or 0.0)
+            locked = _auto_cycle.locked_value_from_holdings(holdings_by.get(name) or [])
+            eff_eq = _auto_cycle.effective_book_equity(p_val, locked)
             start = self.session_starts.get(name)
             pl = (p_val - start) if start is not None and start > 0 else 0.0
             bid = {"Robinhood": "ROBINHOOD", "Coinbase": "COINBASE", "E*TRADE": "ETRADE"}.get(name, name)
             rows.append({
                 "broker": name,
                 "broker_id": bid,
-                "equity": p_val,
+                "equity": eff_eq,
+                "raw_equity": p_val,
+                "locked_value": locked,
                 "buying_power": bp,
                 "day_pnl": pl,
                 "armed": bool(self.auto_trade_enabled.get(name)),
@@ -8399,24 +8551,60 @@ class MarketAdvisorGUI(QMainWindow):
         head = float(c.get("bp_headroom") or 0)
         room = c.get("loss_room")
         used = float(c.get("session_risk_used_pct") or 0)
-        self.home_heat_lbl.setText(
+        locked_total = sum(float(r.get("locked_value") or 0.0) for r in rows)
+        heat_txt = (
             f"Open risk ≈ {format_currency(risk_d)} ({risk_p:.1f}% equity) · "
             f"BP headroom ≈ {format_currency(head)} · "
             f"Day P&L {format_currency(c.get('day_pnl') or 0)}"
         )
+        if locked_total > 0.01:
+            heat_txt += f" · Locked {format_money(locked_total)} excluded from sizing"
+        self.home_heat_lbl.setText(heat_txt)
         if c.get("dd_paused"):
             why = c.get("dd_reason") or "drawdown"
-            self.home_dd_chip.setText(f"DD: buys paused ({why})")
+            mins = int(c.get("dd_mins_left") or 0)
+            brokers = c.get("dd_brokers") or []
+            peak_dd = float(c.get("peak_dd_worst_pct") or 0.0)
+            eq = float(c.get("equity") or 0.0)
+            small_book = 0 < eq < 500.0
+            if brokers:
+                btxt = ", ".join(str(b) for b in brokers[:2])
+                self.home_dd_chip.setText(
+                    f"DD: paused ({btxt}; {mins}m left)"
+                )
+            else:
+                self.home_dd_chip.setText(f"DD: buys paused ({why}; {mins}m left)")
+            tip = (
+                f"{why}. New buys paused ~{mins}m. "
+                f"Peak DD from session high: {peak_dd * 100:.1f}%."
+            )
+            if small_book:
+                tip += " Small book (<$500): crypto min ticket $8 active."
+            self.home_dd_chip.setToolTip(tip)
             self.home_dd_chip.setStyleSheet(
                 f"font-size: {ui_px(11)}px; font-weight: 600; color: #E65100; "
                 f"padding: {ui_px(2)}px {ui_px(8)}px;"
             )
         else:
-            self.home_dd_chip.setText("DD: ok (buys allowed)")
+            eq = float(c.get("equity") or 0.0)
+            peak_dd = float(c.get("peak_dd_worst_pct") or 0.0)
+            small_book = 0 < eq < 500.0
+            if small_book:
+                self.home_dd_chip.setText("DD: ok · small-book hygiene")
+                self.home_dd_chip.setToolTip(
+                    f"Buys allowed. Book ~{format_money(eq)} — crypto min ticket $8, "
+                    f"peak DD {peak_dd * 100:.1f}% from session high."
+                )
+            else:
+                self.home_dd_chip.setText("DD: ok (buys allowed)")
+                self.home_dd_chip.setToolTip(
+                    f"Peak DD {peak_dd * 100:.1f}% from session high (pause triggers on posture thresholds)."
+                )
             self.home_dd_chip.setStyleSheet(
                 f"font-size: {ui_px(11)}px; font-weight: 600; "
                 f"padding: {ui_px(2)}px {ui_px(8)}px;"
             )
+        self._refresh_locked_capital_chip()
         if c.get("loss_disarmed"):
             self.home_loss_chip.setText("$-loss: DISARMED")
             self.home_loss_chip.setStyleSheet(
@@ -8560,7 +8748,7 @@ class MarketAdvisorGUI(QMainWindow):
             # Publish for companion / monitor
             self._last_cluster_heat = clusters
             self._last_protective_health = health
-            self._refresh_cb_basis_chip()
+            self._refresh_basis_chips()
             self._refresh_fill_chip()
         except Exception:
             pass
@@ -8630,46 +8818,196 @@ class MarketAdvisorGUI(QMainWindow):
         )
         self.home_fill_chip.setToolTip(tip)
 
-    def _refresh_cb_basis_chip(self):
-        """Home Coinbase chip: unknown cost-basis count for honesty."""
-        if not hasattr(self, "home_cb_basis_chip"):
+    def _refresh_locked_capital_chip(self):
+        """Home OTC/dust capital checklist — not deployable for rotates/sizing."""
+        chip = getattr(self, "home_locked_chip", None)
+        nudge = getattr(self, "home_locked_nudge", None)
+        if chip is None:
             return
         tc = theme_colors(self.dark_mode)
-        unknown = 0
-        try:
-            assets = getattr(self, "_last_portfolio_assets", None) or []
-            if not assets:
-                # Fall back to cache keys with no positive cost
-                cache = (self.cost_basis_cache or {}).get("Coinbase") or {}
-                # Prefer live holdings count from table when present
-                for row in range(getattr(self, "portfolio_table", None).rowCount() if hasattr(self, "portfolio_table") else 0):
-                    b = self.portfolio_table.item(row, 0)
-                    c = self.portfolio_table.item(row, 3)
-                    if b and b.text() == "Coinbase" and c and (
-                        c.text() == "cost ?" or c.text() in ("$0.00", "0", "")
-                    ):
-                        unknown += 1
-                if unknown == 0 and cache is not None:
-                    # No CB rows visible — show tracked state
-                    pass
-            else:
-                unknown = _auto_cycle.count_unknown_cost_holdings(
-                    assets, broker_name="Coinbase",
-                )
-        except Exception:
-            unknown = 0
-        if unknown > 0:
-            self.home_cb_basis_chip.setText(f"Basis: {unknown} unknown")
-            self.home_cb_basis_chip.setStyleSheet(
-                f"font-size: {ui_px(11)}px; font-weight: 700; color: #F9A825; "
-                f"padding: {ui_px(2)}px {ui_px(8)}px;"
-            )
+        holdings: list = []
+        assets = getattr(self, "_last_assets_snapshot", None) or []
+        if assets:
+            holdings = list(assets)
         else:
-            self.home_cb_basis_chip.setText("Basis: tracked")
-            self.home_cb_basis_chip.setStyleSheet(
-                f"font-size: {ui_px(11)}px; font-weight: 700; color: {tc['muted']}; "
+            for name in BROKER_NAMES:
+                for h in (getattr(self, "_heat_holdings_by_broker", {}) or {}).get(name) or []:
+                    row = dict(h) if isinstance(h, dict) else {}
+                    row.setdefault("broker", name)
+                    holdings.append(row)
+        # Enrich with live dust/untradeable checks when broker connected
+        enriched = []
+        for h in holdings:
+            if not isinstance(h, dict):
+                continue
+            row = dict(h)
+            bname = str(row.get("broker") or "")
+            broker = self.brokers.get(bname)
+            ticker = row.get("ticker") or ""
+            shares = row.get("shares") or row.get("qty") or 0
+            px = row.get("price") or row.get("live_price") or 0
+            asset_type = row.get("asset_type") or row.get("type") or ""
+            if broker and not row.get("locked_reason"):
+                try:
+                    if float(px or 0) <= 0:
+                        px = float(broker.get_live_price(ticker) or 0)
+                        row["price"] = px
+                except Exception:
+                    pass
+                try:
+                    if bname == "Robinhood" and hasattr(broker, "_rh_equity_sellable"):
+                        ok_inst, _, why_inst = broker._rh_equity_sellable(ticker)
+                        if not ok_inst and why_inst:
+                            row["locked_reason"] = str(why_inst)
+                except Exception:
+                    pass
+                try:
+                    is_dust, dust_reason = broker.position_is_dust(
+                        ticker, shares, px, asset_type=asset_type,
+                    )
+                    if is_dust and dust_reason:
+                        row["locked_reason"] = dust_reason
+                except Exception:
+                    pass
+            enriched.append(row)
+        try:
+            summary = _auto_cycle.locked_capital_summary(enriched)
+        except Exception:
+            summary = {"count": 0, "total_value": 0.0, "rows": []}
+        self._last_locked_summary = summary
+        by_broker: dict[str, float] = {}
+        for row in summary.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            b = str(row.get("broker") or "")
+            if not b:
+                continue
+            try:
+                by_broker[b] = float(by_broker.get(b) or 0.0) + max(
+                    0.0, float(row.get("value") or 0.0)
+                )
+            except (TypeError, ValueError):
+                pass
+        self._last_locked_by_broker = by_broker
+        n = int(summary.get("count") or 0)
+        total = float(summary.get("total_value") or 0.0)
+        rows = summary.get("rows") or []
+        if n > 0:
+            chip.setText(f"Locked: {n} (~{format_money(total)})")
+            chip.setStyleSheet(
+                f"font-size: {ui_px(11)}px; font-weight: 700; color: #EF6C00; "
                 f"padding: {ui_px(2)}px {ui_px(8)}px;"
             )
+            parts = [
+                f"{r.get('broker', '?')}:{r.get('ticker', '?')} ({r.get('reason', '?')})"
+                for r in rows[:6]
+            ]
+            sample = ", ".join(parts)
+            more = f" (+{n - 6} more)" if n > 6 else ""
+            if nudge is not None:
+                nudge.setText(
+                    f"⚠ ~{format_money(total)} locked in untradeable/dust "
+                    f"({sample}{more}) — not deployable BP. Sell in broker app if possible."
+                )
+                nudge.setVisible(True)
+        else:
+            chip.setText("Locked: none")
+            chip.setStyleSheet(
+                f"font-size: {ui_px(11)}px; font-weight: 600; color: {tc['muted']}; "
+                f"padding: {ui_px(2)}px {ui_px(8)}px;"
+            )
+            if nudge is not None:
+                nudge.setVisible(False)
+
+    def _refresh_basis_chips(self):
+        """Home RH/CB chips + nudge banner for unknown cost basis (regrade P0 honesty)."""
+        tc = theme_colors(self.dark_mode)
+        assets = getattr(self, "_last_portfolio_assets", None) or []
+        unknown_rows: list[tuple[str, str]] = []
+
+        def _count_from_table(broker_name: str) -> int:
+            n = 0
+            pt = getattr(self, "portfolio_table", None)
+            if pt is None:
+                return 0
+            for row in range(pt.rowCount()):
+                b = pt.item(row, 0)
+                c = pt.item(row, 3)
+                t = pt.item(row, 1)
+                if b and b.text() == broker_name and c and (
+                    c.text() == "cost ?" or c.text() in ("$0.00", "0", "")
+                ):
+                    n += 1
+                    if t:
+                        unknown_rows.append((broker_name, t.text()))
+            return n
+
+        def _paint_chip(chip, broker_name: str):
+            if chip is None:
+                return
+            unknown = 0
+            try:
+                if assets:
+                    unknown = _auto_cycle.count_unknown_cost_holdings(
+                        assets, broker_name=broker_name,
+                    )
+                    for a in assets:
+                        if not isinstance(a, dict):
+                            continue
+                        if str(a.get("broker") or "") != broker_name:
+                            continue
+                        try:
+                            cost = float(a.get("cost") or 0.0)
+                        except (TypeError, ValueError):
+                            cost = 0.0
+                        if cost <= 0:
+                            unknown_rows.append((broker_name, str(a.get("ticker") or "?")))
+                else:
+                    unknown = _count_from_table(broker_name)
+            except Exception:
+                unknown = 0
+            if unknown > 0:
+                chip.setText(f"Basis: {unknown} unknown")
+                chip.setStyleSheet(
+                    f"font-size: {ui_px(11)}px; font-weight: 700; color: #F9A825; "
+                    f"padding: {ui_px(2)}px {ui_px(8)}px;"
+                )
+            else:
+                chip.setText("Basis: tracked")
+                chip.setStyleSheet(
+                    f"font-size: {ui_px(11)}px; font-weight: 700; color: {tc['muted']}; "
+                    f"padding: {ui_px(2)}px {ui_px(8)}px;"
+                )
+
+        _paint_chip(getattr(self, "home_rh_basis_chip", None), "Robinhood")
+        _paint_chip(getattr(self, "home_cb_basis_chip", None), "Coinbase")
+
+        nudge = getattr(self, "home_basis_nudge", None)
+        if nudge is None:
+            return
+        uniq: list[str] = []
+        seen = set()
+        for b, t in unknown_rows:
+            key = f"{b}:{t}"
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(f"{b}:{t}")
+        if uniq:
+            sample = ", ".join(uniq[:5])
+            more = f" (+{len(uniq) - 5} more)" if len(uniq) > 5 else ""
+            nudge.setText(
+                f"⚠ {len(uniq)} holding(s) missing avg cost ({sample}{more}) — "
+                f"TTP/scale-in gated. Settings → Cost basis paste "
+                f"(e.g. Robinhood:SHIB=0.000012)."
+            )
+            nudge.setVisible(True)
+        else:
+            nudge.setVisible(False)
+
+    def _refresh_cb_basis_chip(self):
+        """Backward-compatible alias."""
+        self._refresh_basis_chips()
 
     def _clear_layout_widgets(self, layout):
         if layout is None:
@@ -9661,9 +9999,15 @@ class MarketAdvisorGUI(QMainWindow):
         eq = float(equity) if equity is not None else None
         if eq is None:
             try:
-                eq, _ = self.get_broker_balances(self.cycle_broker_name)
+                eq, _, _ = self.get_effective_balances(self.cycle_broker_name)
             except Exception:
-                eq = float(current_bp or 0.0)
+                try:
+                    eq, _ = self.get_broker_balances(self.cycle_broker_name)
+                except Exception:
+                    eq = float(current_bp or 0.0)
+        else:
+            locked = self._locked_capital_value(self.cycle_broker_name)
+            eq = _auto_cycle.effective_book_equity(eq, locked)
         min_dollars = effective_min_dollars(
             broker_id, eq, is_crypto, self.settings.get("min_trade_dollars", 5.0)
         )
@@ -10336,7 +10680,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         if not auto_mode:
             sample_type = filtered[0].get("asset_type", "")
-            equity, bp = self.get_broker_balances(self.cycle_broker_name)
+            equity, bp, _locked = self.get_effective_balances(self.cycle_broker_name)
             try:
                 _h = self.get_broker_holdings(self.cycle_broker_name) or []
                 _open = len({(a.get("ticker") or "").upper() for a in _h if a.get("ticker")})
@@ -10412,7 +10756,7 @@ class MarketAdvisorGUI(QMainWindow):
                 "broker": broker_name,
             }
 
-        equity, bp = self.get_broker_balances(broker_name)
+        equity, bp, _locked = self.get_effective_balances(broker_name)
         holdings = self.get_broker_holdings(broker_name) or []
         held = {
             (a.get("ticker") or "").upper()
@@ -10522,6 +10866,24 @@ class MarketAdvisorGUI(QMainWindow):
                         c["score"] = float(c.get("score") or 0.0)
                         c["scale_in"] = bool(c.get("scale_in"))
             ranked.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+            prefer_whole = bool(self.settings.get("prefer_whole_shares_for_stops", True))
+            affordable, unaff = _auto_cycle.filter_affordable_buy_candidates(
+                ranked,
+                buying_power=bp,
+                equity=equity,
+                broker_id=broker_id,
+                settings=self.settings,
+                prefer_whole_shares=prefer_equity_rth and prefer_whole,
+            )
+            if unaff:
+                sample = ", ".join(unaff[:5])
+                more = f" (+{len(unaff) - 5})" if len(unaff) > 5 else ""
+                self._throttled_log(
+                    f"{broker_name}:unaffordable_pre_rank",
+                    f"[{broker_name}] Unaffordable after rank — dropped: {sample}{more}",
+                    cooldown_sec=780,
+                )
+            ranked = affordable
             # Drop names that cannot improve the book (already held without scale-in / cluster full)
             actionable = _auto_cycle.filter_actionable_ranked(ranked)
             # Always log Ranked (incl. single-signal BREAKOUT) so the trail is visible
@@ -10552,6 +10914,20 @@ class MarketAdvisorGUI(QMainWindow):
                     px = float(broker.get_live_price(t) if broker else 0.0) or 0.0
                 except Exception:
                     px = 0.0
+                asset_type = "cryptocurrency" if m.get("is_crypto") else "stock"
+                probe = {
+                    "broker": broker_name,
+                    "ticker": t,
+                    "shares": float(m.get("shares") or 0.0),
+                    "price": px,
+                    "value": float(m.get("value") or 0.0),
+                    "type": asset_type,
+                }
+                locked, _why = _auto_cycle.classify_locked_holding(
+                    probe, broker_name=broker_name,
+                )
+                if locked:
+                    continue
                 rows.append({
                     "ticker": t,
                     "value": float(m.get("value") or 0.0),
@@ -10559,7 +10935,7 @@ class MarketAdvisorGUI(QMainWindow):
                     "avg_cost": float(m.get("avg_cost") or 0.0),
                     "shares": float(m.get("shares") or 0.0),
                     "price": px,
-                    "asset_type": "cryptocurrency" if m.get("is_crypto") else "stock",
+                    "asset_type": asset_type,
                 })
             return rows
 
@@ -11561,9 +11937,9 @@ class MarketAdvisorGUI(QMainWindow):
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
         posture = self.settings.get("risk_posture", "balanced")
         try:
-            equity, _bp = self.get_broker_balances(broker_name)
+            equity, bp, _locked = self.get_effective_balances(broker_name)
         except Exception:
-            equity = 0.0
+            equity, bp = 0.0, 0.0
         holdings = self.get_broker_holdings(broker_name) or []
         held = {
             (a.get("ticker") or "").upper()
@@ -11693,6 +12069,18 @@ class MarketAdvisorGUI(QMainWindow):
                     "table_row": row,
                     "scale_in": False,
                 })
+        prefer_whole = bool(self.settings.get("prefer_whole_shares_for_stops", True))
+        affordable, unaff = _auto_cycle.filter_affordable_buy_candidates(
+            buy_candidates,
+            buying_power=bp,
+            equity=equity,
+            broker_id=broker_id,
+            settings=self.settings,
+            prefer_whole_shares=prefer_equity_rth and prefer_whole,
+        )
+        if unaff:
+            dropped.extend(unaff)
+        buy_candidates = affordable
         buy_candidates.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
         return opps, results, buy_candidates, dropped
 
@@ -11839,6 +12227,43 @@ class MarketAdvisorGUI(QMainWindow):
             self._bg_scan_crypto,
         )
 
+    def _maybe_regime_idle_coach(self, broker, engine, raw_buys):
+        """One [COACH] per ~1hr of zero raw BUY signals when regime blocks new entries."""
+        if not self._is_broker_auto_trading(broker):
+            return
+        now = time.time()
+        store = getattr(self, "_scan_idle_since", None)
+        if store is None:
+            self._scan_idle_since = {}
+            store = self._scan_idle_since
+        key = f"{broker}:{engine}"
+        if int(raw_buys or 0) > 0:
+            store[key] = now
+            return
+        since = store.get(key)
+        if since is None:
+            store[key] = now
+            return
+        idle_sec = now - float(since)
+        if idle_sec < _auto_cycle.REGIME_IDLE_COACH_SEC:
+            return
+        is_crypto = str(engine or "").upper() in ("CRYPTO",)
+        regime_ok = True
+        regime_reason = ""
+        try:
+            from scoring import market_regime_ok
+            regime_ok, regime_reason = market_regime_ok(is_crypto=is_crypto)
+        except Exception:
+            regime_ok = True
+        if regime_ok:
+            return
+        tip_key, tip = _auto_cycle.regime_idle_coach_tip(
+            broker, engine,
+            idle_sec=idle_sec,
+            regime_reason=regime_reason,
+        )
+        self._coach_tip(tip_key, tip, cooldown_sec=1800)
+
     def _log_scan_buy_outcome(self, engine, results, buy_candidates, dropped=None):
         """
         Log BUY score count, and when signals exist but none are actionable for the book,
@@ -11847,6 +12272,7 @@ class MarketAdvisorGUI(QMainWindow):
         """
         broker = self.cycle_broker_name
         raw_buys = self._count_buy_signals(results)
+        self._maybe_regime_idle_coach(broker, engine, raw_buys)
         actionable = len(buy_candidates or [])
         if actionable:
             self.log_event(f"[AUTO] [{broker}] {engine} scored — {actionable} BUY signal(s)")

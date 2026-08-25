@@ -173,20 +173,11 @@ def usable_avg_cost(cost, mark_price, *, min_frac=COST_BASIS_DUST_FRAC):
 
 def _get_seeded_cost(broker_id, ticker):
     """Tier 4: Last-known (Seed) fallback for missing crypto cost basis."""
-    import json
-    import os
     try:
-        seed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed.json")
-        if os.path.exists(seed_path):
-            with open(seed_path, "r", encoding="utf-8") as f:
-                seeds = json.load(f)
-            broker_seeds = seeds.get(broker_id.upper(), {})
-            clean_ticker = str(ticker).replace("-USD", "").upper().strip()
-            if clean_ticker in broker_seeds:
-                return float(broker_seeds[clean_ticker])
+        import cost_basis as cb_mod
+        return float(cb_mod.seed_lookup(broker_id, ticker) or 0.0)
     except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 def _rh_pos_mark_price(pos):
     """Best-effort mark from a RH crypto position payload (no network)."""

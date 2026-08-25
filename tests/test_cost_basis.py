@@ -141,6 +141,7 @@ class TestResolveHoldingCost(unittest.TestCase):
 
     def test_normalize_ticker(self):
         self.assertEqual(cb.normalize_ticker("eth-usd"), "ETH")
+        self.assertEqual(cb.normalize_ticker("ETH-USD"), "ETH")
         self.assertEqual(cb.normalize_ticker("SHIB"), "SHIB")
 
     def test_parse_manual_basis_lines(self):
@@ -183,7 +184,25 @@ class TestResolveHoldingCost(unittest.TestCase):
 
 
 class TestRthEquityPrefer(unittest.TestCase):
-    def test_rth_boosts_equity_vs_crypto(self):
+    def test_load_seed_file_skips_zero(self):
+        import json
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"ROBINHOOD": {"SHIB": 0.000015, "AMP": 0.0}}, f)
+            path = f.name
+        try:
+            seeds = cb.load_seed_file(path)
+            self.assertAlmostEqual(seeds["Robinhood"]["SHIB"], 0.000015)
+            self.assertNotIn("AMP", seeds.get("Robinhood", {}))
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_seed_lookup(self):
+        seeds = {"Robinhood": {"DOGE": 0.08}}
+        self.assertAlmostEqual(cb.seed_lookup("Robinhood", "DOGE", seeds), 0.08)
+        self.assertEqual(cb.seed_lookup("Robinhood", "BTC", seeds), 0.0)
+
         from scoring import portfolio_buy_rank_adjust
 
         meta = [{"ticker": "SHIB", "value": 20.0, "is_crypto": True}]

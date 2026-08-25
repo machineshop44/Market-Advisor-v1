@@ -538,8 +538,44 @@ class FeeAnalyticsTests(unittest.TestCase):
         self.assertEqual(s["rotates"], 1)
         self.assertAlmostEqual(s["realized_pnl"], 20.0, places=2)
         self.assertAlmostEqual(s["fee_est"], 0.4, places=2)
+        self.assertEqual(s["wins"], 1)
+        self.assertEqual(s["net_wins"], 1)
+        self.assertAlmostEqual(s["net_win_rate"], 1.0, places=4)
+        self.assertAlmostEqual(s["win_rate"], 1.0, places=4)
 
-    def test_fee_confidence_profile_is_low(self):
+    def test_net_win_rate_loser_after_fees(self):
+        rows = [
+            {
+                "timestamp": "2026-08-05T10:00:00",
+                "broker": "Coinbase",
+                "side": "BUY",
+                "ticker": "ETH",
+                "price": 100.0,
+                "qty": 1,
+                "dollars": 100.0,
+                "status": "Filled",
+                "confirmed": True,
+                "fee_est": 1.2,
+            },
+            {
+                "timestamp": "2026-08-05T11:00:00",
+                "broker": "Coinbase",
+                "side": "SELL",
+                "ticker": "ETH",
+                "price": 101.0,
+                "qty": 1,
+                "dollars": 101.0,
+                "status": "Filled",
+                "confirmed": True,
+                "fee_est": 1.2,
+            },
+        ]
+        s = analytics.summarize_fills(rows)
+        self.assertEqual(s["wins"], 1)
+        self.assertEqual(s["net_losses"], 1)
+        self.assertAlmostEqual(s["win_rate"], 1.0, places=4)
+        self.assertAlmostEqual(s["net_win_rate"], 0.0, places=4)
+
         rows = [
             {
                 "timestamp": "2026-08-05T10:00:00",

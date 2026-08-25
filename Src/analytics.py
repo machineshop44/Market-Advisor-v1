@@ -111,6 +111,8 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
                 "realized_pnl": 0.0,
                 "wins": 0,
                 "losses": 0,
+                "net_wins": 0,
+                "net_losses": 0,
                 "hold_minutes_sum": 0.0,
                 "hold_samples": 0,
             }
@@ -119,7 +121,7 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
     # Open lots for FIFO-ish pairing: (broker, ticker) -> list of {qty, price, dollars, ts}
     lots: dict[tuple[str, str], list[dict]] = {}
     realized = 0.0
-    wins = losses = 0
+    wins = losses = net_wins = net_losses = 0
     hold_sum = 0.0
     hold_n = 0
 
@@ -174,6 +176,7 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
                 "qty": abs(float(row.get("qty") or 0) or (notion / float(row.get("price") or 1))),
                 "price": float(row.get("price") or 0),
                 "dollars": notion,
+                "fee": fe,
                 "ts": row_ts,
             })
         elif side == "SELL":
@@ -189,11 +192,16 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
                 remaining = notion / sell_px
             queue = lots.get(key) or []
             pnl = 0.0
+            buy_fees = 0.0
             while remaining > 1e-12 and queue:
                 lot = queue[0]
                 take = min(remaining, float(lot.get("qty") or 0))
+                lot_qty = float(lot.get("qty") or 0)
                 cost_px = float(lot.get("price") or 0)
                 pnl += (sell_px - cost_px) * take
+                lot_fee = float(lot.get("fee") or 0.0)
+                if lot_qty > 1e-12 and lot_fee > 0:
+                    buy_fees += lot_fee * (take / lot_qty)
                 buy_ts = lot.get("ts")
                 if buy_ts is not None and row_ts is not None:
                     hold_m = max(0.0, (row_ts - buy_ts).total_seconds() / 60.0)
@@ -201,10 +209,11 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
                     hold_n += 1
                     bucket["hold_minutes_sum"] += hold_m
                     bucket["hold_samples"] += 1
-                lot["qty"] = float(lot.get("qty") or 0) - take
+                lot["qty"] = lot_qty - take
                 remaining -= take
                 if float(lot.get("qty") or 0) <= 1e-12:
                     queue.pop(0)
+            net_pnl = pnl - fe - buy_fees
             realized += pnl
             bucket["realized_pnl"] += pnl
             if pnl > 1e-9:
@@ -213,14 +222,24 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
             elif pnl < -1e-9:
                 losses += 1
                 bucket["losses"] += 1
+            if net_pnl > 1e-9:
+                net_wins += 1
+                bucket["net_wins"] += 1
+            elif net_pnl < -1e-9:
+                net_losses += 1
+                bucket["net_losses"] += 1
 
     turnover = buy_notional + sell_notional
     closed = wins + losses
     win_rate = (wins / closed) if closed > 0 else None
+    net_closed = net_wins + net_losses
+    net_win_rate = (net_wins / net_closed) if net_closed > 0 else None
     avg_hold_min = (hold_sum / hold_n) if hold_n > 0 else None
     for bkt in by_broker.values():
         c = int(bkt.get("wins") or 0) + int(bkt.get("losses") or 0)
         bkt["win_rate"] = (bkt["wins"] / c) if c > 0 else None
+        nc = int(bkt.get("net_wins") or 0) + int(bkt.get("net_losses") or 0)
+        bkt["net_win_rate"] = (bkt["net_wins"] / nc) if nc > 0 else None
         hs = int(bkt.get("hold_samples") or 0)
         bkt["avg_hold_min"] = (bkt["hold_minutes_sum"] / hs) if hs > 0 else None
         # Fee drag = est fees / turnover for this broker
@@ -242,6 +261,9 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
         "wins": wins,
         "losses": losses,
         "win_rate": win_rate,
+        "net_wins": net_wins,
+        "net_losses": net_losses,
+        "net_win_rate": net_win_rate,
         "avg_hold_min": avg_hold_min,
         "by_broker": by_broker,
     }
@@ -422,7 +444,13 @@ def format_reports_hero(
 
     s = summary or {}
     wr = s.get("win_rate")
-    wr_txt = f"{wr * 100:.0f}%" if wr is not None else "—"
+    nwr = s.get("net_win_rate")
+    if wr is not None and nwr is not None:
+        wr_txt = f"{wr * 100:.0f}% gross / {nwr * 100:.0f}% net"
+    elif wr is not None:
+        wr_txt = f"{wr * 100:.0f}%"
+    else:
+        wr_txt = "—"
     hold = s.get("avg_hold_min")
     hold_txt = f"{hold:.0f}m" if hold is not None else "—"
     win_lbl = f" · {window_label}" if window_label else ""

@@ -601,6 +601,224 @@ def etrade_home_env_chip(
     return chip, tip, col
 
 
+def filter_affordable_buy_candidates(
+    candidates,
+    *,
+    buying_power,
+    equity,
+    broker_id,
+    settings=None,
+    prefer_whole_shares=False,
+) -> tuple[list, list[str]]:
+    """
+    Pre-rank affordability filter — drop names that cannot meet min ticket / whole share.
+    Returns (affordable, drop_lines for Activity/coach).
+    """
+    try:
+        from scoring import buy_candidate_affordable
+    except Exception:
+        return list(candidates or []), []
+
+    affordable: list = []
+    dropped: list[str] = []
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        ticker = str(c.get("ticker") or "?")
+        asset_type = str(c.get("asset_type") or "")
+        is_crypto = (
+            "crypto" in asset_type.lower()
+            or ticker.upper() in DEFAULT_CRYPTO_TICKERS
+        )
+        ok, why = buy_candidate_affordable(
+            buying_power=buying_power,
+            price=c.get("price"),
+            is_crypto=is_crypto,
+            broker_id=broker_id,
+            equity=equity,
+            settings=settings,
+            scale_in=bool(c.get("scale_in")),
+            prefer_whole_shares=prefer_whole_shares,
+        )
+        if ok:
+            affordable.append(c)
+        else:
+            dropped.append(f"{ticker} (unaffordable: {why})")
+    return affordable, dropped
+
+
+def classify_locked_holding(holding: dict, *, broker_name: str = "") -> tuple[bool, str]:
+    """
+    Heuristic OTC/dust/untradeable capital — not deployable for rotates/sizing.
+    GOEVQ-style *Q bags and sub-$1 dust are excluded from effective book BP.
+    """
+    if not isinstance(holding, dict):
+        return False, ""
+    reason = str(holding.get("locked_reason") or holding.get("untradeable_reason") or "").strip()
+    if reason:
+        return True, reason
+    t = str(holding.get("ticker") or "").upper().replace("-USD", "")
+    if not t:
+        return False, ""
+    asset_type = str(holding.get("asset_type") or holding.get("type") or "")
+    is_crypto = (
+        "crypto" in asset_type.lower()
+        or t in DEFAULT_CRYPTO_TICKERS
+        or str(broker_name) == "Coinbase"
+    )
+    try:
+        shares = float(holding.get("shares") or holding.get("qty") or 0.0)
+    except (TypeError, ValueError):
+        shares = 0.0
+    if shares <= 0:
+        return False, ""
+    try:
+        px = float(
+            holding.get("price")
+            or holding.get("live_price")
+            or holding.get("mark")
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        px = 0.0
+    try:
+        val = float(holding.get("value") or 0.0)
+    except (TypeError, ValueError):
+        val = 0.0
+    if val <= 0 and px > 0:
+        val = abs(shares * px)
+
+    if t.endswith("Q") and len(t) >= 4:
+        if px <= 0:
+            return True, "OTC/delisted (*Q, no quote)"
+        return True, "OTC/delisted (*Q)"
+
+    if px <= 0:
+        return True, "no quote"
+
+    if is_crypto and val > 0 and val < 1.0:
+        return True, "crypto dust (<$1)"
+
+    if not is_crypto and shares < 1.0 and val > 0 and val < 1.0:
+        return True, "dust fractional (<$1)"
+
+    return False, ""
+
+
+def effective_book_equity(equity, locked_value) -> float:
+    """
+    Deployable book equity for sizing / rank — total equity minus OTC/dust/no-quote bags.
+    BP is unchanged (locked value sits in holdings, not cash).
+    """
+    try:
+        eq = float(equity or 0.0)
+    except (TypeError, ValueError):
+        eq = 0.0
+    try:
+        locked = max(0.0, float(locked_value or 0.0))
+    except (TypeError, ValueError):
+        locked = 0.0
+    return max(0.0, eq - locked)
+
+
+def locked_value_for_broker(summary: dict | None, broker_name: str) -> float:
+    """Sum locked notional for one broker from locked_capital_summary rows."""
+    if not isinstance(summary, dict):
+        return 0.0
+    want = str(broker_name or "").strip()
+    total = 0.0
+    for row in summary.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        if want and str(row.get("broker") or "").strip() != want:
+            continue
+        try:
+            total += max(0.0, float(row.get("value") or 0.0))
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def locked_value_from_holdings(holdings: Iterable, *, broker_name: str | None = None) -> float:
+    """Lightweight locked total without broker network calls."""
+    return float(locked_capital_summary(holdings).get("total_value") or 0.0)
+
+
+def locked_capital_summary(holdings: Iterable) -> dict[str, Any]:
+    """
+    Aggregate untradeable/dust holdings for Home capital checklist.
+    Returns {count, total_value, rows: [{broker, ticker, value, reason}, ...]}.
+    """
+    rows: list[dict] = []
+    total = 0.0
+    for h in holdings or []:
+        if not isinstance(h, dict):
+            continue
+        broker = str(h.get("broker") or h.get("broker_name") or "")
+        locked, reason = classify_locked_holding(h, broker_name=broker)
+        if not locked:
+            continue
+        try:
+            val = float(h.get("value") or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val <= 0:
+            try:
+                px = float(h.get("price") or h.get("live_price") or 0.0)
+                qty = float(h.get("shares") or h.get("qty") or 0.0)
+                val = abs(px * qty)
+            except (TypeError, ValueError):
+                val = 0.0
+        total += max(0.0, val)
+        rows.append({
+            "broker": broker,
+            "ticker": str(h.get("ticker") or "?"),
+            "value": val,
+            "reason": reason,
+        })
+    return {"count": len(rows), "total_value": total, "rows": rows}
+
+
+REGIME_IDLE_COACH_SEC = 3600  # ~1 hour of zero BUY signals
+
+
+def regime_idle_coach_tip(
+    broker: str,
+    engine: str,
+    *,
+    idle_sec: float,
+    regime_reason: str = "",
+    dd_paused: bool = False,
+) -> tuple[str, str]:
+    """
+    [COACH] when an armed broker scans for ~1hr with zero raw BUY signals and regime blocks.
+    Returns (throttle_key, message).
+    """
+    idle_min = max(1, int(float(idle_sec or 0) / 60))
+    reason = str(regime_reason or "").strip()
+    if dd_paused:
+        tip = (
+            f"{broker}/{engine}: no BUY signals for ~{idle_min}m — drawdown pause is active. "
+            f"New buys stay gated until the pause clears or ROI recovers."
+        )
+        key = f"{broker}:{engine}:regime_idle:dd_pause"
+    elif reason:
+        short = reason.replace("DO NOT BUY (Regime:", "Regime:").strip(" )")
+        tip = (
+            f"{broker}/{engine}: no BUY signals for ~{idle_min}m — {short}. "
+            f"Idle is expected in downtrends; enable allow_buys_when_regime_blocked in Settings "
+            f"only if you accept the risk."
+        )
+        key = f"{broker}:{engine}:regime_idle:blocked"
+    else:
+        tip = (
+            f"{broker}/{engine}: no BUY signals for ~{idle_min}m — market regime gate may be "
+            f"blocking new entries. Check Activity Log for DO NOT BUY (Regime) marks."
+        )
+        key = f"{broker}:{engine}:regime_idle:unknown"
+    return key, tip
+
+
 def etrade_bp_label(bp: float, *, environment: str, min_trade_dollars: float = 5.0) -> tuple[str, str]:
     """Buying Power label + tooltip for Home ET row."""
     env = str(environment or "sandbox").lower()
