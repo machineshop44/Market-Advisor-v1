@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.31.0"
+__version__ = "1.32.0"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Reports net WR by broker · DD coach · Reset Day P&L · locked capital · crypto min"
+    "Heat extract wave 2 · fee-aware rotate sort · companion locked · crypto min"
 )
 
 

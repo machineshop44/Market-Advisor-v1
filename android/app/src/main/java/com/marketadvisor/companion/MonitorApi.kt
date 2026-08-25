@@ -63,6 +63,14 @@ object MonitorApi {
         val sessionRiskUsedPct: Double = 0.0,
         val ddPaused: Boolean = false,
         val ddReason: String = "",
+        val peakDdWorstPct: Double = 0.0,
+        val present: Boolean = false,
+    )
+
+    data class LockedCapital(
+        val total: Double = 0.0,
+        val count: Int = 0,
+        val byBroker: Map<String, Double> = emptyMap(),
         val present: Boolean = false,
     )
 
@@ -123,6 +131,7 @@ object MonitorApi {
         val fracPolicy: FracPolicy = FracPolicy(),
         val etrade: EtradeInfo = EtradeInfo(),
         val walkForward: WalkForward = WalkForward(),
+        val lockedCapital: LockedCapital = LockedCapital(),
         val halted: Boolean = false,
         val app: String = "",
         val version: String = "",
@@ -346,10 +355,34 @@ object MonitorApi {
                 sessionRiskUsedPct = heatCombined.optDouble("session_risk_used_pct", 0.0),
                 ddPaused = heatCombined.optBoolean("dd_paused", false),
                 ddReason = heatCombined.optString("dd_reason", ""),
+                peakDdWorstPct = heatCombined.optDouble("peak_dd_worst_pct", 0.0),
                 present = true,
             )
         } else {
             PortfolioHeat()
+        }
+
+        val lockedObj = json.optJSONObject("locked_capital")
+        val lockedCapital = if (lockedObj != null) {
+            val byB = mutableMapOf<String, Double>()
+            val byBrokerObj = lockedObj.optJSONObject("by_broker")
+            if (byBrokerObj != null) {
+                val keys = byBrokerObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val row = byBrokerObj.optJSONObject(k)
+                    val v = row?.optDouble("value", 0.0) ?: byBrokerObj.optDouble(k, 0.0)
+                    if (v > 0.001) byB[k] = v
+                }
+            }
+            LockedCapital(
+                total = lockedObj.optDouble("total", 0.0),
+                count = lockedObj.optInt("count", 0),
+                byBroker = byB,
+                present = true,
+            )
+        } else {
+            LockedCapital()
         }
 
         val sgObj = json.optJSONObject("shadow_guard")
@@ -424,6 +457,7 @@ object MonitorApi {
             fracPolicy = fracPolicy,
             etrade = etrade,
             walkForward = walkForward,
+            lockedCapital = lockedCapital,
             halted = json.optBoolean("halted", false),
             app = json.optString("app", ""),
             version = json.optString("version", ""),

@@ -283,6 +283,32 @@ class TestCycleBookExtract(unittest.TestCase):
             1,
         )
 
+    def test_portfolio_heat_extract_helpers(self):
+        assets = [
+            {"broker": "Robinhood", "ticker": "GOEVQ", "price": 0.01, "value": 0.5, "shares": 50},
+            {"broker": "Coinbase", "ticker": "BTC", "price": 50000, "value": 50, "shares": 0.001},
+        ]
+        by_b = ac.holdings_by_broker_from_assets(assets, ("Robinhood", "Coinbase"))
+        self.assertEqual(len(by_b["Robinhood"]), 1)
+        totals = {
+            "Robinhood": {"p_val": 100.0, "bp": 20.0},
+            "Coinbase": {"p_val": 80.0, "bp": 10.0},
+        }
+        rows = ac.build_portfolio_heat_rows(
+            totals, by_b, {"Robinhood": 95.0, "Coinbase": 75.0},
+            {"Robinhood": True, "Coinbase": False},
+            ("Robinhood", "Coinbase"),
+        )
+        self.assertEqual(len(rows), 2)
+        rh = next(r for r in rows if r["broker"] == "Robinhood")
+        self.assertLess(rh["equity"], rh["raw_equity"])
+        snap = {"combined": {"open_risk_dollars": 5, "open_risk_pct": 2.5, "bp_headroom": 30, "day_pnl": 5}}
+        label = ac.format_portfolio_heat_label(
+            snap, rows, money_fn=lambda x: f"${x:.2f}", currency_fn=lambda x: f"${x:.2f}",
+        )
+        self.assertIn("Locked", label)
+        self.assertIn("Open risk", label)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8557,49 +8557,17 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             return
         totals = getattr(self, "_last_balance_totals", {}) or {}
-        # Lightweight holdings: value unknown → use count * soft estimate skipped;
-        # prefer any cached portfolio table rows if present.
-        holdings_by = {n: [] for n in BROKER_NAMES}
-        try:
-            # Portfolio table may hold last All-view assets
-            assets = getattr(self, "_last_assets_snapshot", None)
-            if isinstance(assets, list):
-                for a in assets:
-                    if not isinstance(a, dict):
-                        continue
-                    bname = a.get("broker") or a.get("broker_name") or ""
-                    if bname not in holdings_by:
-                        # try match
-                        for n in BROKER_NAMES:
-                            if n.lower() in str(bname).lower():
-                                bname = n
-                                break
-                    if bname in holdings_by:
-                        holdings_by[bname].append(a)
-        except Exception:
-            pass
+        assets = getattr(self, "_last_assets_snapshot", None)
+        holdings_by = _auto_cycle.holdings_by_broker_from_assets(assets, BROKER_NAMES)
         self._heat_holdings_by_broker = holdings_by
 
-        rows = []
-        for name in BROKER_NAMES:
-            p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
-            bp = float(totals.get(name, {}).get("bp", 0.0) or 0.0)
-            locked = _auto_cycle.locked_value_from_holdings(holdings_by.get(name) or [])
-            eff_eq = _auto_cycle.effective_book_equity(p_val, locked)
-            start = self.session_starts.get(name)
-            pl = (p_val - start) if start is not None and start > 0 else 0.0
-            bid = {"Robinhood": "ROBINHOOD", "Coinbase": "COINBASE", "E*TRADE": "ETRADE"}.get(name, name)
-            rows.append({
-                "broker": name,
-                "broker_id": bid,
-                "equity": eff_eq,
-                "raw_equity": p_val,
-                "locked_value": locked,
-                "buying_power": bp,
-                "day_pnl": pl,
-                "armed": bool(self.auto_trade_enabled.get(name)),
-                "holdings": holdings_by.get(name) or [],
-            })
+        rows = _auto_cycle.build_portfolio_heat_rows(
+            totals,
+            holdings_by,
+            self.session_starts,
+            self.auto_trade_enabled,
+            BROKER_NAMES,
+        )
         snap = portfolio_heat_snapshot(
             rows,
             settings=self.settings,
@@ -8613,13 +8581,9 @@ class MarketAdvisorGUI(QMainWindow):
         room = c.get("loss_room")
         used = float(c.get("session_risk_used_pct") or 0)
         locked_total = sum(float(r.get("locked_value") or 0.0) for r in rows)
-        heat_txt = (
-            f"Open risk ≈ {format_currency(risk_d)} ({risk_p:.1f}% equity) · "
-            f"BP headroom ≈ {format_currency(head)} · "
-            f"Day P&L {format_currency(c.get('day_pnl') or 0)}"
+        heat_txt = _auto_cycle.format_portfolio_heat_label(
+            snap, rows, money_fn=format_money, currency_fn=format_currency,
         )
-        if locked_total > 0.01:
-            heat_txt += f" · Locked {format_money(locked_total)} excluded from sizing"
         self.home_heat_lbl.setText(heat_txt)
         if c.get("dd_paused"):
             why = c.get("dd_reason") or "drawdown"

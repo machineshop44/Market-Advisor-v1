@@ -3119,6 +3119,7 @@ def pick_rotation_funding(
         if edge_pct < recycle_fee + fee_buf:
             continue
 
+        net_edge_pct = edge_pct - recycle_fee
         same_sleeve = (bool(candidate_is_crypto) == bool(is_c))
         clears_shortfall = True if shortfall <= 0 else (val + 1e-9 >= shortfall)
         candidates.append({
@@ -3134,12 +3135,13 @@ def pick_rotation_funding(
             "shares": float(h.get("shares") or 0.0),
             "asset_type": asset_type,
             "edge_pct": edge_pct,
+            "net_edge_pct": net_edge_pct,
             "recycle_fee_pct": recycle_fee,
             "fee_est": estimate_fee_dollars(val, broker_id, t, asset_type, round_trip=True),
             "reason": (
                 f"score gap {score_delta:.0f} "
                 f"(cand {cand_score:.0f} vs hold {hold_score:.0f}, need +{gap:.0f}); "
-                f"roi {roi*100:.2f}%; edge {edge_pct*100:.2f}% vs fees {recycle_fee*100:.2f}%"
+                f"roi {roi*100:.2f}%; net edge {net_edge_pct*100:.2f}% after fees"
             ),
         })
 
@@ -3161,6 +3163,7 @@ def pick_rotation_funding(
         key=lambda x: (
             0 if x.get("same_sleeve") else 1,
             0 if x.get("clears_shortfall") else 1,
+            -float(x.get("net_edge_pct") or 0.0),
             float(x.get("score") or 0.0),
             float(x.get("roi") or 0.0),
             -float(x.get("value") or 0.0),

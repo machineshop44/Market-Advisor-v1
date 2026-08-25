@@ -14,6 +14,8 @@
 #   powershell -ExecutionPolicy Bypass -File .\publish-exe-to-drive.ps1 -NoCopyToDrive
 #   powershell -ExecutionPolicy Bypass -File .\publish-exe-to-drive.ps1 -InstallerOnly
 #     → Plex PC path: build Inno x64.exe only, copy to Drive\exe (no portable zip)
+#   powershell -ExecutionPolicy Bypass -File .\publish-exe-to-drive.ps1 -InstallerOnly -Sign
+#     → same + Authenticode sign when MA_SIGN_PFX_PATH is set
 
 param(
     [switch]$SkipBuild,
@@ -21,6 +23,7 @@ param(
     [switch]$NoInstaller,
     [switch]$NoCopyToDrive,
     [switch]$InstallerOnly,
+    [switch]$Sign,
     [string]$DriveExeDir = "G:\My Drive\exe"
 )
 
@@ -242,6 +245,12 @@ if (-not $NoInstaller) {
         } else {
             $InstMb = [math]::Round((Get-Item $InstallerPath).Length / 1MB, 1)
             Write-Host "Installer: $InstallerPath ($InstMb MB)"
+            if ($Sign) {
+                $signScript = Join-Path $Packaging "sign-authenticode.ps1"
+                if (Test-Path $signScript) {
+                    & powershell -NoProfile -ExecutionPolicy Bypass -File $signScript -ExePath $InstallerPath
+                }
+            }
         }
     }
 } else {
@@ -258,8 +267,12 @@ foreach ($p in @($ZipPath, $InstallerPath)) {
     }
 }
 $shaLines += ""
-$shaLines += "Unsigned build (SmartScreen may warn) - same trust model as ytarr / Arrs Hub."
-$shaLines += "Authenticode signing is what raises Packaging toward A."
+if ($Sign -and $InstallerPath -and (Test-Path $InstallerPath) -and $env:MA_SIGN_PFX_PATH) {
+    $shaLines += "Authenticode signed when MA_SIGN_PFX_PATH was set at publish time."
+} else {
+    $shaLines += "Unsigned build (SmartScreen may warn) - same trust model as ytarr / Arrs Hub."
+    $shaLines += "Authenticode signing: set MA_SIGN_PFX_PATH and publish with -Sign."
+}
 Set-Content -Path $ShaPath -Value ($shaLines -join "`r`n") -Encoding ASCII
 Write-Host "Checksums: $ShaPath"
 

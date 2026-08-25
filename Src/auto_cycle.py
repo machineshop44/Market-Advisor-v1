@@ -819,6 +819,102 @@ def regime_idle_coach_tip(
     return key, tip
 
 
+DEFAULT_BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
+
+_BROKER_ID_MAP = {
+    "Robinhood": "ROBINHOOD",
+    "Coinbase": "COINBASE",
+    "E*TRADE": "ETRADE",
+}
+
+
+def holdings_by_broker_from_assets(
+    assets,
+    broker_names: Iterable[str] | None = None,
+) -> dict[str, list]:
+    """Group portfolio snapshot rows by broker display name."""
+    names = list(broker_names or DEFAULT_BROKER_NAMES)
+    holdings_by: dict[str, list] = {n: [] for n in names}
+    if not isinstance(assets, list):
+        return holdings_by
+    for a in assets:
+        if not isinstance(a, dict):
+            continue
+        bname = str(a.get("broker") or a.get("broker_name") or "")
+        if bname not in holdings_by:
+            for n in names:
+                if n.lower() in bname.lower():
+                    bname = n
+                    break
+        if bname in holdings_by:
+            holdings_by[bname].append(a)
+    return holdings_by
+
+
+def build_portfolio_heat_rows(
+    totals: dict,
+    holdings_by: dict,
+    session_starts: dict,
+    auto_trade_enabled: dict,
+    broker_names: Iterable[str] | None = None,
+) -> list[dict]:
+    """Build per-broker rows for portfolio_heat_snapshot (effective equity net of locked)."""
+    names = list(broker_names or DEFAULT_BROKER_NAMES)
+    rows: list[dict] = []
+    for name in names:
+        try:
+            p_val = float((totals.get(name) or {}).get("p_val", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            p_val = 0.0
+        try:
+            bp = float((totals.get(name) or {}).get("bp", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            bp = 0.0
+        locked = locked_value_from_holdings(holdings_by.get(name) or [])
+        eff_eq = effective_book_equity(p_val, locked)
+        start = session_starts.get(name) if isinstance(session_starts, dict) else None
+        try:
+            pl = (p_val - float(start)) if start is not None and float(start) > 0 else 0.0
+        except (TypeError, ValueError):
+            pl = 0.0
+        bid = _BROKER_ID_MAP.get(name, name)
+        rows.append({
+            "broker": name,
+            "broker_id": bid,
+            "equity": eff_eq,
+            "raw_equity": p_val,
+            "locked_value": locked,
+            "buying_power": bp,
+            "day_pnl": pl,
+            "armed": bool((auto_trade_enabled or {}).get(name)),
+            "holdings": holdings_by.get(name) or [],
+        })
+    return rows
+
+
+def format_portfolio_heat_label(
+    snap: dict,
+    rows: list,
+    *,
+    money_fn,
+    currency_fn,
+) -> str:
+    """Home heat strip one-liner from portfolio_heat_snapshot + broker rows."""
+    c = snap.get("combined") or {}
+    risk_d = float(c.get("open_risk_dollars") or 0)
+    risk_p = float(c.get("open_risk_pct") or 0)
+    head = float(c.get("bp_headroom") or 0)
+    locked_total = sum(float(r.get("locked_value") or 0.0) for r in (rows or []))
+    heat_txt = (
+        f"Open risk ≈ {currency_fn(risk_d)} ({risk_p:.1f}% equity) · "
+        f"BP headroom ≈ {currency_fn(head)} · "
+        f"Day P&L {currency_fn(c.get('day_pnl') or 0)}"
+    )
+    if locked_total > 0.01:
+        heat_txt += f" · Locked {money_fn(locked_total)} excluded from sizing"
+    return heat_txt
+
+
 def etrade_bp_label(bp: float, *, environment: str, min_trade_dollars: float = 5.0) -> tuple[str, str]:
     """Buying Power label + tooltip for Home ET row."""
     env = str(environment or "sandbox").lower()

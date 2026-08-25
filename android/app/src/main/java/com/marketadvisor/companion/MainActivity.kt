@@ -224,6 +224,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun brokerSubtitle(name: String, info: MonitorApi.BrokerInfo?, etrade: MonitorApi.EtradeInfo): String {
+        return brokerSubtitle(name, info, etrade, MonitorApi.LockedCapital())
+    }
+
+    private fun brokerSubtitle(
+        name: String,
+        info: MonitorApi.BrokerInfo?,
+        etrade: MonitorApi.EtradeInfo,
+        locked: MonitorApi.LockedCapital,
+    ): String {
         if (info == null && name != "E*TRADE") return ""
         val bits = mutableListOf<String>()
         if (info != null) {
@@ -233,6 +242,10 @@ class MainActivity : AppCompatActivity() {
                 else -> "Disconnected"
             }
             if (info.ddPause) bits += "DD pause"
+            val lk = locked.byBroker[name]
+            if (lk != null && lk > 0.01) {
+                bits += String.format(Locale.US, "locked $%,.0f", lk)
+            }
             if (!info.liveTrading) bits += "live trading off"
             info.buyingPower?.let { bp ->
                 if (name != "E*TRADE") {
@@ -360,6 +373,13 @@ class MainActivity : AppCompatActivity() {
                     )
                     riskBits += String.format(Locale.US, "sess %.0f%%", heat.sessionRiskUsedPct)
                     if (heat.ddPaused) riskBits += "DD"
+                    if (heat.peakDdWorstPct < -0.001) {
+                        riskBits += String.format(Locale.US, "peak %.1f%%", heat.peakDdWorstPct * 100.0)
+                    }
+                    val locked = status.lockedCapital
+                    if (locked.present && locked.total > 0.01) {
+                        riskBits += String.format(Locale.US, "locked $%,.0f", locked.total)
+                    }
                     if (status.halted) riskBits += "HALTED"
                     binding.metricRisk.text = riskBits.joinToString(" · ")
                     binding.metricRisk.setTextColor(
@@ -470,7 +490,7 @@ class MainActivity : AppCompatActivity() {
                         row.binding.brokerSwitch.isChecked = armed
                     }
                     setPill(row.binding.brokerPill, armed)
-                    val detail = brokerSubtitle(row.name, info, status.etrade)
+                    val detail = brokerSubtitle(row.name, info, status.etrade, status.lockedCapital)
                     if (detail.isNotBlank()) {
                         row.binding.brokerDetail.visibility = View.VISIBLE
                         row.binding.brokerDetail.text = detail
