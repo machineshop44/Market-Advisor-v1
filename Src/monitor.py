@@ -441,6 +441,8 @@ async function refresh(){
       if(info.reauth_needed) bits.push('REAUTH');
       if(info.dd_pause) bits.push('DD pause');
       if(info.armed) bits.push('armed');
+      const lk = ((d.locked_capital||{}).by_broker||{})[n] || {};
+      if((lk.value||0) > 0.01) bits.push('locked '+money(lk.value));
       if(n==='E*TRADE'){
         if(info.sandbox_no_bp) bits.push('Sandbox/no BP');
         else if(info.environment) bits.push(String(info.environment));
@@ -464,6 +466,11 @@ async function refresh(){
       if(heat.open_risk_pct != null) bits.push('open risk '+Number(heat.open_risk_pct).toFixed(1)+'%');
       if(heat.session_risk_used_pct != null) bits.push('session '+Number(heat.session_risk_used_pct).toFixed(0)+'%');
       if(heat.dd_paused) bits.push('DD pause');
+      const locked = d.locked_capital || {};
+      if((locked.total||0) > 0.01) bits.push('locked '+money(locked.total));
+      if(heat.peak_dd_worst_pct != null && heat.peak_dd_worst_pct < -0.001) {
+        bits.push('peak DD '+(Number(heat.peak_dd_worst_pct)*100).toFixed(1)+'%');
+      }
       if(d.halted) bits.push('HALTED');
       risk.textContent = bits.join(' · ');
     }
@@ -471,6 +478,7 @@ async function refresh(){
     if(riskPanel){
       const ph = d.protective_health || {};
       const heat = ((d.portfolio_heat||{}).combined) || {};
+      const locked = d.locked_capital || {};
       const sg = d.shadow_guard || {};
       const fp = d.frac_policy || {};
       const et = d.etrade || {};
@@ -478,6 +486,12 @@ async function refresh(){
       lines.push('Open risk ≈ $'+Number(heat.open_risk_dollars||0).toFixed(2)+
         ' ('+Number(heat.open_risk_pct||0).toFixed(1)+'% eq) · session '+
         Number(heat.session_risk_used_pct||0).toFixed(0)+'%');
+      if((locked.total||0) > 0.01){
+        lines.push('Locked capital '+money(locked.total)+' excluded from sizing/deployable BP');
+      }
+      if(heat.peak_dd_worst_pct != null && heat.peak_dd_worst_pct < -0.001){
+        lines.push('Peak drawdown from session high: '+(Number(heat.peak_dd_worst_pct)*100).toFixed(1)+'%');
+      }
       lines.push('Stops missing '+(ph.missing_count||0)+
         (ph.fractional_na_count ? (' · fractional N/A '+ph.fractional_na_count) : '')+
         ' · Repair skips E*TRADE (stops N/A)');

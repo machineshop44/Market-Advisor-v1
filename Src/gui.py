@@ -1921,6 +1921,36 @@ class MarketAdvisorGUI(QMainWindow):
         else:
             self.trade_locks.pop(f"{key}:crypto", None)
 
+    def _reset_day_pnl_baseline(self):
+        """Re-anchor Day P&L to current portfolio values (survives via settings)."""
+        totals = getattr(self, "_last_balance_totals", {}) or {}
+        if not totals:
+            QMessageBox.information(
+                self, "Reset Day P&L",
+                "Connect brokers and refresh balances first.",
+            )
+            return
+        updated = []
+        for name in BROKER_NAMES:
+            p_val = float(totals.get(name, {}).get("p_val", 0.0) or 0.0)
+            if p_val > 0:
+                self.session_starts[name] = p_val
+                updated.append(f"{name} {format_currency(p_val)}")
+        if not updated:
+            QMessageBox.information(
+                self, "Reset Day P&L",
+                "No positive portfolio values available to anchor.",
+            )
+            return
+        self._persist_session_baselines()
+        self.log_event(
+            "📊 Day P&L baseline reset to current portfolio: " + "; ".join(updated)
+        )
+        self._refresh_home_balance_labels()
+        if hasattr(self, "_refresh_portfolio_heat"):
+            self._refresh_portfolio_heat()
+        self.publish_monitor_status()
+
     def _persist_session_baselines(self):
         """Save day-start equity so Day P&L survives app restarts."""
         self.settings["pnl_baseline_date"] = str(datetime.now().date())
@@ -3864,6 +3894,18 @@ class MarketAdvisorGUI(QMainWindow):
                 "cash": combined_cash,
                 "day_pnl": combined_pnl,
             }
+            locked_by = getattr(self, "_last_locked_by_broker", None) or {}
+            locked_capital = {"total": 0.0, "count": 0, "by_broker": {}}
+            for name in BROKER_NAMES:
+                summ = locked_by.get(name) or {}
+                val = float(summ.get("total_value") or 0.0)
+                cnt = int(summ.get("count") or 0)
+                if val <= 0 and cnt <= 0:
+                    holdings = (getattr(self, "_heat_holdings_by_broker", {}) or {}).get(name) or []
+                    val = float(_auto_cycle.locked_value_from_holdings(holdings))
+                locked_capital["by_broker"][name] = {"value": val, "count": cnt}
+                locked_capital["total"] += val
+                locked_capital["count"] += cnt
             market = "Unknown"
             if hasattr(self, "market_status_lbl"):
                 txt = self.market_status_lbl.text() or ""
@@ -3904,6 +3946,7 @@ class MarketAdvisorGUI(QMainWindow):
                 "cluster_heat": getattr(self, "_last_cluster_heat", []) or [],
                 "protective_health": getattr(self, "_last_protective_health", {}) or {},
                 "portfolio_heat": getattr(self, "_last_portfolio_heat", {}) or {},
+                "locked_capital": locked_capital,
                 "shadow_guard": getattr(self, "_last_shadow_guard", None)
                 or getattr(self, "_shadow_guard_active", None)
                 or {},
@@ -4892,6 +4935,18 @@ class MarketAdvisorGUI(QMainWindow):
         self.home_master_pl_lbl.setWordWrap(True)
         self.home_master_pl_lbl.setMinimumHeight(ui_px(22))
         self.home_master_pl_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        reset_pl_row = QHBoxLayout()
+        reset_pl_row.addStretch(1)
+        self.home_reset_pnl_btn = QPushButton("Reset Day P&L baseline")
+        self.home_reset_pnl_btn.setFlat(True)
+        self.home_reset_pnl_btn.setToolTip(
+            "Set today's Day P&L start to current portfolio values (use after restart "
+            "if combined P&L looks wrong). Does not affect autotrader risk rails."
+        )
+        self.home_reset_pnl_btn.clicked.connect(self._reset_day_pnl_baseline)
+        reset_pl_row.addWidget(self.home_reset_pnl_btn)
+        reset_pl_row.addStretch(1)
         
         # Vertically distribute total / cash / day P&L when card stretches to brokers
         mc_layout.addStretch(1)
@@ -4899,6 +4954,7 @@ class MarketAdvisorGUI(QMainWindow):
         mc_layout.addStretch(1)
         mc_layout.addWidget(self.home_master_bp_lbl)
         mc_layout.addWidget(self.home_master_pl_lbl)
+        mc_layout.addLayout(reset_pl_row)
         mc_layout.addStretch(1)
         self.master_card.setLayout(mc_layout)
 
@@ -5743,10 +5799,11 @@ class MarketAdvisorGUI(QMainWindow):
         )
         layout.addWidget(self.reports_fee_conf_lbl)
 
-        self.reports_broker_table = QTableWidget(0, 9)
+        self.reports_broker_table = QTableWidget(0, 11)
         self.reports_broker_table.setHorizontalHeaderLabels([
             "Broker", "Buys", "Sells", "Rotates", "Turnover",
-            "Est. Fees", "Fee drag %", "Realized P&L", "Net≈",
+            "Est. Fees", "Fee drag %", "Gross WR", "Net WR",
+            "Realized P&L", "Net P&L",
         ])
         self.reports_broker_table.horizontalHeader().setStretchLastSection(True)
         self.reports_broker_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -5859,6 +5916,8 @@ class MarketAdvisorGUI(QMainWindow):
             for i, (name, b) in enumerate(sorted(by_b.items())):
                 turnover = float(b.get("buy_notional") or 0) + float(b.get("sell_notional") or 0)
                 drag = float(b.get("fee_drag_pct") or 0.0)
+                gross_wr = b.get("win_rate")
+                net_wr = b.get("net_win_rate")
                 net = float(b.get("net_after_fees") or (
                     float(b.get("realized_pnl") or 0) - float(b.get("fee_est") or 0)
                 ))
@@ -5870,6 +5929,8 @@ class MarketAdvisorGUI(QMainWindow):
                     format_currency(turnover),
                     format_currency(b.get("fee_est") or 0),
                     f"{drag:.2f}%",
+                    f"{gross_wr * 100:.0f}%" if gross_wr is not None else "—",
+                    f"{net_wr * 100:.0f}%" if net_wr is not None else "—",
                     format_currency(b.get("realized_pnl") or 0),
                     format_currency(net),
                 ]
@@ -12250,17 +12311,25 @@ class MarketAdvisorGUI(QMainWindow):
         is_crypto = str(engine or "").upper() in ("CRYPTO",)
         regime_ok = True
         regime_reason = ""
+        dd_paused = False
         try:
-            from scoring import market_regime_ok
+            from scoring import market_regime_ok, get_drawdown_status
             regime_ok, regime_reason = market_regime_ok(is_crypto=is_crypto)
+            bid = {
+                "Robinhood": "ROBINHOOD",
+                "Coinbase": "COINBASE",
+                "E*TRADE": "ETRADE",
+            }.get(broker, broker)
+            dd_paused = bool(get_drawdown_status(bid).get("paused"))
         except Exception:
             regime_ok = True
-        if regime_ok:
+        if regime_ok and not dd_paused:
             return
         tip_key, tip = _auto_cycle.regime_idle_coach_tip(
             broker, engine,
             idle_sec=idle_sec,
-            regime_reason=regime_reason,
+            regime_reason=regime_reason if not dd_paused else "",
+            dd_paused=dd_paused,
         )
         self._coach_tip(tip_key, tip, cooldown_sec=1800)
 

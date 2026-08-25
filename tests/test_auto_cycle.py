@@ -85,6 +85,12 @@ class TestAutoCycleCoachThrottle(unittest.TestCase):
         self.assertIn("61m", tip)
         self.assertIn("Regime", tip)
 
+        key2, tip2 = ac.regime_idle_coach_tip(
+            "Robinhood", "CORE", idle_sec=3700, dd_paused=True,
+        )
+        self.assertIn("regime_idle:dd_pause", key2)
+        self.assertIn("drawdown pause", tip2.lower())
+
         line = ac.format_no_actionable_scan_note(
             "Coinbase", "CRYPTO", 3, visible=["ETH (held)"], suppressed=1,
         )
