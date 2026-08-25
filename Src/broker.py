@@ -716,9 +716,78 @@ class RobinhoodAdapter(BaseBroker):
             if notional < 1.0:
                 return True, f"below ~$1 RH crypto floor (${notional:.4f})"
             return False, ""
+        # Whole shares are always sell-eligible (penny/OTC bags can be <$1 notional).
+        # Only block sub-$1 *fractional* equity (RH rejects those).
+        if self._qty_is_whole_shares(shares):
+            return False, ""
         if notional < 1.0:
             return True, f"stock fractional under $1 (${notional:.4f})"
         return False, ""
+
+    def _rh_instrument_id_from_positions(self, ticker):
+        """
+        Resolve instrument UUID from open stock positions when symbol search fails
+        (common for OTC / *Q delisted leftovers like GOEVQ).
+        """
+        clean = str(ticker).replace("-USD", "").upper().strip()
+        if not clean:
+            return None
+        try:
+            positions = r.get_open_stock_positions() or []
+        except Exception:
+            try:
+                positions = r.account.get_open_stock_positions() or []
+            except Exception:
+                return None
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            try:
+                qty = float(pos.get("quantity") or pos.get("shares") or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty <= 0:
+                continue
+            inst_url = pos.get("instrument") or pos.get("instrument_url") or ""
+            if not inst_url:
+                continue
+            try:
+                from robin_stocks.robinhood.helper import request_get
+                inst = request_get(inst_url, "regular")
+                if not isinstance(inst, dict):
+                    continue
+                sym = str(inst.get("symbol") or "").upper().strip()
+                if sym == clean:
+                    iid = inst.get("id")
+                    if iid:
+                        return str(iid)
+            except Exception:
+                continue
+        return None
+
+    def _rh_equity_sellable(self, ticker):
+        """
+        Return (ok, instrument_id_or_none, reason).
+        ok=False when RH has no tradeable instrument for this symbol (OTC/delisted).
+        """
+        clean = str(ticker).replace("-USD", "").upper().strip()
+        try:
+            from robin_stocks.robinhood.stocks import id_for_stock
+            iid = id_for_stock(clean)
+            if iid:
+                return True, str(iid), ""
+        except Exception:
+            pass
+        iid = self._rh_instrument_id_from_positions(clean)
+        if iid:
+            return True, iid, ""
+        hint = ""
+        if clean.endswith("Q") and len(clean) >= 4:
+            hint = " (OTC/delisted *Q — often sell-only in Robinhood app, not API)"
+        return False, None, (
+            f"RH has no tradeable instrument for {clean}{hint}. "
+            "Try selling in the Robinhood app; API cannot place the order."
+        )
 
     def _get_crypto_qty_increment(self, ticker):
         if ticker not in self._crypto_inc_cache:
@@ -1069,22 +1138,80 @@ class RobinhoodAdapter(BaseBroker):
         if price <= 0:
             return "Skipped: No valid market price (delisted/untradeable)", None
 
-        # Whole-share-only path (limit). Never int() a fractional full exit — that left dust.
+        sellable, _iid, why_blocked = self._rh_equity_sellable(ticker)
+        if not sellable:
+            return f"Skipped: {why_blocked}", None
+
+        def _is_instrument_miss(err):
+            e = str(err or "").lower()
+            return (
+                "list index" in e
+                or "not a valid" in e
+                or "no instrument" in e
+                or "instrument" in e and "none" in e
+            )
+
+        # Whole-share-only path (limit → market fallback). Never int() a fractional full exit.
         if self._qty_is_whole_shares(shares_val):
             qty_to_sell = int(Decimal(str(shares_val)).to_integral_value())
             limit_price = round(price * (1.0 - offset_pct), 4 if price < 1.0 else 2)
             try:
-                res = r.order_sell_limit(symbol=ticker, quantity=qty_to_sell, limitPrice=limit_price, timeInForce='gfd', extendedHours=use_ext_hours)
+                res = r.order_sell_limit(
+                    symbol=ticker, quantity=qty_to_sell, limitPrice=limit_price,
+                    timeInForce="gfd", extendedHours=use_ext_hours,
+                )
                 if isinstance(res, dict) and ("id" in res or "state" in res):
-                    oid = res.get('id')
+                    oid = res.get("id")
                     conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
                     tag = "Filled" if conf else f"Pending/{state}"
                     return f"{all_tag} {tag} ({qty_to_sell})", oid
-                return f"Fail: {res}", None
+                # Limit rejected / empty — try market once (OTC leftovers sometimes need it)
+                try:
+                    res_m = r.order_sell_market(
+                        symbol=ticker, quantity=qty_to_sell,
+                        timeInForce="gfd", extendedHours=use_ext_hours,
+                    )
+                    if isinstance(res_m, dict) and ("id" in res_m or "state" in res_m):
+                        oid = res_m.get("id")
+                        conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                        tag = "Filled" if conf else f"Pending/{state}"
+                        return f"{all_tag} market {tag} ({qty_to_sell})", oid
+                    return f"Fail: {res_m or res}", None
+                except Exception as e2:
+                    if _is_instrument_miss(e2):
+                        return (
+                            f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                            "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                            None,
+                        )
+                    return f"Fail: {e2}", None
             except Exception as e:
                 err = str(e)
-                if "list index" in err.lower() or "not a valid" in err.lower():
-                    return f"Skipped: Untradeable ticker ({err})", None
+                if _is_instrument_miss(err):
+                    # Market fallback before giving up
+                    try:
+                        res_m = r.order_sell_market(
+                            symbol=ticker, quantity=qty_to_sell,
+                            timeInForce="gfd", extendedHours=False,
+                        )
+                        if isinstance(res_m, dict) and ("id" in res_m or "state" in res_m):
+                            oid = res_m.get("id")
+                            conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                            tag = "Filled" if conf else f"Pending/{state}"
+                            return f"{all_tag} market {tag} ({qty_to_sell})", oid
+                    except Exception as e2:
+                        if _is_instrument_miss(e2) or _is_instrument_miss(err):
+                            return (
+                                f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                                "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                                None,
+                            )
+                        return f"Fail: {e2}", None
+                    return (
+                        f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                        "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                        None,
+                    )
                 return f"Fail: {e}", None
 
         # Fractional remainder / mixed integer+fractional / sub-1 share — sell exact qty
@@ -1123,8 +1250,12 @@ class RobinhoodAdapter(BaseBroker):
             return f"Fail: {res}", None
         except Exception as e:
             err = str(e)
-            if "list index" in err.lower() or "not a valid" in err.lower():
-                return f"Skipped: Untradeable ticker ({err})", None
+            if _is_instrument_miss(err):
+                return (
+                    f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                    "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                    None,
+                )
             if use_ext_hours or market_hours == "extended_hours":
                 return f"Skipped: Ext. Hours fractional rejected ({err[:100]})", None
             return f"Fail: {e}", None
@@ -1447,9 +1578,15 @@ class CoinbaseAdapter(BaseBroker):
         return out
 
     def get_current_holdings(self):
+        """
+        Spot crypto with sellable size. Tiny leftovers Coinbase's app hides
+        (sub-$1 / below product mins) are filtered so they don't show as phantoms.
+        """
         assets = []
         if not self.is_connected:
             return assets
+        # Match CB app hide-dust behavior (~$1) and our sell dust gate
+        min_display_notional = 1.0
         try:
             accounts = self._fetch_all_accounts()
             avg_by_asset = {}
@@ -1476,6 +1613,22 @@ class CoinbaseAdapter(BaseBroker):
                         mark = float(meta.get("mark") or 0.0)
                     except (TypeError, ValueError):
                         mark = 0.0
+                    if mark <= 0:
+                        try:
+                            mark = float(
+                                self.get_live_price(currency, allow_yahoo_fallback=True) or 0.0
+                            )
+                        except Exception:
+                            mark = 0.0
+                    if mark > 0:
+                        notional = float(total_qty) * mark
+                        if notional + 1e-9 < min_display_notional:
+                            continue
+                        dust, _why = self.position_is_dust(
+                            currency, total_qty, mark, "crypto"
+                        )
+                        if dust:
+                            continue
                     row = {
                         "ticker": currency,
                         "shares": total_qty,

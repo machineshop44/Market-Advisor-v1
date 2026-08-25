@@ -66,7 +66,7 @@ def _get_overview_class():
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 ACTIVITY_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activity_log.txt")
-# Keep UI/memory and on-disk log bounded so long sessions don't freeze Journal → Activity.
+# UI + active file stay bounded; older lines archive indefinitely (never deleted by rotate).
 from activity_log_util import (  # noqa: E402
     ACTIVITY_LOG_UI_MAX_LINES,
     ACTIVITY_LOG_DISK_MAX_BYTES,
@@ -101,7 +101,7 @@ def _tail_activity_log_file(path=None, max_lines=ACTIVITY_LOG_DISK_TAIL_LINES):
 
 
 def _rotate_activity_log_if_needed(path=None, force=False):
-    """Rewrite ACTIVITY_LOG_FILE keeping only the last keep-lines when over size/line limits."""
+    """Bound the active log file; spill older lines into activity_log_archives/ (kept forever)."""
     return _rotate_activity_log_if_needed_impl(path or ACTIVITY_LOG_FILE, force=force)
 
 
@@ -229,6 +229,7 @@ def load_settings():
         "etrade_account_id_key": "",
         "etrade_token_expires_at": 0.0,
         "etrade_live_trading": False,
+        "etrade_arm_intent": False,
         "webull_app_key": "",
         "webull_app_secret": "",
         "webull_env": "sandbox",
@@ -4053,6 +4054,7 @@ class MarketAdvisorGUI(QMainWindow):
         """
         Priority equity pulse at RTH open/close boundaries.
         PORTFOLIO first (deferred sells), then CORE / BREAKOUT buys. Crypto unchanged.
+        Runs for every armed equity broker (Robinhood + E*TRADE).
         """
         labels = {
             "pre_open": "Pre-open session check…",
@@ -4061,29 +4063,48 @@ class MarketAdvisorGUI(QMainWindow):
         }
         self.log_event(labels.get(kind, f"Session boundary check ({kind})…"))
 
-        broker = "Robinhood"
-        if not self.auto_trade_enabled.get(broker):
-            return
-        if (
-            not self.paper_mode
-            and not self.brokers[broker].is_connected
-        ):
+        equity_brokers = [
+            b for b in BROKER_NAMES
+            if self.auto_trade_enabled.get(b)
+            and self._broker_supports(b, "supports_equities")
+        ]
+        if not equity_brokers:
             return
 
-        # Prefer front of queue so sells/buys hit ASAP vs any pending CRYPTO pulse
+        now_ts = float(now_ts or time.time())
         priority = []
-        for task in ("PORTFOLIO", "CORE", "PENNY"):
-            item = (broker, task)
-            if item in self.task_queue:
-                self.task_queue.remove(item)
-            priority.append(item)
-        self.task_queue = priority + self.task_queue
+        for broker in equity_brokers:
+            if (
+                not self.paper_mode
+                and not self.brokers[broker].is_connected
+            ):
+                continue
+            idle_why = self._buy_engines_idle_reason(broker)
+            if idle_why:
+                self._throttled_log(
+                    f"{broker}:buy_engines_idle",
+                    f"[{broker}] {idle_why} — session-boundary buys skipped",
+                    cooldown_sec=780,
+                )
+                tasks = ("PORTFOLIO",)
+            else:
+                tasks = ("PORTFOLIO", "CORE", "PENNY")
+            for task_name in tasks:
+                item = (broker, task_name)
+                if item in self.task_queue:
+                    self.task_queue.remove(item)
+                priority.append(item)
+            self.last_port_time[broker] = now_ts
+            if "CORE" in tasks:
+                self.last_core_time[broker] = now_ts
+                self.last_penny_time[broker] = now_ts
 
-        self.last_port_time[broker] = now_ts
-        self.last_core_time[broker] = now_ts
-        self.last_penny_time[broker] = now_ts
+        if not priority:
+            return
+        self.task_queue = priority + self.task_queue
+        who = ", ".join(dict.fromkeys(b for b, _ in priority))
         self._set_engine_banner(
-            f"🤖 ⏰ [{broker}] {labels.get(kind, 'Session check')} — queued",
+            f"🤖 ⏰ [{who}] {labels.get(kind, 'Session check')} — queued",
             "#00897B",
         )
 
@@ -4092,7 +4113,12 @@ class MarketAdvisorGUI(QMainWindow):
         Once per weekday (ET): equity cycles ~60s before 9:30 open, at/just after open,
         and ~60s before 16:00 close. Weekends skipped; no holiday calendar (weekday RTH baseline).
         """
-        if not self.auto_trade_enabled.get("Robinhood"):
+        equity_armed = any(
+            self.auto_trade_enabled.get(b)
+            and self._broker_supports(b, "supports_equities")
+            for b in BROKER_NAMES
+        )
+        if not equity_armed:
             return
 
         now_et = self._now_et()
@@ -4347,7 +4373,20 @@ class MarketAdvisorGUI(QMainWindow):
             self._activity_log_disk_writes = 0
         except Exception:
             pass
-        self.log_event("Activity log cleared.")
+        self.log_event(
+            "Activity log cleared (active file). Archives under activity_log_archives/ kept."
+        )
+
+    def _open_activity_log_folder(self):
+        """Reveal activity_log.txt + archives folder in Explorer."""
+        try:
+            folder = os.path.dirname(os.path.abspath(ACTIVITY_LOG_FILE))
+            arch = os.path.join(folder, "activity_log_archives")
+            target = arch if os.path.isdir(arch) else folder
+            os.makedirs(folder, exist_ok=True)
+            os.startfile(target)
+        except Exception as e:
+            self.log_event(f"Could not open logs folder: {e}")
 
     # ---------------------------------------------------------
     #  UI BUILDING & SCREENS
@@ -4459,7 +4498,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.halt_all_btn.setStyleSheet(top_bar_btn_style("#B71C1C"))
         self.halt_all_btn.setToolTip(
             "Panic Halt All — disarm every broker, clear queues, urgent Discord. "
-            "Does not place sells; cancels tracked protective stops when supported."
+            "Does not place sells and does not cancel protective stops."
         )
         self.halt_all_btn.clicked.connect(self.panic_halt_all)
         # Visible only while Auto-Trader is armed (synced in _update_autotrade_ui).
@@ -5453,10 +5492,14 @@ class MarketAdvisorGUI(QMainWindow):
         header.setStyleSheet(section_header_style())
 
         tc = theme_colors(self.dark_mode)
-        self.activity_log_hint = QLabel(f"Showing last {ACTIVITY_LOG_UI_MAX_LINES} lines")
+        self.activity_log_hint = QLabel(
+            f"Showing last {ACTIVITY_LOG_UI_MAX_LINES} lines · older → activity_log_archives/"
+        )
         self.activity_log_hint.setObjectName("activityLogHint")
         self.activity_log_hint.setToolTip(
-            "Older lines stay on disk (rotated). Clear Log clears both the UI and the on-disk file."
+            "UI shows a recent window. The active activity_log.txt rolls when large; "
+            "older lines are archived indefinitely under activity_log_archives/ "
+            "(next to the log file). Clear Log clears the UI + active file only — not archives."
         )
         self.activity_log_hint.setStyleSheet(
             f"color: {tc['muted']}; font-size: {ui_px(11)}px;"
@@ -5481,9 +5524,22 @@ class MarketAdvisorGUI(QMainWindow):
         save_log_btn.setFixedWidth(ui_px(120))
         save_log_btn.clicked.connect(self.save_log_to_file)
 
+        open_logs_btn = QPushButton("Open Logs Folder")
+        open_logs_btn.setObjectName("openLogsBtn")
+        open_logs_btn.setFixedWidth(ui_px(130))
+        open_logs_btn.setToolTip(
+            "Open the folder with activity_log.txt and activity_log_archives/ "
+            "(indefinite history)."
+        )
+        open_logs_btn.clicked.connect(self._open_activity_log_folder)
+
         clear_log_btn = QPushButton("Clear Log")
         clear_log_btn.setObjectName("clearLogBtn")
         clear_log_btn.setFixedWidth(ui_px(100))
+        clear_log_btn.setToolTip(
+            "Clear the UI and active activity_log.txt. Archived history under "
+            "activity_log_archives/ is kept."
+        )
         clear_log_btn.clicked.connect(self._clear_activity_log)
 
         header_bar.addWidget(header)
@@ -5493,6 +5549,7 @@ class MarketAdvisorGUI(QMainWindow):
         header_bar.addWidget(self.log_filter_combo)
         header_bar.addWidget(copy_log_btn)
         header_bar.addWidget(save_log_btn)
+        header_bar.addWidget(open_logs_btn)
         header_bar.addWidget(clear_log_btn)
         layout.addLayout(header_bar)
 
@@ -6550,10 +6607,18 @@ class MarketAdvisorGUI(QMainWindow):
         self.rh_connect_btn.setProperty("uiBtnKind", "primary")
         self.rh_connect_btn.setStyleSheet(action_btn_style("primary"))
         self.rh_connect_btn.clicked.connect(self.connect_robinhood)
+        self.rh_disconnect_btn = QPushButton("Disconnect")
+        self.rh_disconnect_btn.setToolTip(
+            "Log out and clear the saved Robinhood session so you can re-login / reauth."
+        )
+        self.rh_disconnect_btn.clicked.connect(self.disconnect_robinhood)
+        rh_btn_row = QHBoxLayout()
+        rh_btn_row.addWidget(self.rh_connect_btn)
+        rh_btn_row.addWidget(self.rh_disconnect_btn)
         rh_form.addRow("Status:", self.rh_dialog_status_lbl)
         rh_form.addRow("Email:", self.rh_email_input)
         rh_form.addRow("Password:", self.rh_pass_input)
-        rh_form.addRow("", self.rh_connect_btn)
+        rh_form.addRow("", rh_btn_row)
 
         # Coinbase Advanced (CDP)
         self._cb_login_dialog = QDialog(self)
@@ -6580,11 +6645,20 @@ class MarketAdvisorGUI(QMainWindow):
         self.cb_connect_btn.setProperty("uiBtnKind", "primary")
         self.cb_connect_btn.setStyleSheet(action_btn_style("primary"))
         self.cb_connect_btn.clicked.connect(self.connect_coinbase)
+        self.cb_disconnect_btn = QPushButton("Disconnect")
+        self.cb_disconnect_btn.setToolTip(
+            "Drop the live Coinbase session so you can reconnect / rotate API keys."
+        )
+        self.cb_disconnect_btn.clicked.connect(self.disconnect_coinbase)
+        cb_btn_row = QHBoxLayout()
+        cb_btn_row.addWidget(self.cb_connect_btn)
+        cb_btn_row.addWidget(self.cb_disconnect_btn)
+        self.cb_live_trading_chk.stateChanged.connect(self._on_cb_live_trading_toggled)
         cb_form.addRow("Status:", self.cb_dialog_status_lbl)
         cb_form.addRow("CDP API Key:", self.cb_key_input)
         cb_form.addRow("CDP API Secret:", self.cb_secret_input)
         cb_form.addRow("", self.cb_live_trading_chk)
-        cb_form.addRow("", self.cb_connect_btn)
+        cb_form.addRow("", cb_btn_row)
 
         # E*TRADE OAuth
         self._et_login_dialog = QDialog(self)
@@ -6628,6 +6702,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.et_connect_btn.clicked.connect(self.connect_etrade)
         self.et_disconnect_btn = QPushButton("Disconnect")
         self.et_disconnect_btn.clicked.connect(self.disconnect_etrade)
+        self.et_live_trading_chk.stateChanged.connect(self._on_et_live_trading_toggled)
         et_btn_row.addWidget(self.et_auth_btn)
         et_btn_row.addWidget(self.et_connect_btn)
         et_btn_row.addWidget(self.et_disconnect_btn)
@@ -7189,7 +7264,18 @@ class MarketAdvisorGUI(QMainWindow):
                 self.et_secret_input.clear()
             self.refresh_account_balances()
             self.log_event(f"[E*TRADE] Connected ({et.environment}) account={et.account_id_key}")
+            if str(et.environment).lower() != "live" and self.settings["etrade_live_trading"]:
+                self.log_event(
+                    "[E*TRADE] Note: Live order checkbox is ON but Environment is "
+                    f"'{et.environment}' — switch to live + Complete Connection for real buys."
+                )
+            elif str(et.environment).lower() == "live" and not self.settings["etrade_live_trading"]:
+                self.log_event(
+                    "[E*TRADE] Live env connected read-only — enable Live order placement "
+                    "to allow CORE/BREAKOUT buys."
+                )
             self._update_autotrade_ui()
+            self._maybe_restore_etrade_arm(source="connect")
         else:
             if _is_manual_auth_failure(msg):
                 self._broker_manual_auth_needed["E*TRADE"] = True
@@ -7201,9 +7287,96 @@ class MarketAdvisorGUI(QMainWindow):
             self.brokers["E*TRADE"].logout()
         except Exception:
             pass
+        if self.auto_trade_enabled.get("E*TRADE"):
+            self._disarm_broker("E*TRADE", notify_discord=True, clear_arm_intent=True)
+        else:
+            self._set_etrade_arm_intent(False)
         self._broker_manual_auth_needed["E*TRADE"] = True
         self._set_broker_status("E*TRADE", "🔴 Disconnected", "")
         self.log_event("[E*TRADE] Disconnected / token revoked.")
+        self._update_autotrade_ui()
+
+    def _on_et_live_trading_toggled(self, _state=None):
+        """Persist live-order kill switch immediately (do not wait for Complete Connection)."""
+        enabled = bool(
+            self.et_live_trading_chk.isChecked()
+            if hasattr(self, "et_live_trading_chk")
+            else False
+        )
+        self.settings["etrade_live_trading"] = enabled
+        et = self.brokers.get("E*TRADE")
+        if et is not None:
+            et.live_trading_enabled = enabled
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        env = str(
+            getattr(et, "environment", None)
+            or self.settings.get("etrade_environment", "sandbox")
+        ).lower()
+        if enabled and env != "live":
+            self.log_event(
+                "[E*TRADE] Live order placement ON — but Environment is still "
+                f"'{env}'. Switch Environment to live and Complete Connection to place real orders."
+            )
+        else:
+            self.log_event(
+                f"[E*TRADE] Live order placement {'ON' if enabled else 'OFF'} "
+                f"(env={env})."
+            )
+        self._update_autotrade_ui()
+
+    def _on_cb_live_trading_toggled(self, _state=None):
+        enabled = bool(
+            self.cb_live_trading_chk.isChecked()
+            if hasattr(self, "cb_live_trading_chk")
+            else True
+        )
+        self.settings["coinbase_live_trading"] = enabled
+        cb = self.brokers.get("Coinbase")
+        if cb is not None:
+            cb.live_trading_enabled = enabled
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self.log_event(f"[Coinbase] Live order placement {'ON' if enabled else 'OFF'}.")
+        self._update_autotrade_ui()
+
+    def disconnect_robinhood(self):
+        """Log out + clear saved session pickle so Connect can reauth cleanly."""
+        try:
+            self.brokers["Robinhood"].logout()
+        except Exception:
+            pass
+        # Clear saved session so next Connect is a real login (not stale pickle)
+        try:
+            from broker import robinhood_pickle_path
+            path = robinhood_pickle_path()
+            if path and os.path.isfile(path):
+                os.remove(path)
+                self.log_event(f"[Robinhood] Cleared saved session ({path}).")
+        except Exception as e:
+            self.log_event(f"[Robinhood] Could not clear session pickle: {e}")
+        if self.auto_trade_enabled.get("Robinhood"):
+            self._disarm_broker("Robinhood", notify_discord=True)
+        self._broker_manual_auth_needed["Robinhood"] = True
+        self._set_broker_status("Robinhood", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
+        self.log_event("[Robinhood] Disconnected — use Connect to re-login / MFA.")
+        self._update_autotrade_ui()
+
+    def disconnect_coinbase(self):
+        """Drop live CDP client; keys stay in Settings for reconnect."""
+        try:
+            self.brokers["Coinbase"].logout()
+        except Exception:
+            pass
+        if self.auto_trade_enabled.get("Coinbase"):
+            self._disarm_broker("Coinbase", notify_discord=True)
+        self._broker_manual_auth_needed["Coinbase"] = True
+        self._set_broker_status("Coinbase", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
+        self.log_event("[Coinbase] Disconnected — use Connect to reauth (keys kept).")
         self._update_autotrade_ui()
 
     def connect_robinhood(self):
@@ -7600,7 +7773,9 @@ class MarketAdvisorGUI(QMainWindow):
             self.at_status_frame.setVisible(False)
             self._reset_autotrader_banner_style()
 
-    def _disarm_broker(self, broker_name, notify_discord=False):
+    def _disarm_broker(self, broker_name, notify_discord=False, *, clear_arm_intent=False):
+        if broker_name == "E*TRADE" and clear_arm_intent:
+            self._set_etrade_arm_intent(False)
         self.auto_trade_enabled[broker_name] = False
         self.task_queue = [
             item for item in self.task_queue
@@ -7615,6 +7790,111 @@ class MarketAdvisorGUI(QMainWindow):
                 prefix="[RISK]",
             )
 
+    def _set_etrade_arm_intent(self, want: bool):
+        """Remember user wanted ET armed through midnight reauth / session drop."""
+        prev = bool(self.settings.get("etrade_arm_intent", False))
+        want = bool(want)
+        if prev == want:
+            return
+        self.settings["etrade_arm_intent"] = want
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _maybe_restore_etrade_arm(self, *, source=""):
+        """
+        Re-arm E*TRADE after successful reconnect when user had it armed before
+        midnight expiry or auth failure. Full OAuth still required at midnight ET —
+        this only restores Auto-Trader once tokens are valid again.
+        """
+        if not bool(self.settings.get("etrade_arm_intent", False)):
+            return
+        if self.auto_trade_enabled.get("E*TRADE"):
+            self._set_etrade_arm_intent(False)
+            return
+        et = self.brokers.get("E*TRADE")
+        if not et or not getattr(et, "is_connected", False):
+            return
+        if getattr(self, "_broker_manual_auth_needed", {}).get("E*TRADE"):
+            return
+        env = str(getattr(et, "environment", None) or self.settings.get("etrade_environment", "")).lower()
+        live_ok = bool(
+            getattr(et, "live_trading_enabled", False)
+            or self.settings.get("etrade_live_trading", False)
+        )
+        if env != "live" or not live_ok:
+            self._throttled_log(
+                "E*TRADE:arm_intent_wait_live",
+                "[E*TRADE] Arm intent saved — enable Live env + Live orders, then re-arm "
+                "or Complete Connection to resume CORE/BREAKOUT.",
+                cooldown_sec=3600,
+            )
+            return
+        armed = self._arm_broker_engines(["E*TRADE"], warn=False)
+        if armed:
+            self._set_etrade_arm_intent(False)
+            src = f" ({source})" if source else ""
+            self.log_event(
+                f"[E*TRADE] Auto-Trader re-armed after reconnect{src} "
+                "(restored from pre-midnight intent)."
+            )
+            self.send_discord_alert(
+                "✅ [E*TRADE] Auto-Trader **re-armed** after reconnect.",
+                urgent=False,
+                prefix="[ET]",
+            )
+            self._set_engine_banner("🤖 ⚡ E*TRADE re-armed — spinning up…")
+            QTimer.singleShot(0, self.director_tick)
+            self._update_autotrade_ui()
+
+    def _maybe_etrade_midnight_handling(self, now_ts=None):
+        """
+        At midnight ET: token dies — cannot silently renew into the next day.
+        Persist arm intent so one OAuth reauth can restore trading without re-checking ET.
+        """
+        if self.paper_mode:
+            return
+        et = self.brokers.get("E*TRADE")
+        if not et or not getattr(et, "client", None):
+            return
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+            now_et = datetime.fromtimestamp(float(now_ts or time.time()), ZoneInfo("America/New_York"))
+        except Exception:
+            return
+        day_key = now_et.date().isoformat()
+        handled = getattr(self, "_etrade_midnight_handled_day", None)
+        if handled == day_key:
+            return
+        # First ~10 minutes after midnight ET — catch expiry once per day
+        if not (now_et.hour == 0 and now_et.minute < 10):
+            return
+        exp = float(getattr(et, "token_expires_at", 0) or self.settings.get("etrade_token_expires_at", 0) or 0)
+        if exp <= 0 or time.time() <= exp:
+            return
+        self._etrade_midnight_handled_day = day_key
+        was_armed = bool(self.auto_trade_enabled.get("E*TRADE"))
+        if was_armed:
+            self._set_etrade_arm_intent(True)
+        ok, msg = et.ensure_session()
+        if ok:
+            self.settings["etrade_token_expires_at"] = float(et.token_expires_at or 0)
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
+            self.log_event(f"[E*TRADE] Session renewed after midnight boundary ({msg}).")
+            return
+        if was_armed or bool(self.settings.get("etrade_arm_intent", False)):
+            self.log_event(
+                "[E*TRADE] Midnight ET — access token expired. "
+                "Reauth in Settings (verifier required once). Auto-Trader will re-arm when connected."
+            )
+        if _is_manual_auth_failure(msg):
+            self._handle_broker_auth_failure("E*TRADE", msg, source="midnight_et")
+
     def panic_halt_all(self):
         """Disarm every broker, clear queues, urgent Discord — Panic Halt All."""
         self.task_queue = []
@@ -7623,6 +7903,7 @@ class MarketAdvisorGUI(QMainWindow):
             if self.auto_trade_enabled.get(name):
                 halted.append(name)
             self.auto_trade_enabled[name] = False
+        self._set_etrade_arm_intent(False)
         self.log_event("[HALT] Panic Halt All — all brokers disarmed, queues cleared.")
         self._update_autotrade_ui()
         self.publish_monitor_status()
@@ -7961,6 +8242,9 @@ class MarketAdvisorGUI(QMainWindow):
         if not hasattr(self, "_broker_manual_auth_needed"):
             self._broker_manual_auth_needed = _blank_broker_map(False)
         self._broker_manual_auth_needed[broker_name] = True
+
+        if broker_name == "E*TRADE" and was_armed:
+            self._set_etrade_arm_intent(True)
 
         broker = self.brokers.get(broker_name)
         if broker is not None:
@@ -8491,7 +8775,29 @@ class MarketAdvisorGUI(QMainWindow):
             status = "Connected"
         else:
             status = "Disconnected"
-        return f"{broker_name} ({cap_txt}) — {status}"
+        extra = ""
+        if broker_name == "E*TRADE" and connected and not self.paper_mode:
+            env = str(
+                getattr(b, "environment", None)
+                or self.settings.get("etrade_environment", "sandbox")
+            ).lower()
+            live_ok = bool(
+                getattr(b, "live_trading_enabled", False)
+                or self.settings.get("etrade_live_trading", False)
+            )
+            bp = float(
+                (getattr(self, "_last_balance_totals", {}) or {})
+                .get("E*TRADE", {})
+                .get("bp", 0.0)
+                or 0.0
+            )
+            extra = f" · {env}"
+            extra += " · orders ON" if live_ok else " · orders OFF"
+            if bp > 0:
+                extra += f" · BP ${bp:,.2f}"
+            else:
+                extra += " · BP $0"
+        return f"{broker_name} ({cap_txt}) — {status}{extra}"
 
     def _broker_is_arm_eligible(self, broker_name, *, warn=False):
         """Return True if this broker can be armed right now."""
@@ -8621,6 +8927,30 @@ class MarketAdvisorGUI(QMainWindow):
                     f"[E*TRADE] {why} (CORE/BREAKOUT skipped); "
                     "PORTFOLIO sells still run."
                 )
+            if broker_name == "E*TRADE":
+                et = self.brokers.get("E*TRADE")
+                env = str(
+                    getattr(et, "environment", None)
+                    or self.settings.get("etrade_environment", "sandbox")
+                ).lower()
+                live_ok = bool(
+                    getattr(et, "live_trading_enabled", False)
+                    or self.settings.get("etrade_live_trading", False)
+                )
+                try:
+                    note = _decision_log.etrade_path_honesty_note(
+                        environment=env,
+                        live_trading=live_ok,
+                        buying_power=bp,
+                        paper_mode=bool(self.paper_mode),
+                        min_trade_dollars=float(self.settings.get("min_trade_dollars", 5.0) or 5.0),
+                    )
+                    self.log_event(f"[E*TRADE] {note}")
+                except Exception:
+                    self.log_event(
+                        f"[E*TRADE] env={env} live_orders={'ON' if live_ok else 'OFF'} "
+                        f"BP={format_currency(bp)} — equity buys only in REGULAR/EXTENDED ET."
+                    )
         self.send_discord_alert(
             f"⚔️ Auto-Trader **ARMED** ({mode}) on {', '.join(armed)}.\n"
             + "\n".join(bp_lines)
@@ -8688,9 +9018,15 @@ class MarketAdvisorGUI(QMainWindow):
             return
 
         for broker_name in to_disarm:
-            self._disarm_broker(broker_name, notify_discord=True)
+            self._disarm_broker(
+                broker_name,
+                notify_discord=True,
+                clear_arm_intent=(broker_name == "E*TRADE"),
+            )
 
         newly_armed = self._arm_broker_engines(to_arm, warn=True) if to_arm else []
+        if "E*TRADE" in to_arm:
+            self._set_etrade_arm_intent(False)
 
         # Keep previously armed brokers that remain selected
         still_armed = [b for b in BROKER_NAMES if self.auto_trade_enabled.get(b)]
@@ -8752,6 +9088,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         # Equity RTH boundary wake-ups before interval scheduling (sets last_* so no double-queue)
         self._maybe_session_boundary_wakeup(now)
+        self._maybe_etrade_midnight_handling(now)
 
         for broker_name, enabled in self.auto_trade_enabled.items():
             if not enabled:
@@ -8788,31 +9125,40 @@ class MarketAdvisorGUI(QMainWindow):
                 self.last_port_time[broker_name] = now
 
             # Equities: capability-driven (RH + E*TRADE; not Coinbase)
-            if self._broker_supports(broker_name, "supports_equities") and self.is_equity_session_active():
-                idle_why = self._buy_engines_idle_reason(broker_name)
-                if now - self.last_penny_time[broker_name] >= self.settings.get("interval_penny", 60):
-                    if idle_why:
-                        self._throttled_log(
-                            f"{broker_name}:buy_engines_idle",
-                            f"[{broker_name}] {idle_why}",
-                            cooldown_sec=780,
-                        )
-                    else:
-                        task = (broker_name, "PENNY")
-                        if task not in self.task_queue: self.task_queue.append(task)
-                    self.last_penny_time[broker_name] = now
+            if self._broker_supports(broker_name, "supports_equities"):
+                if not self.is_equity_session_active():
+                    sess = self.get_equity_session_info().get("label", "?")
+                    self._throttled_log(
+                        f"{broker_name}:equity_session_wait",
+                        f"[{broker_name}] Equity buy engines wait for REGULAR/EXTENDED "
+                        f"(now {sess}) — PORTFOLIO sells still run 24/7.",
+                        cooldown_sec=1800,
+                    )
+                else:
+                    idle_why = self._buy_engines_idle_reason(broker_name)
+                    if now - self.last_penny_time[broker_name] >= self.settings.get("interval_penny", 60):
+                        if idle_why:
+                            self._throttled_log(
+                                f"{broker_name}:buy_engines_idle",
+                                f"[{broker_name}] {idle_why}",
+                                cooldown_sec=780,
+                            )
+                        else:
+                            task = (broker_name, "PENNY")
+                            if task not in self.task_queue: self.task_queue.append(task)
+                        self.last_penny_time[broker_name] = now
 
-                if now - self.last_core_time[broker_name] >= self.settings.get("interval_core", 300):
-                    if idle_why:
-                        self._throttled_log(
-                            f"{broker_name}:buy_engines_idle",
-                            f"[{broker_name}] {idle_why}",
-                            cooldown_sec=780,
-                        )
-                    else:
-                        task = (broker_name, "CORE")
-                        if task not in self.task_queue: self.task_queue.append(task)
-                    self.last_core_time[broker_name] = now
+                    if now - self.last_core_time[broker_name] >= self.settings.get("interval_core", 300):
+                        if idle_why:
+                            self._throttled_log(
+                                f"{broker_name}:buy_engines_idle",
+                                f"[{broker_name}] {idle_why}",
+                                cooldown_sec=780,
+                            )
+                        else:
+                            task = (broker_name, "CORE")
+                            if task not in self.task_queue: self.task_queue.append(task)
+                        self.last_core_time[broker_name] = now
 
         self.process_queue()
 
@@ -8828,6 +9174,7 @@ class MarketAdvisorGUI(QMainWindow):
             if now - getattr(self, "_last_idle_balance_refresh", 0.0) >= bal_every:
                 self._last_idle_balance_refresh = now
                 self.refresh_account_balances(quiet=True)
+            self._maybe_nudge_etrade_arm(now)
 
         # Throttle monitor publish (~every 3s) so the phone page stays fresh
         last_pub = getattr(self, "_monitor_last_publish", 0.0)
@@ -8835,6 +9182,47 @@ class MarketAdvisorGUI(QMainWindow):
             self._monitor_last_publish = now
             self.publish_monitor_status()
 
+    def _maybe_nudge_etrade_arm(self, now=None):
+        """
+        Once per stretch: if live ET is ready for real buys but not armed, say so.
+        Live checkbox alone does not place orders — Auto-Trader must include E*TRADE.
+        """
+        if self.paper_mode or self.auto_trade_enabled.get("E*TRADE"):
+            return
+        et = self.brokers.get("E*TRADE")
+        if not et or not getattr(et, "is_connected", False):
+            return
+        env = str(
+            getattr(et, "environment", None)
+            or self.settings.get("etrade_environment", "sandbox")
+        ).lower()
+        live_ok = bool(
+            getattr(et, "live_trading_enabled", False)
+            or self.settings.get("etrade_live_trading", False)
+        )
+        if env != "live" or not live_ok:
+            return
+        bp = float(
+            (getattr(self, "_last_balance_totals", {}) or {})
+            .get("E*TRADE", {})
+            .get("bp", 0.0)
+            or 0.0
+        )
+        min_d = float(self.settings.get("min_trade_dollars", 5.0) or 5.0)
+        if bp < max(0.01, min_d):
+            self._throttled_log(
+                "E*TRADE:live_ready_zero_bp",
+                f"[E*TRADE] Live · orders ON but BP {format_currency(bp)} — "
+                "fund the account / pick the right account before arming buys.",
+                cooldown_sec=1800,
+            )
+            return
+        self._throttled_log(
+            "E*TRADE:live_ready_not_armed",
+            "[E*TRADE] Live · orders ON · funded — but Auto-Trader is not armed "
+            "for E*TRADE. Open Auto-Trader and check E*TRADE to run CORE/BREAKOUT.",
+            cooldown_sec=1800,
+        )
     def _try_reconnect_broker(self, broker_name):
         """Kick off silent re-login on a worker thread (never block director_tick)."""
         now = time.time()
@@ -8904,6 +9292,15 @@ class MarketAdvisorGUI(QMainWindow):
                 self._update_autotrade_ui()
                 if hasattr(self, "_update_reauth_banner"):
                     self._update_reauth_banner()
+                if broker_name == "E*TRADE":
+                    et = self.brokers.get("E*TRADE")
+                    if et and getattr(et, "token_expires_at", None):
+                        self.settings["etrade_token_expires_at"] = float(et.token_expires_at)
+                        try:
+                            save_settings(self.settings)
+                        except Exception:
+                            pass
+                    self._maybe_restore_etrade_arm(source="reconnect")
             else:
                 streak = self._reconnect_fail_streak.get(broker_name, 0) + 1
                 self._reconnect_fail_streak[broker_name] = streak
@@ -9254,23 +9651,25 @@ class MarketAdvisorGUI(QMainWindow):
 
         Returns trade dollars, or (trade, detail_dict) when return_detail=True.
         """
-        from scoring import risk_sizing_breakdown, get_stop_distance_pct, get_execution_feedback
+        from scoring import risk_sizing_breakdown, get_stop_distance_pct, get_execution_feedback, effective_min_dollars
         is_crypto = "crypto" in str(asset_type).lower()
         if is_crypto:
             alloc_pct = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 8.0)) / 100.0
         else:
             alloc_pct = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0)) / 100.0
-        min_dollars = self.settings.get("min_trade_dollars", 5.0)
         broker_id = getattr(self.cycle_broker, "broker_id", None) or self.cycle_broker_name.upper()
-        stop_d = get_stop_distance_pct(
-            broker_id, ticker=ticker, asset_type=asset_type, for_sizing=True,
-        )
         eq = float(equity) if equity is not None else None
         if eq is None:
             try:
                 eq, _ = self.get_broker_balances(self.cycle_broker_name)
             except Exception:
                 eq = float(current_bp or 0.0)
+        min_dollars = effective_min_dollars(
+            broker_id, eq, is_crypto, self.settings.get("min_trade_dollars", 5.0)
+        )
+        stop_d = get_stop_distance_pct(
+            broker_id, ticker=ticker, asset_type=asset_type, for_sizing=True,
+        )
         max_open = max_open_positions
         if max_open is None:
             max_open = int(self.settings.get("max_open_positions", 8))
@@ -9761,9 +10160,10 @@ class MarketAdvisorGUI(QMainWindow):
                     row["engine"] = task
             if "regime_ok" not in row:
                 try:
-                    from scoring import market_regime_ok
+                    from scoring import market_regime_ok, uses_btc_regime
                     is_crypto = bool(row.get("is_crypto"))
-                    ok, why = market_regime_ok(is_crypto=is_crypto)
+                    use_btc = uses_btc_regime(row.get("ticker"), is_crypto)
+                    ok, why = market_regime_ok(is_crypto=use_btc)
                     row["regime_ok"] = bool(ok)
                     if not ok:
                         row.setdefault("regime_why", why)
@@ -10385,6 +10785,7 @@ class MarketAdvisorGUI(QMainWindow):
             allow_regime_override = bool(self.settings.get("allow_buys_when_regime_blocked", False))
             regime_ok, regime_why = entry_regime_ok(
                 is_crypto=is_crypto, posture=posture, allow_when_blocked=allow_regime_override,
+                ticker=ticker,
             )
             if not regime_ok:
                 why = regime_why or "regime blocked"
@@ -11034,7 +11435,15 @@ class MarketAdvisorGUI(QMainWindow):
                 broker = self.brokers.get(broker_name, self.cycle_broker)
                 price = broker.get_live_price(ticker) if broker else 0.0
                 if not price or price <= 0:
-                    results.append((row, 0.0, "HOLD (Untradeable — no quote)", asset_type, None))
+                    tu = str(ticker or "").upper()
+                    if tu.endswith("Q") and len(tu) >= 4:
+                        msg = (
+                            "HOLD (Untradeable — no quote; OTC/delisted *Q — "
+                            "try Robinhood app)"
+                        )
+                    else:
+                        msg = "HOLD (Untradeable — no quote)"
+                    results.append((row, 0.0, msg, asset_type, None))
                     continue
                 # Broker-aware dust: RH min qty / $1 fractional vs CB base+quote mins
                 try:
@@ -11048,6 +11457,17 @@ class MarketAdvisorGUI(QMainWindow):
                         (row, price, f"HOLD (Dust — {dust_reason})", asset_type, None)
                     )
                     continue
+                # Pre-flight RH instrument for known-dead OTC leftovers
+                try:
+                    if broker_name == "Robinhood" and hasattr(broker, "_rh_equity_sellable"):
+                        ok_inst, _, why_inst = broker._rh_equity_sellable(ticker)
+                        if not ok_inst:
+                            results.append(
+                                (row, price, f"HOLD (Untradeable — {why_inst})", asset_type, None)
+                            )
+                            continue
+                except Exception:
+                    pass
                 action = evaluate_holding(
                     ticker, avg_cost,
                     broker_id=getattr(broker, "broker_id", None) or broker_name,

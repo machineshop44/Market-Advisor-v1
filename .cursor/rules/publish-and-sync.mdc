@@ -1,0 +1,25 @@
+---
+description: Always publish EXE to Drive and push major changes to GitHub
+alwaysApply: true
+---
+
+# Publish & GitHub sync (Andrew)
+
+When shipping a coherent version bump or meaningful feature/fix batch on any Andrew project:
+
+## Windows EXE / installer
+
+- After building a frozen EXE or installer, **always run the project publish script** (e.g. `publish-exe-to-drive.ps1`) so artifacts land on **`G:\My Drive\exe\`** with versioned names + SHA256 checksums.
+- Do not leave a build only in `release/` or `dist/` without copying to Drive.
+- Tell Andrew the Drive paths and checksum file when done.
+
+## GitHub
+
+- Push **major / coherent changes** to the project remote (`origin`) on `master` or the active feature branch — source, tests, packaging scripts, version bumps.
+- **Never commit**: secrets (`.env`, `settings.json`, API keys, `api codes.txt`), live journals/logs, `release/` binaries, `dist/`, `build/`.
+- Use clear commit messages focused on *why* (e.g. "Persist ET arm intent through midnight reauth").
+- Push after commit unless Andrew says not to.
+
+## Version discipline
+
+- Match folder/app semver in `Src/version.py` (or project equivalent) to the EXE name on Drive.

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Match desktop dark theme (gui.py UI_ACCENT / theme_colors / splash) -->
+    <color name="bg">#0F1115</color>
+    <color name="panel">#1A1D24</color>
+    <color name="top_bar">#151820</color>
+    <color name="line">#2A2F3A</color>
+    <color name="text">#E8EAED</color>
+    <color name="muted">#9AA0A6</color>
+    <color name="accent">#1F8A70</color>
+    <color name="accent_hover">#26A69A</color>
+    <color name="danger">#FF5252</color>
+    <color name="ok">#00E676</color>
+    <color name="warn">#FFB300</color>
+    <color name="brand_bg">#0D3B2E</color>
+    <color name="ic_launcher_background">#0D3B2E</color>
+</resources>

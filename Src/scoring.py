@@ -149,6 +149,7 @@ MAX_CRYPTO_BOOK_FRAC = 0.30       # max crypto share on multi-asset brokers (RH)
 RTH_EQUITY_RANK_BOOST = 12.0
 RTH_CRYPTO_RANK_PENALTY = 10.0
 SMALL_BOOK_EQUITY = 500.0         # below this, crypto soft penalties start earlier
+SMALL_BOOK_CRYPTO_MIN_DOLLARS = 8.0  # aim ≥ this on small books — ~2% RT fees need room
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
 MAX_SINGLE_NAME_EQUITY_FRAC = 0.15  # soft cap: one name ≤ ~15% of equity
 # Fill-quality feedback (conservative; throttled)
@@ -316,23 +317,55 @@ def crypto_turbulence_ok():
     return True, ""
 
 
-def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False):
+# Spot crypto + BTC-beta equities/ETFs that should gate on Bitcoin trend, not SPY.
+# (IBIT/MSTR etc. — equity session, but beta follows BTC.)
+BTC_PROXY_EQUITIES = frozenset(
+    {
+        "IBIT", "FBTC", "BITO", "GBTC", "MSTR", "ETHE",
+        "ETHA", "ARKB", "HODL", "BTCO", "BITB", "BRRR",
+    }
+)
+
+
+def _normalize_regime_ticker(ticker=None):
+    return str(ticker or "").replace("-USD", "").upper().strip()
+
+
+def uses_btc_regime(ticker=None, is_crypto=False):
+    """
+    True when broad-market regime should vote Bitcoin (not SPY).
+    Spot crypto always; BTC-proxy equities/ETFs (IBIT, MSTR, …) too.
+    """
+    if is_crypto:
+        return True
+    clean = _normalize_regime_ticker(ticker)
+    if not clean:
+        return False
+    if clean in CRYPTO_TICKERS:
+        return True
+    return clean in BTC_PROXY_EQUITIES
+
+
+def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False, ticker=None):
     """
     Hard gate for NEW entries (scan + execute). Matches evaluate_* posture rules:
-      - Equities: always require SPY regime unless allow_when_blocked
+      - Equities: SPY regime unless ticker is a BTC-proxy (IBIT/MSTR/…) → BTC
       - Crypto: BTC turbulence pause (all postures); BTC regime when
         posture.require_crypto_regime (Safer + Balanced)
     Returns (ok: bool, reason: str). Override setting defaults OFF for live.
     """
     if allow_when_blocked:
         return True, "override:allow_buys_when_regime_blocked"
-    if is_crypto:
+    clean = _normalize_regime_ticker(ticker)
+    spot_crypto = bool(is_crypto) or (clean in CRYPTO_TICKERS)
+    use_btc = uses_btc_regime(clean or ticker, is_crypto=spot_crypto)
+    if spot_crypto:
         tok, tw = crypto_turbulence_ok()
         if not tok:
             return False, tw
         if not crypto_regime_required(posture):
             return True, ""
-    return market_regime_ok(is_crypto=bool(is_crypto))
+    return market_regime_ok(is_crypto=bool(use_btc))
 
 
 def trade_lock_seconds(is_crypto=False):
@@ -2821,6 +2854,38 @@ def broker_min_notional(broker_id, *, is_crypto: bool = False) -> float:
     return 5.0
 
 
+def effective_min_dollars(broker_id, equity, is_crypto, settings_min=5.0):
+    """
+    Settings/broker floor for sizing and skip gates.
+
+    On small books (<$500), crypto tickets aim higher than the RH/CB $5 hard
+    minimum so round-trip friction (~2%) does not dominate P&L.
+    """
+    min_d = max(
+        float(settings_min or 5.0),
+        broker_min_notional(broker_id, is_crypto=bool(is_crypto)),
+    )
+    try:
+        pv = float(equity or 0.0)
+    except (TypeError, ValueError):
+        pv = 0.0
+    if is_crypto and pv > 0 and pv < SMALL_BOOK_EQUITY:
+        min_d = max(min_d, float(SMALL_BOOK_CRYPTO_MIN_DOLLARS))
+    return min_d
+
+
+def resolve_journal_fee_key(fee_profile, broker_id=None, ticker=None, asset_type=""):
+    """
+    Map legacy journal fee_profile values (e.g. bare 'ROBINHOOD') to canonical
+    FEE_PROFILES keys (ROBINHOOD_CRYPTO vs ROBINHOOD_STOCK).
+    """
+    raw = str(fee_profile or "").strip().upper()
+    if raw in _FEE_ONE_WAY_PCT:
+        return raw
+    bid = broker_id or fee_profile or "ROBINHOOD"
+    return fee_profile_key(bid, ticker, asset_type)
+
+
 def pick_rotation_funding(
     candidate_ticker,
     candidate_score,
@@ -2861,7 +2926,8 @@ def pick_rotation_funding(
 
     if params.get("freeze_on_regime_fail") and not skip_regime_check:
         try:
-            regime_ok, regime_why = market_regime_ok(is_crypto=bool(candidate_is_crypto))
+            use_btc = uses_btc_regime(candidate_ticker, bool(candidate_is_crypto))
+            regime_ok, regime_why = market_regime_ok(is_crypto=bool(use_btc))
         except Exception:
             regime_ok, regime_why = False, "regime check failed"
         if not regime_ok:
@@ -3194,7 +3260,7 @@ def evaluate_opportunity(ticker, is_penny_stock=False, broker_id="ROBINHOOD", li
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "DO NOT BUY (Awaiting Price)"
 
-    ok, reason = market_regime_ok(is_crypto=False)
+    ok, reason = market_regime_ok(is_crypto=uses_btc_regime(ticker, False))
     if not ok: return reason
 
     allowed, reason = _check_hysteresis(ticker, current_price, is_crypto=False, broker_id=broker_id)

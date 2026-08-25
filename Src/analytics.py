@@ -9,6 +9,7 @@ try:
         estimate_fee_dollars,
         estimate_round_trip_fee_pct,
         fee_profile_key,
+        resolve_journal_fee_key,
         normalize_risk_posture,
         get_risk_posture_profile,
     )
@@ -16,6 +17,7 @@ except ImportError:
     estimate_fee_dollars = None  # type: ignore
     estimate_round_trip_fee_pct = None  # type: ignore
     fee_profile_key = None  # type: ignore
+    resolve_journal_fee_key = None  # type: ignore
     normalize_risk_posture = lambda x: "balanced"  # noqa: E731
     get_risk_posture_profile = lambda x=None: {}  # noqa: E731
 
@@ -133,6 +135,12 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
         reason = str(row.get("reason") or "")
         asset_type = str(row.get("asset_type") or "")
         fee_key = row.get("fee_profile") or ""
+        resolved_fee_key = fee_key
+        if resolve_journal_fee_key is not None:
+            try:
+                resolved_fee_key = resolve_journal_fee_key(fee_key, b, ticker, asset_type)
+            except Exception:
+                resolved_fee_key = fee_key
         row_ts = _parse_ts(row)
         # Prefer broker invoice fields; else stored fee_est; else profile estimate
         broker_fe = _row_broker_fee_dollars(row)
@@ -144,7 +152,7 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
             fe = float(broker_fe)
         elif fe is None and estimate_fee_dollars is not None:
             fe = estimate_fee_dollars(
-                notion, fee_key or b, ticker, asset_type, round_trip=False
+                notion, resolved_fee_key or b, ticker, asset_type, round_trip=False
             )
         fe = float(fe or 0.0)
 
@@ -1043,9 +1051,17 @@ def _estimate_rt_fee(row: dict, notional: float) -> float:
         return float(fe) * 2.0 if fe > 0 else notional * DEFAULT_BAR_FEE_BPS / 10000.0
     if estimate_fee_dollars is not None:
         try:
+            fk = row.get("fee_profile") or row.get("broker") or ""
+            if resolve_journal_fee_key is not None:
+                fk = resolve_journal_fee_key(
+                    fk,
+                    row.get("broker") or "",
+                    row.get("ticker"),
+                    row.get("asset_type") or "",
+                )
             return float(estimate_fee_dollars(
                 notional,
-                row.get("fee_profile") or row.get("broker") or "",
+                fk,
                 row.get("ticker"),
                 row.get("asset_type") or "",
                 round_trip=True,

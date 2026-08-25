@@ -22,8 +22,14 @@ env/
 # Packaging / freeze outputs
 build/
 dist/
+release/
 *.spec
 Src/_pyinstaller_entry.py
+pyinstaller-build.log
+
+# Secrets (extra)
+api codes.txt
+*.lnk
 
 # OS / editor
 .DS_Store

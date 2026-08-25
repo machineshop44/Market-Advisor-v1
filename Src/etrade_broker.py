@@ -357,22 +357,38 @@ class ETradeAdapter(BaseBroker):
         self.accounts = []
 
     def ensure_session(self):
-        """Renew if idle-inactive; return (ok, message)."""
+        """
+        Keep the OAuth session alive.
+
+        Same calendar day: ``renew_access_token`` reactivates idle tokens (~2h).
+        After midnight ET the access token is dead — renew cannot extend it;
+        full browser OAuth + verifier is required.
+        """
         if not self.client or not self.client.access_token:
             return False, "Not connected"
-        if self.token_expires_at and time.time() > float(self.token_expires_at):
-            self.is_connected = False
-            return False, "Access token expired at midnight ET — reauthorize"
+        env = self.environment
+
+        def _renew_and_probe():
+            self.client.renew_access_token()
+            store_etrade_secret("access_token", env, self.client.access_token)
+            store_etrade_secret("access_token_secret", env, self.client.access_token_secret)
+            self.token_expires_at = midnight_et_epoch()
+            self.client.get_balance(self.account_id_key)
+            return True, "renewed"
+
+        expired = bool(self.token_expires_at and time.time() > float(self.token_expires_at))
+        if expired:
+            try:
+                return _renew_and_probe()
+            except Exception:
+                self.is_connected = False
+                return False, "Access token expired at midnight ET — reauthorize"
         try:
             self.client.get_balance(self.account_id_key)
             return True, "ok"
         except ETradeAPIError:
             try:
-                self.client.renew_access_token()
-                store_etrade_secret("access_token", self.environment, self.client.access_token)
-                store_etrade_secret("access_token_secret", self.environment, self.client.access_token_secret)
-                self.client.get_balance(self.account_id_key)
-                return True, "renewed"
+                return _renew_and_probe()
             except Exception as e:
                 self.is_connected = False
                 return False, f"Reauthorization required ({e})"
@@ -384,6 +400,9 @@ class ETradeAdapter(BaseBroker):
     def get_account_balances(self):
         if not self.is_connected or not self.client or not self.account_id_key:
             return 0.0, 0.0
+        ok, msg = self.ensure_session()
+        if not ok:
+            raise ETradeAPIError(msg or "E*TRADE session expired")
         try:
             data = self.client.get_balance(self.account_id_key)
             return parse_etrade_balances(data)

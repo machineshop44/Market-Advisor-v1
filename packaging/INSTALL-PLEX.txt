@@ -1,0 +1,39 @@
+Market Advisor — install / Plex migrate notes
+=============================================
+
+Preferred for Plex PC (no portable zip / no secrets in the Drop):
+
+1) START MENU INSTALLER (ytarr / Arrs Hub style)
+   MarketAdvisor-<ver>-x64.exe on Google Drive\exe
+   - Run the installer on the Plex PC
+   - Per-user install → %LOCALAPPDATA%\Programs\MarketAdvisor
+   - Start Menu shortcut (+ optional Desktop)
+   - Ships settings.example.json (blank) by default
+   - Copy your existing settings.json into Src\ after install
+     (or re-connect brokers in Settings)
+   - Windows SmartScreen may warn (unsigned — same as ytarr / Arrs Hub)
+
+Optional desk-migrate artifact (only when explicitly built with secrets):
+
+2) PORTABLE ZIP
+   MarketAdvisor-<ver>-portable.zip
+   - Unzip anywhere; keep MarketAdvisor.exe, _internal\, Src\ together
+   - When built with -IncludeSettings: live settings.json, journals, TLS,
+     scoring_state, Restore-Tokens\, Restore-Sessions.ps1, PLEX-README.txt
+   - Run Restore-Sessions.ps1 once on the new PC, then MarketAdvisor.exe
+
+Publish flags:
+  powershell -ExecutionPolicy Bypass -File .\publish-exe-to-drive.ps1 -InstallerOnly
+    → builds Inno x64.exe only and drops it on Drive\exe (Plex path)
+
+Lightweight alternative (no Inno):
+  powershell -ExecutionPolicy Bypass -File .\MarketAdvisor-Setup.ps1
+  Extracts a portable zip to %LOCALAPPDATA%\MarketAdvisor and creates
+  Start Menu + Desktop shortcuts.
+
+Checksums:
+  MarketAdvisor-<ver>-SHA256.txt next to the artifacts on Drive.
+
+What still raises Packaging toward A:
+  Authenticode code signing cert, auto-update, store listing.
+  Unsigned Start Menu install + versioned Drive artifacts ≈ A− practical.

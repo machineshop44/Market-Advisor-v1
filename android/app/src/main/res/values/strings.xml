@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Market Advisor</string>
+    <string name="app_name_short">MA Companion</string>
+    <string name="open_monitor">Refresh Monitor</string>
+    <string name="settings">Settings</string>
+    <string name="base_url">Monitor URL</string>
+    <string name="username">User</string>
+    <string name="password">Password</string>
+    <string name="save">Save</string>
+    <string name="halt_all">HALT ALL</string>
+    <string name="confirm_halt">Panic Halt All — disarm every broker and clear queues?</string>
+    <string name="arm">Arm</string>
+    <string name="disarm">Disarm</string>
+    <string name="refresh">Refresh</string>
+    <string name="auto_trader_section">Auto-Trader</string>
+    <string name="confirm_arm">Arm auto-trader for %1$s?</string>
+    <string name="confirm_disarm">Disarm auto-trader for %1$s?</string>
+    <string name="controls_hint">Each broker arms independently. Requires Companion Controls + User/Pass on the PC. Use https:// and paste the TLS fingerprint (or scan setup QR).</string>
+    <string name="controls_hint_offline">Monitor offline — switches disabled. Pull to refresh or check PC / network.</string>
+    <string name="controls_hint_readonly">Companion Controls are off on the PC (read-only). Enable them in Settings → Companion…</string>
+    <string name="tls_fingerprint">TLS fingerprint (from PC Settings)</string>
+    <string name="scan_setup_qr">Scan setup QR</string>
+    <string name="setup_needed_title">Connect to your PC</string>
+    <string name="setup_needed_body">Scan the setup QR from Market Advisor Settings → Companion… (or paste URL and TLS fingerprint).</string>
+    <string name="monitor_section">Live Monitor</string>
+    <string name="combined_equity">Combined Equity</string>
+    <string name="combined_cash">Combined Cash</string>
+    <string name="combined_pnl">Day P&amp;L</string>
+    <string name="stops_health">Protective Stops</string>
+    <string name="cluster_heat">Cluster Heat</string>
+    <string name="open_risk">Open Risk</string>
+    <string name="shadow_guard">Shadow Guard</string>
+    <string name="version_label">Companion v%1$s</string>
+    <string name="compat_note">Desktop 1.29.1+</string>
+    <string name="share_apk">Share APK</string>
+    <string name="share_apk_hint">Share this install via Nearby Share / Files / Drive so another phone can install the update.</string>
+    <string name="stale_suffix"> · stale</string>
+    <string name="tls_pin_mismatch">TLS certificate does not match the saved fingerprint</string>
+    <string name="tls_pin_required">Paste TLS fingerprint from PC Settings first</string>
+</resources>

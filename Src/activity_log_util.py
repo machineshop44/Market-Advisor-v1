@@ -1,19 +1,30 @@
 """
-Bounded activity-log helpers (disk rotate / tail).
+Bounded activity-log helpers (disk rotate / tail / archive).
 
 Kept out of gui.py so ops regressions can lock the cap without importing Qt.
+
+Active file stays bounded for UI/perf; older lines are archived indefinitely
+(never deleted by rotate). Clear Log still wipes the active file only.
 """
 from __future__ import annotations
 
 import os
 from collections import deque
+from datetime import datetime
 
-# Defaults match historical gui.py constants
+# UI buffer — Journal → Activity view
 ACTIVITY_LOG_UI_MAX_LINES = 2000
-ACTIVITY_LOG_DISK_MAX_BYTES = 5 * 1024 * 1024  # ~5 MB
-ACTIVITY_LOG_DISK_MAX_LINES = 50_000
-ACTIVITY_LOG_DISK_KEEP_LINES = 5000
+# Active on-disk file (current session working set)
+ACTIVITY_LOG_DISK_MAX_BYTES = 20 * 1024 * 1024  # ~20 MB before rotate
+ACTIVITY_LOG_DISK_MAX_LINES = 200_000
+ACTIVITY_LOG_DISK_KEEP_LINES = 80_000  # ~days of dense AUTO cycles
 ACTIVITY_LOG_DISK_TAIL_LINES = 5000
+
+
+def activity_log_archive_dir(path):
+    """Sibling folder next to the active log file."""
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    return os.path.join(parent, "activity_log_archives")
 
 
 def tail_activity_log_file(path, max_lines=ACTIVITY_LOG_DISK_TAIL_LINES):
@@ -36,6 +47,29 @@ def tail_activity_log_file(path, max_lines=ACTIVITY_LOG_DISK_TAIL_LINES):
         return ""
 
 
+def _archive_head_lines(path, head_lines):
+    """
+    Persist lines that are about to fall off the active file.
+    Returns archive path or None. Never deletes prior archives.
+    """
+    if not head_lines:
+        return None
+    try:
+        arch_dir = activity_log_archive_dir(path)
+        os.makedirs(arch_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = os.path.splitext(os.path.basename(path))[0] or "activity_log"
+        dest = os.path.join(arch_dir, f"{base}-{stamp}.txt")
+        # Avoid clobber if two rotates in the same second
+        if os.path.exists(dest):
+            dest = os.path.join(arch_dir, f"{base}-{stamp}-{os.getpid()}.txt")
+        with open(dest, "w", encoding="utf-8") as f:
+            f.writelines(head_lines)
+        return dest
+    except Exception:
+        return None
+
+
 def rotate_activity_log_if_needed(
     path,
     *,
@@ -43,9 +77,11 @@ def rotate_activity_log_if_needed(
     max_bytes=ACTIVITY_LOG_DISK_MAX_BYTES,
     max_lines=ACTIVITY_LOG_DISK_MAX_LINES,
     keep_lines=ACTIVITY_LOG_DISK_KEEP_LINES,
+    archive=True,
 ):
     """
     Rewrite path keeping only the last keep_lines when over size/line limits.
+    Older lines are written to activity_log_archives/ (indefinite retention).
     Returns True if a rewrite happened.
     """
     try:
@@ -55,15 +91,23 @@ def rotate_activity_log_if_needed(
         if not force and size < max_bytes and size < max_lines * 40:
             return False
         keep = deque(maxlen=keep_lines)
+        head = []
         total = 0
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                keep.append(line if line.endswith("\n") else line + "\n")
+                normalized = line if line.endswith("\n") else line + "\n"
                 total += 1
+                if len(keep) == keep.maxlen:
+                    # Line about to drop from the ring — archive candidate
+                    dropped = keep[0]
+                    head.append(dropped)
+                keep.append(normalized)
         if not force and total <= max_lines and size < max_bytes:
             return False
         if total <= keep_lines:
             return False
+        if archive and head:
+            _archive_head_lines(path, head)
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(keep)
         return True
