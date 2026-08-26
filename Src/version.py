@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.37.0"
+__version__ = "1.37.1"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Desk Advisor ask-before-apply, execution quality, ET overnight scorecard, "
-    "per-broker posture, capital planner, companion duty officer"
+    "Honesty patch: per-broker posture actually drives size/DD/exits, "
+    "Advisor claim-then-fill, overnight gaps, halt vs disarmed"
 )
 
 

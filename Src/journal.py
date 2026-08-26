@@ -6,6 +6,27 @@ from datetime import datetime
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_journal.jsonl")
 
 
+def _read_jsonl_tail_lines(path, limit):
+    """Last N non-empty lines without loading the whole file (recent-only reads)."""
+    limit = max(int(limit or 1), 1)
+    if not os.path.exists(path):
+        return []
+    try:
+        size = os.path.getsize(path)
+        if size <= 0:
+            return []
+        take = min(size, max(16384, limit * 640))
+        with open(path, "rb") as f:
+            f.seek(max(0, size - take))
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+        if size > take and lines:
+            lines = lines[1:]
+        return lines[-limit:]
+    except Exception:
+        return []
+
+
 def log_trade(entry):
     """
     Append one trade event.
@@ -24,20 +45,13 @@ def log_trade(entry):
 
 def read_recent(limit=20):
     """Return the most recent trade events (newest last)."""
-    if not os.path.exists(JOURNAL_FILE):
-        return []
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        rows = []
-        for ln in lines[-max(limit, 1):]:
-            try:
-                rows.append(json.loads(ln))
-            except Exception:
-                continue
-        return rows
-    except Exception:
-        return []
+    rows = []
+    for ln in _read_jsonl_tail_lines(JOURNAL_FILE, limit):
+        try:
+            rows.append(json.loads(ln))
+        except Exception:
+            continue
+    return rows
 
 
 def read_since_days(days=7, limit=5000):
@@ -142,20 +156,13 @@ def log_decision(entry):
 
 
 def read_recent_decisions(limit=50):
-    if not os.path.exists(DECISION_FILE):
-        return []
-    try:
-        with open(DECISION_FILE, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        rows = []
-        for ln in lines[-max(limit, 1):]:
-            try:
-                rows.append(json.loads(ln))
-            except Exception:
-                continue
-        return rows
-    except Exception:
-        return []
+    rows = []
+    for ln in _read_jsonl_tail_lines(DECISION_FILE, limit):
+        try:
+            rows.append(json.loads(ln))
+        except Exception:
+            continue
+    return rows
 
 
 def read_decisions_since_days(days=7, limit=8000):

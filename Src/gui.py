@@ -1354,6 +1354,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._last_balance_totals = _blank_broker_map(lambda: {'p_val': 0.0, 'bp': 0.0})
         
         self.auto_trade_enabled = _blank_broker_map(False)
+        self._panic_halted = False
         self.task_queue = []
         self.is_processing_queue = False
         self._cycle_broker = None  # Broker locked for the in-flight auto-trade cycle
@@ -3502,25 +3503,22 @@ class MarketAdvisorGUI(QMainWindow):
             # Profit/loss limits only on trusted balance reads (never on a glitch $0)
             if self.auto_trade_enabled.get(broker_name) and trusted.get(broker_name):
                 try:
-                    from scoring import update_equity_drawdown, get_risk_posture_profile
+                    from scoring import update_equity_drawdown, posture_for_broker, posture_knobs_for_broker
                     bid = {
                         "Robinhood": "ROBINHOOD",
                         "Coinbase": "COINBASE",
                         "E*TRADE": "ETRADE",
                     }.get(broker_name, broker_name)
+                    posture_b = posture_for_broker(broker_name, self.settings)
+                    knobs_b = posture_knobs_for_broker(broker_name, self.settings)
                     triggered, dd_msg = update_equity_drawdown(
                         bid,
                         p_val,
-                        posture=self.settings.get("risk_posture", "balanced"),
+                        posture=posture_b,
                         settings=self.settings,
                     )
                     if triggered and dd_msg:
-                        mins = int(
-                            self.settings.get("dd_pause_minutes")
-                            or get_risk_posture_profile(
-                                self.settings.get("risk_posture")
-                            ).get("dd_pause_minutes", 45)
-                        )
+                        mins = int(knobs_b.get("dd_pause_minutes") or 45)
                         self.log_event(
                             f"[DD] [{broker_name}] {dd_msg} — "
                             f"pausing new buys ({mins}m); auto-trader stays armed"
@@ -4263,7 +4261,8 @@ class MarketAdvisorGUI(QMainWindow):
                     "last": getattr(self, "_last_frac_policy", None) or {},
                 },
                 "etrade": self._etrade_monitor_snapshot(),
-                "halted": not any(self.auto_trade_enabled.values()),
+                "halted": bool(getattr(self, "_panic_halted", False)),
+                "armed_any": any(self.auto_trade_enabled.values()),
                 "desk_radar": self._monitor_desk_radar_payload(),
                 "signal_alert": self._monitor_signal_alert_payload(),
                 "advisor": self._monitor_advisor_payload(),
@@ -8989,6 +8988,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.auto_trade_enabled[name] = False
         self._set_etrade_arm_intent(False)
         self.log_event("[HALT] Panic Halt All — all brokers disarmed, queues cleared.")
+        self._panic_halted = True
         self._update_autotrade_ui()
         self.publish_monitor_status()
         detail = ", ".join(halted) if halted else "none were armed"
@@ -9074,11 +9074,12 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _advisor_apply_proposal(self, proposal_id):
         import advisor_queue as aq
-        prop = aq.approve(proposal_id)
+        prop = aq.claim(proposal_id)
         if not prop:
             return {"ok": False, "error": "Proposal not found or already resolved"}
         broker = str(prop.get("broker") or "")
         if broker not in BROKER_NAMES:
+            aq.complete(proposal_id, False)
             return {"ok": False, "error": f"Unknown broker: {broker}"}
         self.active_broker_name = broker
         self._cycle_broker = broker
@@ -9088,23 +9089,47 @@ class MarketAdvisorGUI(QMainWindow):
             "price": float(prop.get("price") or 0),
             "score": float(prop.get("score") or 0),
             "_advisor_approved": True,
+            "_advisor_proposal_id": proposal_id,
             "engine": prop.get("engine") or "",
         }
         self.set_working_state(True, f"Advisor BUY {prop.get('ticker')}…")
-        self.run_thread(
-            self._bg_buy_batch,
-            lambda payload: self._on_advisor_buy_done(payload, proposal_id),
-            [candidate],
-            False,
-            advisor_gate=False,
-        )
+        try:
+            self.run_thread(
+                self._bg_buy_batch,
+                lambda payload: self._on_advisor_buy_done(payload, proposal_id),
+                [candidate],
+                False,
+                advisor_gate=False,
+            )
+        except Exception as e:
+            aq.complete(proposal_id, False)
+            return {"ok": False, "error": str(e)}
         self._refresh_advisor_card()
         self.publish_monitor_status()
         self.log_event(
             f"[Advisor] Approved BUY {prop.get('ticker')} on {broker} "
-            f"~${float(prop.get('dollars') or 0):.2f}"
+            f"~${float(prop.get('dollars') or 0):.2f} (executing)"
         )
-        return {"ok": True, "id": proposal_id, "ticker": prop.get("ticker"), "broker": broker}
+        return {
+            "ok": True,
+            "id": proposal_id,
+            "ticker": prop.get("ticker"),
+            "broker": broker,
+            "queued": True,
+        }
+
+    def _on_advisor_buy_done(self, payload, proposal_id):
+        import advisor_queue as aq
+        payload = payload or {}
+        buys_done = int(payload.get("buys_done") or 0)
+        aq.complete(proposal_id, ok=buys_done > 0)
+        if buys_done <= 0:
+            notes = payload.get("notes") or []
+            why = notes[0] if notes else "buy did not fill — proposal restored to pending"
+            self.log_event(f"[Advisor] Execute missed: {why}")
+        self._on_buy_batch_done(payload, auto_mode=False, table=None)
+        self._refresh_advisor_card()
+        self.publish_monitor_status()
 
     def _advisor_reject_proposal(self, proposal_id):
         import advisor_queue as aq
@@ -9132,10 +9157,6 @@ class MarketAdvisorGUI(QMainWindow):
         self._refresh_advisor_card()
         self.publish_monitor_status()
         self.log_event(f"[Advisor] Rejected all pending ({n})")
-
-    def _on_advisor_buy_done(self, payload, proposal_id):
-        self._on_buy_batch_done(payload, auto_mode=False, table=None)
-        self._refresh_advisor_card()
 
     def _refresh_advisor_card(self):
         if not hasattr(self, "home_advisor_lbl"):
@@ -9800,9 +9821,11 @@ class MarketAdvisorGUI(QMainWindow):
             clusters = cluster_heat_snapshot(all_tickers)
             if hasattr(self, "home_cluster_host"):
                 self._render_cluster_heat(clusters)
-            # Publish for companion / monitor
+            # Publish for companion / monitor — include Home chip's gap-adjusted missing count
             self._last_cluster_heat = clusters
-            self._last_protective_health = health
+            health_pub = dict(health) if isinstance(health, dict) else {}
+            health_pub["missing_count"] = int(miss_n)
+            self._last_protective_health = health_pub
             if hasattr(self, "home_overnight_chip"):
                 et_count = 0
                 for h in holdings_by.get("E*TRADE") or []:
@@ -9820,7 +9843,7 @@ class MarketAdvisorGUI(QMainWindow):
                 except Exception:
                     session_label = ""
                 oc = _auto_cycle.overnight_scorecard(
-                    protective_health=health,
+                    protective_health=health_pub,
                     reauth_needed=getattr(self, "_broker_manual_auth_needed", {}),
                     session_label=session_label,
                     et_equity_count=et_count,
@@ -10304,6 +10327,7 @@ class MarketAdvisorGUI(QMainWindow):
                 continue
             self._seed_session_start_for_arm(broker_name)
             self.auto_trade_enabled[broker_name] = True
+            self._panic_halted = False
             # Force an immediate first pulse for this broker (don't wait a full interval)
             self.last_crypto_time[broker_name] = 0
             self.last_port_time[broker_name] = 0
@@ -11077,13 +11101,17 @@ class MarketAdvisorGUI(QMainWindow):
 
         Returns trade dollars, or (trade, detail_dict) when return_detail=True.
         """
-        from scoring import risk_sizing_breakdown, get_stop_distance_pct, get_execution_feedback, effective_min_dollars
+        from scoring import (
+            risk_sizing_breakdown, get_stop_distance_pct, get_execution_feedback,
+            effective_min_dollars, posture_knobs_for_broker,
+        )
         is_crypto = "crypto" in str(asset_type).lower()
         if is_crypto:
             alloc_pct = self.settings.get("allocation_pct_crypto", self.settings.get("allocation_pct", 8.0)) / 100.0
         else:
             alloc_pct = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0)) / 100.0
         broker_id = getattr(self.cycle_broker, "broker_id", None) or self.cycle_broker_name.upper()
+        knobs = posture_knobs_for_broker(self.cycle_broker_name, self.settings)
         eq = float(equity) if equity is not None else None
         if eq is None:
             try:
@@ -11104,7 +11132,7 @@ class MarketAdvisorGUI(QMainWindow):
         )
         max_open = max_open_positions
         if max_open is None:
-            max_open = int(self.settings.get("max_open_positions", 8))
+            max_open = int(knobs.get("max_open_positions", 8))
         open_n = open_count
         if open_n is None:
             try:
@@ -11117,27 +11145,27 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 open_n = 0
         try:
-            util = float(self.settings.get("target_bp_utilization_pct", 88.0))
+            util = float(knobs.get("target_bp_utilization_pct", 88.0))
         except (TypeError, ValueError):
             util = 88.0
         try:
-            focus = int(self.settings.get("sizing_focus_slots", 6))
+            focus = int(knobs.get("sizing_focus_slots", 6))
         except (TypeError, ValueError):
             focus = 6
         try:
-            name_cap = float(self.settings.get("max_single_name_equity_pct", 15.0))
+            name_cap = float(knobs.get("max_single_name_equity_pct", 15.0))
         except (TypeError, ValueError):
             name_cap = 15.0
         try:
-            conv_max = float(self.settings.get("conviction_alloc_mult_max", 1.50))
+            conv_max = float(knobs.get("conviction_alloc_mult_max", 1.50))
         except (TypeError, ValueError):
             conv_max = 1.50
         try:
-            risk_pct = float(self.settings.get("risk_pct_per_trade", 0.75))
+            risk_pct = float(knobs.get("risk_pct_per_trade", 0.75))
         except (TypeError, ValueError):
             risk_pct = 0.75
         try:
-            max_book_risk = float(self.settings.get("max_open_risk_pct", 6.0))
+            max_book_risk = float(knobs.get("max_open_risk_pct", 6.0))
         except (TypeError, ValueError):
             max_book_risk = 6.0
         open_risk = 0.0
@@ -11201,7 +11229,9 @@ class MarketAdvisorGUI(QMainWindow):
                     ticker=ticker,
                     reason=reason,
                     score=score,
-                    posture=self.settings.get("risk_posture", "balanced"),
+                    posture=__import__("scoring", fromlist=["posture_for_broker"]).posture_for_broker(
+                        broker_name, self.settings
+                    ),
                     engine=getattr(self, "_cycle_task", None),
                     is_crypto=is_crypto,
                 )
@@ -11241,7 +11271,9 @@ class MarketAdvisorGUI(QMainWindow):
                 broker=broker_name,
                 reason=reason,
                 engine=engine or getattr(self, "_cycle_task", None),
-                posture=self.settings.get("risk_posture", "balanced"),
+                posture=__import__("scoring", fromlist=["posture_for_broker"]).posture_for_broker(
+                    broker_name, self.settings
+                ),
                 bp=bp,
             )
         except Exception:
@@ -11453,7 +11485,8 @@ class MarketAdvisorGUI(QMainWindow):
         et = self.brokers.get("E*TRADE")
         et_armed = bool(self.auto_trade_enabled.get("E*TRADE"))
         et_live = bool(et and (self.paper_mode or getattr(et, "is_connected", False)))
-        if not (et_armed and et_live):
+        if not et_live:
+            self.log_event("[EOD] E*TRADE not connected — overnight warn skipped.")
             return
 
         holdings = []
@@ -11523,9 +11556,16 @@ class MarketAdvisorGUI(QMainWindow):
             pass
 
         if not bool(self.settings.get("et_flatten_before_close", False)):
+            extra = "" if et_armed else " (ET auto-trader is disarmed — TTP idle if app is off.)"
             self.log_event(
                 "[EOD] Flatten OFF — holding ET overnight. Enable "
                 "'Flatten E*TRADE equities before close' in Settings if you want auto flat."
+                + extra
+            )
+            return
+        if not et_armed:
+            self.log_event(
+                "[EOD] Flatten ON but E*TRADE is disarmed — warning only, not selling."
             )
             return
 
@@ -11716,8 +11756,9 @@ class MarketAdvisorGUI(QMainWindow):
         """Append autotrader decision for later Reports / replay."""
         try:
             import journal as journal_mod
+            from scoring import posture_for_broker
             row = dict(kwargs)
-            row.setdefault("posture", self.settings.get("risk_posture", "balanced"))
+            row.setdefault("posture", posture_for_broker(self.cycle_broker_name, self.settings))
             if not row.get("engine"):
                 task = getattr(self, "_cycle_task", None)
                 if task:
@@ -11937,9 +11978,10 @@ class MarketAdvisorGUI(QMainWindow):
             concentration_blocks_buy, buy_rank_score_for_book, buy_rank_score,
             evaluate_scale_in, record_scale_in, get_scale_in_params,
             opportunity_swap_enabled, pick_rotation_funding, mark_opportunity_swap_exit,
-            get_risk_posture_profile, last_rotation_reject_reason, record_rotation,
+            last_rotation_reject_reason, record_rotation,
             entry_regime_ok, broker_min_notional, RH_CRYPTO_MIN_NOTIONAL,
-            crypto_new_entry_ok, posture_for_broker,
+            crypto_new_entry_ok, posture_for_broker, posture_knobs_for_broker,
+            broker_has_posture_override, _drawdown_block,
         )
         broker_name = self.cycle_broker_name
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
@@ -11948,14 +11990,15 @@ class MarketAdvisorGUI(QMainWindow):
         use_ext = session["use_ext"]
         market_hours = session["market_hours"]
         allow_fractional = session["fractional_ok"]
-        max_positions = int(self.settings.get("max_open_positions", 8))
-        max_buys = int(self.settings.get("max_buys_per_cycle", 2))
         posture = posture_for_broker(broker_name, self.settings)
-        si_params = get_scale_in_params(posture=posture, settings=self.settings)
-        _prof = get_risk_posture_profile(posture)
-        exit_roi_scale = float(self.settings.get("exit_roi_scale") or _prof.get("exit_roi_scale") or 1.0)
-        exit_time_scale = float(self.settings.get("exit_time_scale") or _prof.get("exit_time_scale") or 1.0)
-        ttp_arm_scale = float(self.settings.get("ttp_arm_scale") or _prof.get("ttp_arm_scale") or 1.0)
+        knobs = posture_knobs_for_broker(broker_name, self.settings)
+        max_positions = int(knobs.get("max_open_positions", 8) or 8)
+        max_buys = int(knobs.get("max_buys_per_cycle", 1) or 1)
+        si_overlay = None if broker_has_posture_override(broker_name, self.settings) else self.settings
+        si_params = get_scale_in_params(posture=posture, settings=si_overlay)
+        exit_roi_scale = float(knobs.get("exit_roi_scale") or 1.0)
+        exit_time_scale = float(knobs.get("exit_time_scale") or 1.0)
+        ttp_arm_scale = float(knobs.get("ttp_arm_scale") or 1.0)
         notes = []
         ranked = list(candidates or [])
         rotated_once = False
@@ -11975,6 +12018,16 @@ class MarketAdvisorGUI(QMainWindow):
             return {
                 "fills": [],
                 "notes": [f"[{broker_name}] {idle_why} — skipping buy batch"],
+                "buys_done": 0,
+                "broker": broker_name,
+            }
+
+        dd_ok, dd_why = _drawdown_block(broker_id)
+        if not dd_ok:
+            notes.append(f"[{broker_name}] {dd_why} — skipping buy batch")
+            return {
+                "fills": [],
+                "notes": notes,
                 "buys_done": 0,
                 "broker": broker_name,
             }
@@ -12051,7 +12104,7 @@ class MarketAdvisorGUI(QMainWindow):
                             ev = evaluate_scale_in(
                                 ticker, live_px, meta.get("avg_cost") or 0.0,
                                 broker_id=broker_id, asset_type=asset_type, is_crypto=is_crypto,
-                                signal_score=base, posture=posture, settings=self.settings,
+                                signal_score=base, posture=posture, settings=si_overlay,
                                 existing_name_value=meta.get("value") or 0.0,
                                 portfolio_value=equity,
                             )
@@ -12173,6 +12226,12 @@ class MarketAdvisorGUI(QMainWindow):
         ):
             """Sell one eligible holding to fund candidate. Mutates held/bp/open_count. Max 1/cycle."""
             nonlocal bp, open_count, rotated_once, held, holdings_meta, holdings_by_ticker
+            if advisor_gate:
+                notes.append(
+                    f"[{broker_name}] Rotate held until Advisor approve — "
+                    "will not sell a funder for an unapproved BUY"
+                )
+                return False
             if rotated_once or not opportunity_swap_enabled(posture):
                 return False
             try:
@@ -12436,7 +12495,7 @@ class MarketAdvisorGUI(QMainWindow):
                     self._log_decision(
                         broker=broker_name, ticker=ticker, action="SKIP",
                         score=cand_score, reason="max_open",
-                        posture=self.settings.get("risk_posture", "balanced"),
+                        posture=posture,
                         open_count=open_count, max_open=max_positions,
                         is_crypto=is_crypto,
                     )
@@ -12456,7 +12515,7 @@ class MarketAdvisorGUI(QMainWindow):
                     ev = evaluate_scale_in(
                         ticker, price, meta.get("avg_cost") or 0.0,
                         broker_id=broker_id, asset_type=asset_type, is_crypto=is_crypto,
-                        signal_score=sig, posture=posture, settings=self.settings,
+                        signal_score=sig, posture=posture, settings=si_overlay,
                         existing_name_value=existing_val, portfolio_value=equity,
                     )
                     if not ev.get("allowed"):
@@ -12573,7 +12632,7 @@ class MarketAdvisorGUI(QMainWindow):
                         broker=broker_name, ticker=ticker, action="SKIP",
                         score=cand_score,
                         reason=("under_broker_floor" if under_floor else "low_bp"),
-                        posture=self.settings.get("risk_posture", "balanced"),
+                        posture=posture,
                         open_count=open_count, max_open=max_positions,
                         is_crypto=is_crypto, bp=bp, regime_ok=True,
                     )
@@ -12614,7 +12673,7 @@ class MarketAdvisorGUI(QMainWindow):
                     self._log_decision(
                         broker=broker_name, ticker=ticker, action="SKIP",
                         score=cand_score, reason=f"concentration:{reason}",
-                        posture=self.settings.get("risk_posture", "balanced"),
+                        posture=posture,
                         open_count=open_count, max_open=max_positions,
                         is_crypto=is_crypto,
                     )
@@ -12719,7 +12778,7 @@ class MarketAdvisorGUI(QMainWindow):
                     action="BUY" if ok else "BUY_FAIL",
                     score=cand_score,
                     reason=("scale_in" if scale_in else "entry") + (f":{status}" if not ok else ""),
-                    posture=self.settings.get("risk_posture", "balanced"),
+                    posture=posture,
                     dollars=float(spent or row_dollars or 0),
                     open_count=open_count, max_open=max_positions,
                     is_crypto=is_crypto, regime_ok=True,
@@ -13062,18 +13121,15 @@ class MarketAdvisorGUI(QMainWindow):
         from scoring import (
             evaluate_holding,
             flush_state,
-            get_risk_posture_profile,
-            normalize_risk_posture,
+            posture_knobs_for_broker,
         )
-        _exit_prof = get_risk_posture_profile(
-            normalize_risk_posture(self.settings.get("risk_posture", "balanced"))
-        )
-        allow_flat_banks = bool(_exit_prof.get("allow_flat_time_banks", False))
         results = []
         with SuppressPrints():
             for row, ticker, shares, avg_cost, asset_type, *rest in items:
                 broker_name = rest[0] if rest else self.cycle_broker_name
                 broker = self.brokers.get(broker_name, self.cycle_broker)
+                knobs = posture_knobs_for_broker(broker_name, self.settings)
+                allow_flat_banks = bool(knobs.get("allow_flat_time_banks", False))
                 price = broker.get_live_price(ticker) if broker else 0.0
                 if not price or price <= 0:
                     tu = str(ticker or "").upper()
@@ -13114,9 +13170,9 @@ class MarketAdvisorGUI(QMainWindow):
                     broker_id=getattr(broker, "broker_id", None) or broker_name,
                     asset_type=asset_type,
                     live_price=price,
-                    exit_roi_scale=float(self.settings.get("exit_roi_scale", 1.0) or 1.0),
-                    exit_time_scale=float(self.settings.get("exit_time_scale", 1.0) or 1.0),
-                    ttp_arm_scale=float(self.settings.get("ttp_arm_scale", 1.0) or 1.0),
+                    exit_roi_scale=float(knobs.get("exit_roi_scale", 1.0) or 1.0),
+                    exit_time_scale=float(knobs.get("exit_time_scale", 1.0) or 1.0),
+                    ttp_arm_scale=float(knobs.get("ttp_arm_scale", 1.0) or 1.0),
                     allow_flat_time_banks=allow_flat_banks,
                 )
                 results.append((row, price, action, asset_type, None))
@@ -13124,12 +13180,13 @@ class MarketAdvisorGUI(QMainWindow):
         return results
 
     def _bg_score_opportunities(self, items):
-        from scoring import evaluate_crypto_opportunity, evaluate_opportunity
+        from scoring import evaluate_crypto_opportunity, evaluate_opportunity, posture_for_broker
         results = []
         # Price/score in the cycle broker's context (E*TRADE equities use ET, not RH)
         cycle = self.cycle_broker
         cycle_id = getattr(cycle, "broker_id", None) or self.cycle_broker_name
         rh = self.brokers.get("Robinhood")
+        posture = posture_for_broker(self.cycle_broker_name, self.settings)
         with SuppressPrints():
             for entry in items:
                 row, ticker, shares, avg_cost, asset_type = entry[:5]
@@ -13156,7 +13213,7 @@ class MarketAdvisorGUI(QMainWindow):
                         ticker,
                         broker_id=broker_id,
                         live_price=price,
-                        posture=self.settings.get("risk_posture", "balanced"),
+                        posture=posture,
                         is_mover=is_crypto_mover,
                     )
                 else:
@@ -13188,6 +13245,7 @@ class MarketAdvisorGUI(QMainWindow):
     def _bg_scan_and_score(self, scan_func):
         """Discover tickers, score, and pre-rank BUY candidates in one background job."""
         from scoring import buy_rank_score_for_book, buy_rank_score, evaluate_scale_in
+        from scoring import posture_for_broker, broker_has_posture_override
         opps = scan_func() or []
         if not opps:
             return [], [], [], []
@@ -13205,7 +13263,8 @@ class MarketAdvisorGUI(QMainWindow):
 
         broker_name = self.cycle_broker_name
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
-        posture = self.settings.get("risk_posture", "balanced")
+        posture = posture_for_broker(broker_name, self.settings)
+        si_overlay = None if broker_has_posture_override(broker_name, self.settings) else self.settings
         try:
             equity, bp, _locked = self.get_effective_balances(broker_name)
         except Exception:
@@ -13283,7 +13342,7 @@ class MarketAdvisorGUI(QMainWindow):
                         ev = evaluate_scale_in(
                             ticker, live_px, meta.get("avg_cost") or 0.0,
                             broker_id=broker_id, asset_type=atype, is_crypto=is_crypto,
-                            signal_score=base, posture=posture, settings=self.settings,
+                            signal_score=base, posture=posture, settings=si_overlay,
                             existing_name_value=meta.get("value") or 0.0,
                             portfolio_value=equity,
                         )

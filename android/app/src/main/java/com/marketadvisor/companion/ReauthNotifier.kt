@@ -234,12 +234,14 @@ object ReauthNotifier {
         nm.cancel(NOTIFY_DD)
         nm.cancel(NOTIFY_HALT)
         nm.cancel(NOTIFY_SIGNAL)
+        nm.cancel(NOTIFY_ADVISOR)
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_LAST_REAUTH, false)
             .putBoolean(KEY_LAST_DD, false)
             .putBoolean(KEY_LAST_HALT, false)
             .putString(KEY_LAST_SIGNAL_ID, "")
+            .putInt(KEY_LAST_ADVISOR_COUNT, 0)
             .apply()
     }
 }

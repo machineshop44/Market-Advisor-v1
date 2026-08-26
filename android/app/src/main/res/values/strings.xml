@@ -36,7 +36,7 @@
     <string name="recent_trades_section">Recent Trades</string>
     <string name="queue_prefix">Queue:</string>
     <string name="pull_to_refresh">Pull down to refresh</string>
-    <string name="compat_note">Desktop 1.37.0+</string>
+    <string name="compat_note">Desktop 1.37.1+</string>
     <string name="reauth_etrade">Reauth E*TRADE</string>
     <string name="reauth_title">E*TRADE reauthorization</string>
     <string name="reauth_body">Open E*TRADE in the browser, approve access, then paste the verification code here.</string>

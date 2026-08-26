@@ -295,6 +295,38 @@ def get_risk_posture_profile(name=None):
     return dict(RISK_POSTURE_PROFILES[normalize_risk_posture(name)])
 
 
+_BROKER_ID_TO_DISPLAY = {
+    "ROBINHOOD": "Robinhood",
+    "COINBASE": "Coinbase",
+    "ETRADE": "E*TRADE",
+    "E*TRADE": "E*TRADE",
+}
+
+_POSTURE_KNOB_KEYS = (
+    "target_bp_utilization_pct",
+    "sizing_focus_slots",
+    "max_open_positions",
+    "max_buys_per_cycle",
+    "risk_pct_per_trade",
+    "max_open_risk_pct",
+    "max_single_name_equity_pct",
+    "conviction_alloc_mult_max",
+    "exit_roi_scale",
+    "exit_time_scale",
+    "ttp_arm_scale",
+    "allow_flat_time_banks",
+    "allow_scale_in",
+    "day_dd_pause_pct",
+    "peak_dd_pause_pct",
+    "dd_pause_minutes",
+)
+
+
+def _broker_display_name(broker_name_or_id):
+    raw = str(broker_name_or_id or "").strip()
+    return _BROKER_ID_TO_DISPLAY.get(raw.upper().replace("*", ""), raw)
+
+
 def posture_for_broker(broker_name_or_id, settings=None):
     """
     Resolve risk posture for a broker: per-broker map overrides global risk_posture.
@@ -305,15 +337,38 @@ def posture_for_broker(broker_name_or_id, settings=None):
     by_broker = settings.get("risk_posture_by_broker") or {}
     if not isinstance(by_broker, dict):
         by_broker = {}
-    id_to_display = {
-        "ROBINHOOD": "Robinhood",
-        "COINBASE": "Coinbase",
-        "ETRADE": "E*TRADE",
-        "E*TRADE": "E*TRADE",
-    }
-    display = id_to_display.get(raw_name.upper().replace("*", ""), raw_name)
+    display = _broker_display_name(raw_name)
     chosen = by_broker.get(display) or by_broker.get(raw_name) or settings.get("risk_posture", "balanced")
     return normalize_risk_posture(chosen)
+
+
+def broker_has_posture_override(broker_name_or_id, settings=None):
+    """True when Settings has an explicit per-broker posture (not global Mode)."""
+    settings = settings or {}
+    by_broker = settings.get("risk_posture_by_broker") or {}
+    if not isinstance(by_broker, dict):
+        return False
+    raw = str(broker_name_or_id or "").strip()
+    display = _broker_display_name(raw)
+    val = by_broker.get(display) or by_broker.get(raw)
+    return bool(str(val or "").strip())
+
+
+def posture_knobs_for_broker(broker_name_or_id, settings=None):
+    """
+    Knobs that should actually drive this broker: profile if a per-broker override
+    is set, otherwise Advanced/settings overlay on the global posture profile.
+    """
+    settings = settings or {}
+    key = posture_for_broker(broker_name_or_id, settings)
+    prof = get_risk_posture_profile(key)
+    if broker_has_posture_override(broker_name_or_id, settings):
+        return prof
+    out = dict(prof)
+    for k in _POSTURE_KNOB_KEYS:
+        if k in settings and settings[k] is not None:
+            out[k] = settings[k]
+    return out
 
 
 def crypto_regime_required(posture=None):
@@ -898,11 +953,13 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
     if eq <= 0:
         return False, ""
 
-    prof = get_risk_posture_profile(posture)
-    s = settings or {}
-    day_pct = float(s.get("day_dd_pause_pct", prof.get("day_dd_pause_pct", 0.05)) or 0.05)
-    peak_pct = float(s.get("peak_dd_pause_pct", prof.get("peak_dd_pause_pct", 0.12)) or 0.12)
-    pause_min = int(s.get("dd_pause_minutes", prof.get("dd_pause_minutes", 45)) or 45)
+    if settings is not None:
+        knobs = posture_knobs_for_broker(broker_id, settings)
+    else:
+        knobs = get_risk_posture_profile(posture)
+    day_pct = float(knobs.get("day_dd_pause_pct", 0.05) or 0.05)
+    peak_pct = float(knobs.get("peak_dd_pause_pct", 0.12) or 0.12)
+    pause_min = int(knobs.get("dd_pause_minutes", 45) or 45)
     day_pct = max(0.01, min(0.25, day_pct))
     peak_pct = max(0.02, min(0.40, peak_pct))
     pause_min = max(10, min(240, pause_min))
@@ -1325,17 +1382,6 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
     }
     """
     settings = settings or {}
-    posture = posture or settings.get("risk_posture", "balanced")
-    prof = get_risk_posture_profile(posture)
-    try:
-        util_pct = float(
-            settings.get("target_bp_utilization_pct", prof.get("target_bp_utilization_pct", 88.0))
-            or 88.0
-        )
-    except (TypeError, ValueError):
-        util_pct = 88.0
-    util = util_pct / 100.0 if util_pct > 1.0 else util_pct
-    util = max(0.50, min(0.99, util))
     try:
         loss_limit = float(settings.get("daily_loss_limit", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -1373,6 +1419,13 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
         except (TypeError, ValueError):
             eq, bp, pnl = 0.0, 0.0, 0.0
         armed = bool(row.get("armed"))
+        knobs = posture_knobs_for_broker(name or bid, settings)
+        try:
+            util_pct = float(knobs.get("target_bp_utilization_pct", 88.0) or 88.0)
+        except (TypeError, ValueError):
+            util_pct = 88.0
+        util = util_pct / 100.0 if util_pct > 1.0 else util_pct
+        util = max(0.50, min(0.99, util))
         dd = get_drawdown_status(bid, equity=eq)
         dd_paused = bool(dd.get("paused"))
         dd_reason = str(dd.get("pause_reason") or "")

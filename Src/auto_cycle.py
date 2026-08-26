@@ -1178,6 +1178,14 @@ def overnight_scorecard(
     if et_reauth:
         risks.append("E*TRADE reauth needed")
         score -= 20
+    rh_reauth = bool(reauth.get("Robinhood") or reauth.get("ROBINHOOD"))
+    if rh_reauth:
+        risks.append("Robinhood reauth needed")
+        score -= 15
+    cb_reauth = bool(reauth.get("Coinbase") or reauth.get("COINBASE"))
+    if cb_reauth:
+        risks.append("Coinbase reauth needed")
+        score -= 10
     sess = str(session_label or "").upper()
     if sess in ("OVERNIGHT", "CLOSED", "WEEKEND", "HOLIDAY") and not auto_armed:
         risks.append("Auto-trader off — software TTP idle")
@@ -1248,14 +1256,16 @@ def capital_planner_snapshot(
             opportunity_swap_params,
             rotation_allowed_today,
             rotates_today,
+            posture_knobs_for_broker,
         )
+        knobs = posture_knobs_for_broker(broker, settings)
         stop_d = get_stop_distance_pct(broker_id, ticker=ticker, for_sizing=True)
         is_crypto = str(ticker or "").upper() in {
             "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
         }
         alloc_key = "allocation_pct_crypto" if is_crypto else "allocation_pct_stock"
         alloc = float(settings.get(alloc_key, settings.get("allocation_pct", 8.0))) / 100.0
-        util = float(settings.get("target_bp_utilization_pct", 88.0))
+        util = float(knobs.get("target_bp_utilization_pct", 88.0))
         if util > 1.0:
             util = util / 100.0
         detail = risk_sizing_breakdown(
@@ -1266,10 +1276,10 @@ def capital_planner_snapshot(
             min_dollars=float(settings.get("min_trade_dollars", 5.0) or 5.0),
             conviction_score=float(score or 0),
             target_bp_utilization=util,
-            sizing_focus_slots=int(settings.get("sizing_focus_slots", 6) or 6),
-            soft_name_equity_frac=float(settings.get("max_single_name_equity_pct", 15.0) or 15.0) / 100.0,
-            risk_pct_per_trade=float(settings.get("risk_pct_per_trade", 0.75) or 0.75),
-            max_open_risk_pct=float(settings.get("max_open_risk_pct", 6.0) or 6.0),
+            sizing_focus_slots=int(knobs.get("sizing_focus_slots", 6) or 6),
+            soft_name_equity_frac=float(knobs.get("max_single_name_equity_pct", 15.0) or 15.0) / 100.0,
+            risk_pct_per_trade=float(knobs.get("risk_pct_per_trade", 0.75) or 0.75),
+            max_open_risk_pct=float(knobs.get("max_open_risk_pct", 6.0) or 6.0),
         )
         out["deployable"] = float(detail.get("deployable") or 0)
         out["aim"] = float(detail.get("trade") or detail.get("aim") or 0)
