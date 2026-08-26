@@ -315,14 +315,18 @@ def format_money(value):
 
 
 class SparklineWidget(QWidget):
-    """Compact close-series sparkline for the scanner signal card."""
+    """Close-series sparkline for the Signal research tab."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, min_h=36, max_h=48):
         super().__init__(parent)
         self._closes = []
-        self.setMinimumHeight(ui_px(36))
-        self.setMaximumHeight(ui_px(48))
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumHeight(ui_px(min_h))
+        if max_h is None:
+            self.setMaximumHeight(16777215)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        else:
+            self.setMaximumHeight(ui_px(max_h))
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def set_closes(self, closes):
         try:
@@ -1680,9 +1684,12 @@ class MarketAdvisorGUI(QMainWindow):
         self.scanners_tabs.addTab(self.build_crypto_screen(), "Crypto")
         self.scanners_tabs.addTab(self.build_penny_screen(), "Breakouts")
         self.scanners_tabs.addTab(self.build_core_screen(), "Core")
+        self.scanners_tabs.addTab(self.build_signal_screen(), "Signal")
         self.scanners_tab_index = self.tabs.addTab(self.scanners_tabs, "Scanners")
         self.penny_inner_index = 1
         self.core_inner_index = 2
+        self.signal_inner_index = 3
+        self._wire_scanner_signal_sources()
 
         self.build_ipo_screen()
 
@@ -5569,151 +5576,236 @@ class MarketAdvisorGUI(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Portfolio")
 
-    def _build_scanner_signal_card(self, table, *, is_crypto=False):
-        """Research polish: sparkline, factor meters, RS/levels, why-gate, deep links."""
-        card = QGroupBox("Signal card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(ui_px(10), ui_px(8), ui_px(10), ui_px(8))
-        lay.setSpacing(ui_px(6))
+    def build_signal_screen(self):
+        """Dedicated research tab — sparkline/factors without crowding scanner tables."""
+        tab = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(ui_px(16), ui_px(12), ui_px(16), ui_px(12))
+        layout.setSpacing(ui_px(8))
 
-        head = QLabel("Select a row for sparkline · factors · RS · levels.")
-        head.setWordWrap(True)
-        head.setObjectName("settingsHint")
-        head.setStyleSheet(f"color: #555; font-size: {ui_px(11)}px; font-weight: 600;")
-        lay.addWidget(head)
+        header = QLabel("Signal research")
+        header.setObjectName("sectionHeader")
+        header.setStyleSheet(section_header_style())
+        layout.addWidget(header)
 
-        spark = SparklineWidget()
-        lay.addWidget(spark)
-        meters = FactorMeterRow()
-        lay.addWidget(meters)
+        hint = QLabel(
+            "Pick a row on Crypto / Breakouts / Core, or type a ticker below. "
+            "This tab keeps the sparkline roomy so scanner lists stay clean."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("settingsHint")
+        hint.setStyleSheet(f"color: #666; font-size: {ui_px(11)}px;")
+        layout.addWidget(hint)
 
-        why = QLabel("")
-        why.setWordWrap(True)
-        why.setStyleSheet(f"color: #444; font-size: {ui_px(11)}px;")
-        lay.addWidget(why)
+        entry = QHBoxLayout()
+        entry.addWidget(QLabel("Ticker:"))
+        self.signal_ticker_edit = QLineEdit()
+        self.signal_ticker_edit.setPlaceholderText("e.g. SOL or IWM")
+        self.signal_ticker_edit.setMaximumWidth(ui_px(140))
+        entry.addWidget(self.signal_ticker_edit)
+        self.signal_crypto_chk = QCheckBox("Crypto")
+        entry.addWidget(self.signal_crypto_chk)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setProperty("uiBtnKind", "primary")
+        refresh_btn.setStyleSheet(action_btn_style("primary"))
+        refresh_btn.clicked.connect(self._refresh_signal_panel_from_entry)
+        entry.addWidget(refresh_btn)
+        open_scan_btn = QPushButton("Open scanners…")
+        open_scan_btn.clicked.connect(self._focus_scanners_crypto_tab)
+        entry.addWidget(open_scan_btn)
+        entry.addStretch(1)
+        layout.addLayout(entry)
 
-        levels = QLabel("")
-        levels.setWordWrap(True)
-        levels.setStyleSheet(f"color: #666; font-size: {ui_px(10)}px;")
-        lay.addWidget(levels)
+        self.signal_source_lbl = QLabel("Source: —")
+        self.signal_source_lbl.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        layout.addWidget(self.signal_source_lbl)
+
+        self.signal_head_lbl = QLabel("No ticker selected.")
+        self.signal_head_lbl.setWordWrap(True)
+        self.signal_head_lbl.setStyleSheet(
+            f"color: #333; font-size: {ui_px(13)}px; font-weight: 600;"
+        )
+        layout.addWidget(self.signal_head_lbl)
+
+        self.signal_spark = SparklineWidget(min_h=120, max_h=None)
+        self.signal_spark.setMinimumHeight(ui_px(140))
+        layout.addWidget(self.signal_spark, stretch=1)
+
+        self.signal_meters = FactorMeterRow()
+        layout.addWidget(self.signal_meters)
+
+        self.signal_why_lbl = QLabel("")
+        self.signal_why_lbl.setWordWrap(True)
+        self.signal_why_lbl.setStyleSheet(f"color: #444; font-size: {ui_px(12)}px;")
+        layout.addWidget(self.signal_why_lbl)
+
+        self.signal_levels_lbl = QLabel("")
+        self.signal_levels_lbl.setWordWrap(True)
+        self.signal_levels_lbl.setStyleSheet(f"color: #666; font-size: {ui_px(11)}px;")
+        layout.addWidget(self.signal_levels_lbl)
 
         btn_row = QHBoxLayout()
         tv_btn = QPushButton("TradingView")
         fv_btn = QPushButton("Finviz / Coinbase")
         broker_btn = QPushButton("Broker page")
+        tv_btn.clicked.connect(lambda: self._open_signal_deep_link("tv"))
+        fv_btn.clicked.connect(lambda: self._open_signal_deep_link("research"))
+        broker_btn.clicked.connect(lambda: self._open_signal_deep_link("broker"))
         btn_row.addWidget(tv_btn)
         btn_row.addWidget(fv_btn)
         btn_row.addWidget(broker_btn)
         btn_row.addStretch(1)
-        lay.addLayout(btn_row)
+        layout.addLayout(btn_row)
 
-        def _selected_ticker():
-            rows = table.selectionModel().selectedRows() if table.selectionModel() else []
-            row = rows[0].row() if rows else table.currentRow()
-            if row < 0:
-                return ""
-            item = table.item(row, 0)
-            return (item.text() if item else "").strip().upper().replace("-USD", "")
+        self.signal_ticker_edit.returnPressed.connect(self._refresh_signal_panel_from_entry)
+        self._signal_focus = {"ticker": "", "is_crypto": False, "rec": "", "source": ""}
+        tab.setLayout(layout)
+        return tab
 
-        def _row_asset_type():
-            row = table.currentRow()
-            if row < 0:
-                return ""
-            atype_item = table.item(row, 1)
-            return (atype_item.text() if atype_item else "") or ""
+    def _focus_scanners_crypto_tab(self):
+        idx = getattr(self, "scanners_tab_index", -1)
+        if 0 <= idx < self.tabs.count():
+            self.tabs.setCurrentIndex(idx)
+        st = getattr(self, "scanners_tabs", None)
+        if st is not None:
+            st.setCurrentIndex(0)
 
-        def _row_rec():
-            row = table.currentRow()
-            if row < 0:
-                return ""
-            rec_item = table.item(row, 3)
-            return (rec_item.text() if rec_item else "") or ""
+    def _wire_scanner_signal_sources(self):
+        """Row select on scanner tables updates the dedicated Signal tab."""
+        for table, is_crypto, source in (
+            (getattr(self, "crypto_table", None), True, "Crypto"),
+            (getattr(self, "penny_table", None), False, "Breakouts"),
+            (getattr(self, "core_table", None), False, "Core"),
+        ):
+            if table is None:
+                continue
 
-        def _refresh_factors():
-            from scoring import signal_research_bundle, explain_gate_from_recommendation
-            ticker = _selected_ticker()
-            if not ticker:
-                head.setText("Select a row for sparkline · factors · RS · levels.")
-                spark.set_closes([])
-                meters.set_meters({})
-                why.setText("")
-                levels.setText("")
-                return
-            atype = _row_asset_type()
-            crypto = is_crypto or "crypto" in atype.lower()
-            try:
-                f = signal_research_bundle(ticker, is_crypto=crypto)
-            except Exception as e:
-                head.setText(f"{ticker}: research load failed ({e})")
-                return
-            bits = [ticker]
-            if f.get("price"):
-                bits.append(f"@ {format_currency(f['price'])}")
-            if f.get("score") is not None:
-                bits.append(f"score {f['score']:.0f}")
-            if f.get("rs_pct") is not None:
-                bits.append(f"RS vs {f.get('bench') or '—'} {f['rs_pct']:+.1f}%")
-            head.setText(" · ".join(bits))
-            spark.set_closes(f.get("closes") or [])
-            meters.set_meters(f.get("meters") or {})
-            rec = _row_rec()
-            gate = explain_gate_from_recommendation(rec)
-            if f.get("regime_ok") is False and f.get("regime_reason"):
-                gate = f"{gate} · regime: {(f.get('regime_reason') or '')[:50]}"
-            why.setText(f"Why: {gate}")
-            lvl_bits = []
-            if f.get("stop_pct") is not None:
-                if f.get("stop_price"):
-                    lvl_bits.append(
-                        f"hard-stop ~{f['stop_pct']:.1f}% ({format_currency(f['stop_price'])})"
-                    )
-                else:
-                    lvl_bits.append(f"hard-stop ~{f['stop_pct']:.1f}%")
-            if f.get("support_hint"):
-                lvl_bits.append(f"support≈{format_currency(f['support_hint'])}")
-            if f.get("fee_edge_pct") is not None:
-                lvl_bits.append(f"fee edge≈{f['fee_edge_pct']:.2f}%")
-            if f.get("ticker_pct") is not None and f.get("bench_pct") is not None:
-                lvl_bits.append(
-                    f"5d {f['ticker_pct']:+.1f}% vs {f.get('bench')} {f['bench_pct']:+.1f}%"
+            def _on_sel(_=None, t=table, crypto=is_crypto, src=source):
+                self._signal_focus_from_table(t, is_crypto=crypto, source=src)
+
+            table.itemSelectionChanged.connect(_on_sel)
+            table.currentCellChanged.connect(
+                lambda *_a, t=table, c=is_crypto, s=source: self._signal_focus_from_table(
+                    t, is_crypto=c, source=s
                 )
-            levels.setText(" · ".join(lvl_bits) if lvl_bits else "Levels —")
+            )
 
-        def _open_tv():
-            ticker = _selected_ticker()
-            if not ticker:
-                return
-            crypto = is_crypto or "crypto" in _row_asset_type().lower()
+    def _signal_focus_from_table(self, table, *, is_crypto=False, source=""):
+        row = table.currentRow()
+        if row < 0:
+            return
+        item = table.item(row, 0)
+        ticker = (item.text() if item else "").strip().upper().replace("-USD", "")
+        if not ticker:
+            return
+        atype_item = table.item(row, 1)
+        atype = (atype_item.text() if atype_item else "") or ""
+        crypto = is_crypto or "crypto" in atype.lower()
+        rec_item = table.item(row, 3)
+        rec = (rec_item.text() if rec_item else "") or ""
+        self._signal_focus = {
+            "ticker": ticker,
+            "is_crypto": crypto,
+            "rec": rec,
+            "source": source or "Scanner",
+            "asset_type": atype,
+        }
+        if hasattr(self, "signal_ticker_edit"):
+            self.signal_ticker_edit.setText(ticker)
+            self.signal_crypto_chk.setChecked(bool(crypto))
+        self._refresh_signal_panel()
+
+    def _refresh_signal_panel_from_entry(self):
+        ticker = (self.signal_ticker_edit.text() or "").strip().upper().replace("-USD", "")
+        if not ticker:
+            return
+        focus = getattr(self, "_signal_focus", None) or {}
+        self._signal_focus = {
+            "ticker": ticker,
+            "is_crypto": bool(self.signal_crypto_chk.isChecked()),
+            "rec": focus.get("rec") or "",
+            "source": "Manual",
+            "asset_type": focus.get("asset_type") or "",
+        }
+        self._refresh_signal_panel()
+
+    def _refresh_signal_panel(self):
+        from scoring import signal_research_bundle, explain_gate_from_recommendation
+        focus = getattr(self, "_signal_focus", None) or {}
+        ticker = str(focus.get("ticker") or "").upper()
+        if not hasattr(self, "signal_head_lbl"):
+            return
+        if not ticker:
+            self.signal_head_lbl.setText("No ticker selected.")
+            self.signal_spark.set_closes([])
+            self.signal_meters.set_meters({})
+            self.signal_why_lbl.setText("")
+            self.signal_levels_lbl.setText("")
+            self.signal_source_lbl.setText("Source: —")
+            return
+        crypto = bool(focus.get("is_crypto"))
+        src = focus.get("source") or "—"
+        self.signal_source_lbl.setText(f"Source: {src}")
+        try:
+            f = signal_research_bundle(ticker, is_crypto=crypto)
+        except Exception as e:
+            self.signal_head_lbl.setText(f"{ticker}: research load failed ({e})")
+            return
+        bits = [ticker]
+        if f.get("price"):
+            bits.append(f"@ {format_currency(f['price'])}")
+        if f.get("score") is not None:
+            bits.append(f"score {f['score']:.0f}")
+        if f.get("rs_pct") is not None:
+            bits.append(f"RS vs {f.get('bench') or '—'} {f['rs_pct']:+.1f}%")
+        self.signal_head_lbl.setText(" · ".join(bits))
+        self.signal_spark.set_closes(f.get("closes") or [])
+        self.signal_meters.set_meters(f.get("meters") or {})
+        gate = explain_gate_from_recommendation(focus.get("rec") or "")
+        if f.get("regime_ok") is False and f.get("regime_reason"):
+            gate = f"{gate} · regime: {(f.get('regime_reason') or '')[:50]}"
+        self.signal_why_lbl.setText(f"Why: {gate}")
+        lvl_bits = []
+        if f.get("stop_pct") is not None:
+            if f.get("stop_price"):
+                lvl_bits.append(
+                    f"hard-stop ~{f['stop_pct']:.1f}% ({format_currency(f['stop_price'])})"
+                )
+            else:
+                lvl_bits.append(f"hard-stop ~{f['stop_pct']:.1f}%")
+        if f.get("support_hint"):
+            lvl_bits.append(f"support≈{format_currency(f['support_hint'])}")
+        if f.get("fee_edge_pct") is not None:
+            lvl_bits.append(f"fee edge≈{f['fee_edge_pct']:.2f}%")
+        if f.get("ticker_pct") is not None and f.get("bench_pct") is not None:
+            lvl_bits.append(
+                f"5d {f['ticker_pct']:+.1f}% vs {f.get('bench')} {f['bench_pct']:+.1f}%"
+            )
+        self.signal_levels_lbl.setText(" · ".join(lvl_bits) if lvl_bits else "Levels —")
+
+    def _open_signal_deep_link(self, kind):
+        focus = getattr(self, "_signal_focus", None) or {}
+        ticker = str(focus.get("ticker") or "").upper()
+        if not ticker and hasattr(self, "signal_ticker_edit"):
+            ticker = (self.signal_ticker_edit.text() or "").strip().upper().replace("-USD", "")
+        if not ticker:
+            return
+        crypto = bool(focus.get("is_crypto"))
+        if hasattr(self, "signal_crypto_chk"):
+            crypto = bool(self.signal_crypto_chk.isChecked())
+        if kind == "tv":
             path = f"{ticker}USD" if crypto else ticker
             webbrowser.open(f"https://www.tradingview.com/chart/?symbol={path}")
-
-        def _open_research():
-            ticker = _selected_ticker()
-            if not ticker:
-                return
-            crypto = is_crypto or "crypto" in _row_asset_type().lower()
+        elif kind == "research":
             if crypto:
                 webbrowser.open(f"https://www.coinbase.com/price/{ticker.lower()}")
             else:
                 webbrowser.open(f"https://finviz.com/quote.ashx?t={ticker}")
-
-        def _open_broker():
-            ticker = _selected_ticker()
-            if not ticker:
-                return
-            crypto = is_crypto or "crypto" in _row_asset_type().lower()
+        else:
             if crypto:
                 webbrowser.open(f"https://www.coinbase.com/price/{ticker.lower()}")
             else:
-                # RH public quote page (works without login for glance)
                 webbrowser.open(f"https://robinhood.com/stocks/{ticker}")
-
-        tv_btn.clicked.connect(_open_tv)
-        fv_btn.clicked.connect(_open_research)
-        broker_btn.clicked.connect(_open_broker)
-        table.itemSelectionChanged.connect(_refresh_factors)
-        table.currentCellChanged.connect(lambda *_: _refresh_factors())
-        return card
 
     def _export_fills_csv(self):
         try:
@@ -5761,7 +5853,6 @@ class MarketAdvisorGUI(QMainWindow):
         self.crypto_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         polish_table(self.crypto_table)
         layout.addWidget(self.crypto_table)
-        layout.addWidget(self._build_scanner_signal_card(self.crypto_table, is_crypto=True))
         
         scan_btn = QPushButton("Manual Scan: Crypto")
         scan_btn.setProperty("uiBtnKind", "success")
@@ -5809,7 +5900,6 @@ class MarketAdvisorGUI(QMainWindow):
         self.penny_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         polish_table(self.penny_table)
         layout.addWidget(self.penny_table)
-        layout.addWidget(self._build_scanner_signal_card(self.penny_table, is_crypto=False))
         
         scan_btn = QPushButton("Manual Scan: Breakouts")
         scan_btn.setProperty("uiBtnKind", "success")
@@ -5857,7 +5947,6 @@ class MarketAdvisorGUI(QMainWindow):
         self.core_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         polish_table(self.core_table)
         layout.addWidget(self.core_table)
-        layout.addWidget(self._build_scanner_signal_card(self.core_table, is_crypto=False))
         
         scan_btn = QPushButton("Manual Scan: Core ETFs")
         scan_btn.setProperty("uiBtnKind", "success")
