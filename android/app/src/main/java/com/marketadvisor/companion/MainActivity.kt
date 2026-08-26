@@ -94,9 +94,11 @@ class MainActivity : AppCompatActivity() {
         binding.btnHaltAll.setOnClickListener { confirmHaltAll() }
         binding.btnEodRun.setOnClickListener { confirmEodRun() }
         binding.btnAdvisorApprove.setOnClickListener { confirmAdvisorApprove() }
+        binding.btnAdvisorReject.setOnClickListener { confirmAdvisorReject() }
         binding.btnHaltAll.isEnabled = false
         binding.btnEodRun.isEnabled = false
         binding.btnAdvisorApprove.isEnabled = false
+        binding.btnAdvisorReject.isEnabled = false
         binding.btnScanSetupQr.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
@@ -530,6 +532,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 binding.btnAdvisorApprove.isEnabled =
                     status.controlsEnabled && adv.count > 0
+                binding.btnAdvisorReject.isEnabled =
+                    status.controlsEnabled && adv.count > 0
                 binding.btnEodRun.isEnabled = status.controlsEnabled
 
                 val etNeedReauth = status.brokers["E*TRADE"]?.reauthNeeded == true
@@ -606,6 +610,7 @@ class MainActivity : AppCompatActivity() {
                 binding.btnHaltAll.isEnabled = false
                 binding.btnEodRun.isEnabled = false
                 binding.btnAdvisorApprove.isEnabled = false
+                binding.btnAdvisorReject.isEnabled = false
                 syncingUi = false
             } finally {
                 binding.swipe.isRefreshing = false
@@ -654,6 +659,15 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun confirmAdvisorReject() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.advisor_reject_all)
+            .setMessage(R.string.confirm_advisor_reject)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(android.R.string.ok) { _, _ -> postAdvisorReject() }
+            .show()
+    }
+
     private fun postEodRun() {
         lifecycleScope.launch {
             statusEpoch += 1
@@ -688,6 +702,26 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(
                 this@MainActivity,
                 if (result.ok) "Advisor approve sent" else (result.error ?: "Approve failed"),
+                Toast.LENGTH_LONG,
+            ).show()
+            refreshStatus(force = true)
+        }
+    }
+
+    private fun postAdvisorReject() {
+        lifecycleScope.launch {
+            statusEpoch += 1
+            val url = Prefs.baseUrl(this@MainActivity)
+            val user = Prefs.username(this@MainActivity)
+            val pass = Prefs.password(this@MainActivity)
+            val pin = Prefs.fingerprint(this@MainActivity)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { MonitorApi.advisorAction(url, user, pass, pin, "", "reject_all") }
+                    .getOrElse { MonitorApi.AutoResult(false, it.message) }
+            }
+            Toast.makeText(
+                this@MainActivity,
+                if (result.ok) "Advisor reject sent" else (result.error ?: "Reject failed"),
                 Toast.LENGTH_LONG,
             ).show()
             refreshStatus(force = true)

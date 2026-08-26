@@ -28,6 +28,7 @@ class ReauthPollWorker(
                 ddPaused = dd,
                 halted = status.halted,
                 signalAlert = status.signalAlert,
+                advisorCount = status.advisor.count,
             )
             Result.success()
         } catch (_: Exception) {
