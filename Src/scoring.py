@@ -295,6 +295,27 @@ def get_risk_posture_profile(name=None):
     return dict(RISK_POSTURE_PROFILES[normalize_risk_posture(name)])
 
 
+def posture_for_broker(broker_name_or_id, settings=None):
+    """
+    Resolve risk posture for a broker: per-broker map overrides global risk_posture.
+    Accepts display names (Robinhood) or broker_id (ROBINHOOD).
+    """
+    settings = settings or {}
+    raw_name = str(broker_name_or_id or "").strip()
+    by_broker = settings.get("risk_posture_by_broker") or {}
+    if not isinstance(by_broker, dict):
+        by_broker = {}
+    id_to_display = {
+        "ROBINHOOD": "Robinhood",
+        "COINBASE": "Coinbase",
+        "ETRADE": "E*TRADE",
+        "E*TRADE": "E*TRADE",
+    }
+    display = id_to_display.get(raw_name.upper().replace("*", ""), raw_name)
+    chosen = by_broker.get(display) or by_broker.get(raw_name) or settings.get("risk_posture", "balanced")
+    return normalize_risk_posture(chosen)
+
+
 def crypto_regime_required(posture=None):
     """Safer + Balanced require the broad BTC regime gate for crypto entries."""
     return bool(get_risk_posture_profile(posture).get("require_crypto_regime", False))

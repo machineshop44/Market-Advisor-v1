@@ -136,6 +136,28 @@ object MonitorApi {
         val reason: String = "",
     )
 
+    data class AdvisorPending(
+        val id: String = "",
+        val broker: String = "",
+        val ticker: String = "",
+        val dollars: Double = 0.0,
+        val score: Double = 0.0,
+        val engine: String = "",
+    )
+
+    data class AdvisorInfo(
+        val count: Int = 0,
+        val pending: List<AdvisorPending> = emptyList(),
+        val present: Boolean = false,
+    )
+
+    data class OvernightScorecard(
+        val grade: String = "",
+        val label: String = "",
+        val tip: String = "",
+        val present: Boolean = false,
+    )
+
     data class Status(
         val controlsEnabled: Boolean,
         val autoTrader: Map<String, Boolean>,
@@ -158,6 +180,8 @@ object MonitorApi {
         val lockedCapital: LockedCapital = LockedCapital(),
         val halted: Boolean = false,
         val signalAlert: SignalAlert? = null,
+        val advisor: AdvisorInfo = AdvisorInfo(),
+        val overnightScorecard: OvernightScorecard = OvernightScorecard(),
         val brokerBalances: Map<String, BrokerBalance> = emptyMap(),
         val recentTrades: List<RecentTrade> = emptyList(),
         val recentLog: List<String> = emptyList(),
@@ -535,6 +559,44 @@ object MonitorApi {
             }
         }
 
+        val advisorObj = json.optJSONObject("advisor")
+        val advisor = if (advisorObj != null) {
+            val pending = mutableListOf<AdvisorPending>()
+            val arr = advisorObj.optJSONArray("pending")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    pending += AdvisorPending(
+                        id = o.optString("id", ""),
+                        broker = o.optString("broker", ""),
+                        ticker = o.optString("ticker", ""),
+                        dollars = o.optDouble("dollars", 0.0),
+                        score = o.optDouble("score", 0.0),
+                        engine = o.optString("engine", ""),
+                    )
+                }
+            }
+            AdvisorInfo(
+                count = advisorObj.optInt("count", pending.size),
+                pending = pending,
+                present = true,
+            )
+        } else {
+            AdvisorInfo()
+        }
+
+        val ocObj = json.optJSONObject("overnight_scorecard")
+        val overnightScorecard = if (ocObj != null && ocObj.length() > 0) {
+            OvernightScorecard(
+                grade = ocObj.optString("grade", ""),
+                label = ocObj.optString("label", ""),
+                tip = ocObj.optString("tip", ""),
+                present = true,
+            )
+        } else {
+            OvernightScorecard()
+        }
+
         return Status(
             controlsEnabled = json.optBoolean("controls_enabled", false),
             autoTrader = autos,
@@ -557,6 +619,8 @@ object MonitorApi {
             lockedCapital = lockedCapital,
             halted = json.optBoolean("halted", false),
             signalAlert = parseSignalAlert(json.optJSONObject("signal_alert")),
+            advisor = advisor,
+            overnightScorecard = overnightScorecard,
             brokerBalances = brokerBalances,
             recentTrades = recentTrades,
             recentLog = recentLog,
@@ -626,6 +690,60 @@ object MonitorApi {
                 } else {
                     null
                 },
+            )
+        } catch (_: Exception) {
+            val (msg, lockout) = parseErrorMessage(text, code)
+            AutoResult(ok = code in 200..299, error = msg, lockoutSeconds = lockout)
+        }
+    }
+
+    fun runEodPass(
+        baseUrl: String,
+        user: String,
+        pass: String,
+        pinFp: String,
+    ): AutoResult {
+        val conn = open("${baseUrl.trimEnd('/')}/api/eod/run", user, pass, "POST", pinFp)
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write("{}") }
+        val code = conn.responseCode
+        val text = readBody(conn, code)
+        return try {
+            val json = JSONObject(text.ifBlank { "{}" })
+            AutoResult(
+                ok = json.optBoolean("ok", code in 200..299),
+                error = json.optString("error", "").takeIf { it.isNotBlank() },
+            )
+        } catch (_: Exception) {
+            val (msg, lockout) = parseErrorMessage(text, code)
+            AutoResult(ok = code in 200..299, error = msg, lockoutSeconds = lockout)
+        }
+    }
+
+    fun advisorAction(
+        baseUrl: String,
+        user: String,
+        pass: String,
+        pinFp: String,
+        proposalId: String,
+        action: String,
+    ): AutoResult {
+        val conn = open("${baseUrl.trimEnd('/')}/api/advisor/approve", user, pass, "POST", pinFp)
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        val body = JSONObject()
+            .put("id", proposalId)
+            .put("action", action)
+            .toString()
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body) }
+        val code = conn.responseCode
+        val text = readBody(conn, code)
+        return try {
+            val json = JSONObject(text.ifBlank { "{}" })
+            AutoResult(
+                ok = json.optBoolean("ok", code in 200..299),
+                error = json.optString("error", "").takeIf { it.isNotBlank() },
             )
         } catch (_: Exception) {
             val (msg, lockout) = parseErrorMessage(text, code)

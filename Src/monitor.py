@@ -62,6 +62,8 @@ _auth_required = False
 _controls_enabled = False
 _control_handler = None
 _halt_handler = None
+_advisor_handler = None
+_eod_handler = None
 _etrade_oauth_handler = None
 _server = None
 _thread = None
@@ -112,6 +114,22 @@ def set_halt_handler(handler):
     """Register GUI callback for Panic Halt All: handler() -> {"ok": bool, ...}."""
     global _halt_handler
     _halt_handler = handler
+
+
+def set_advisor_handler(handler):
+    """
+    Register GUI callback for companion advisor approve/reject.
+    handler(proposal_id, action) -> dict
+      action: approve | reject | reject_all
+    """
+    global _advisor_handler
+    _advisor_handler = handler
+
+
+def set_eod_handler(handler):
+    """Register GUI callback for companion EOD protective pass: handler() -> dict."""
+    global _eod_handler
+    _eod_handler = handler
 
 
 def set_etrade_oauth_handler(handler):
@@ -676,6 +694,8 @@ class _Handler(BaseHTTPRequestHandler):
         if path not in (
             "/api/auto",
             "/api/halt",
+            "/api/eod/run",
+            "/api/advisor/approve",
             "/api/etrade/oauth/start",
             "/api/etrade/oauth/complete",
         ):
@@ -705,6 +725,52 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 result = handler()
+            except Exception as e:
+                self._json_response(500, {"ok": False, "error": str(e)})
+                return
+            if not isinstance(result, dict):
+                result = {"ok": bool(result)}
+            code = 200 if result.get("ok") else 400
+            self._json_response(code, result)
+            return
+
+        if path == "/api/eod/run":
+            handler = _eod_handler
+            if handler is None:
+                self._json_response(503, {"ok": False, "error": "EOD handler not ready"})
+                return
+            try:
+                result = handler()
+            except Exception as e:
+                self._json_response(500, {"ok": False, "error": str(e)})
+                return
+            if not isinstance(result, dict):
+                result = {"ok": bool(result)}
+            code = 200 if result.get("ok") else 400
+            self._json_response(code, result)
+            return
+
+        if path == "/api/advisor/approve":
+            handler = _advisor_handler
+            if handler is None:
+                self._json_response(503, {"ok": False, "error": "Advisor handler not ready"})
+                return
+            data = self._read_json_body()
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                self._json_response(400, {"ok": False, "error": "Expected JSON body"})
+                return
+            proposal_id = str(data.get("id") or data.get("proposal_id") or "").strip()
+            action = str(data.get("action") or "approve").lower().strip()
+            if action not in ("approve", "reject", "reject_all"):
+                self._json_response(400, {"ok": False, "error": "action must be approve, reject, or reject_all"})
+                return
+            if action == "reject" and not proposal_id:
+                self._json_response(400, {"ok": False, "error": "id required for reject"})
+                return
+            try:
+                result = handler(proposal_id, action)
             except Exception as e:
                 self._json_response(500, {"ok": False, "error": str(e)})
                 return

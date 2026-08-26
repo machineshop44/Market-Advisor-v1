@@ -23,11 +23,13 @@ object ReauthNotifier {
     private const val NOTIFY_DD = 3302
     private const val NOTIFY_HALT = 3303
     private const val NOTIFY_SIGNAL = 3304
+    private const val NOTIFY_ADVISOR = 3305
 
     private const val KEY_LAST_REAUTH = "last_reauth_needed"
     private const val KEY_LAST_DD = "last_dd_paused"
     private const val KEY_LAST_HALT = "last_halted"
     private const val KEY_LAST_SIGNAL_ID = "last_signal_alert_id"
+    private const val KEY_LAST_ADVISOR_COUNT = "last_advisor_count"
 
     fun ensureChannel(ctx: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -128,11 +130,50 @@ object ReauthNotifier {
         ddPaused: Boolean,
         halted: Boolean,
         signalAlert: MonitorApi.SignalAlert? = null,
+        advisorCount: Int = 0,
     ) {
         maybeNotify(ctx, reauthNeeded)
         maybeNotifyDdPause(ctx, ddPaused)
         maybeNotifyHalt(ctx, halted)
         maybeNotifySignal(ctx, signalAlert)
+        maybeNotifyAdvisor(ctx, advisorCount)
+    }
+
+    fun maybeNotifyAdvisor(ctx: Context, count: Int) {
+        ensureChannel(ctx)
+        val prefs = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        val prev = prefs.getInt(KEY_LAST_ADVISOR_COUNT, 0)
+        prefs.edit().putInt(KEY_LAST_ADVISOR_COUNT, count).apply()
+        if (count <= 0) {
+            if (prev > 0) NotificationManagerCompat.from(ctx).cancel(NOTIFY_ADVISOR)
+            return
+        }
+        if (prev > 0) return
+        if (Build.VERSION.SDK_INT >= 33) {
+            val ok = ContextCompat.checkSelfPermission(
+                ctx,
+                android.Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!ok) return
+        }
+        val open = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pi = PendingIntent.getActivity(
+            ctx,
+            NOTIFY_ADVISOR,
+            open,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val note = NotificationCompat.Builder(ctx, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(ctx.getString(R.string.advisor_notify_title))
+            .setContentText(ctx.getString(R.string.advisor_notify_body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pi)
+            .build()
+        NotificationManagerCompat.from(ctx).notify(NOTIFY_ADVISOR, note)
     }
 
     private fun edgeNotify(

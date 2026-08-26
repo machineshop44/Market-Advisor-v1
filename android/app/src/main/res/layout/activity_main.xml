@@ -344,6 +344,47 @@
                     android:textSize="11sp"
                     android:visibility="gone" />
 
+                <TextView
+                    android:id="@+id/advisorLine"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/bg_card"
+                    android:ellipsize="end"
+                    android:maxLines="3"
+                    android:padding="8dp"
+                    android:text="—"
+                    android:textColor="@color/muted"
+                    android:textSize="11sp" />
+
+                <LinearLayout
+                    android:id="@+id/dutyOfficerRow"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnAdvisorApprove"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="4dp"
+                        android:layout_weight="1"
+                        android:text="@string/advisor_approve_top"
+                        android:textSize="12sp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnEodRun"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="4dp"
+                        android:layout_weight="1"
+                        android:text="@string/eod_run"
+                        android:textSize="12sp" />
+                </LinearLayout>
+
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnHaltAll"
                     style="@style/Widget.MaterialComponents.Button"

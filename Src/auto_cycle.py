@@ -1142,3 +1142,180 @@ def drop_locked_portfolio_sells(sell_list: Iterable, holdings: Iterable) -> tupl
         else:
             kept.append(item)
     return kept, dropped
+
+
+def overnight_scorecard(
+    *,
+    protective_health: dict | None = None,
+    reauth_needed: dict | None = None,
+    session_label: str = "",
+    et_equity_count: int = 0,
+    et_flatten_enabled: bool = False,
+    auto_armed: bool = False,
+) -> dict:
+    """
+    Single trust grade for overnight / app-off exposure.
+    Returns {grade, label, risks[], tip}.
+    """
+    ph = protective_health or {}
+    missing = int(ph.get("missing_count") or len(ph.get("missing") or []) or 0)
+    expected = int(ph.get("expected") or 0)
+    ok_stops = bool(ph.get("ok", True)) and missing == 0
+    reauth = reauth_needed or {}
+    et_reauth = bool(reauth.get("E*TRADE") or reauth.get("ETRADE"))
+    risks: list[str] = []
+    score = 100
+    if missing > 0:
+        risks.append(f"{missing} RH stop(s) missing")
+        score -= min(40, 15 * missing)
+    if et_equity_count > 0:
+        if et_flatten_enabled:
+            risks.append(f"ET flatten ON ({et_equity_count} name(s))")
+            score -= 5
+        else:
+            risks.append(f"ET naked overnight ({et_equity_count} equity)")
+            score -= min(35, 10 + 5 * min(et_equity_count, 4))
+    if et_reauth:
+        risks.append("E*TRADE reauth needed")
+        score -= 20
+    sess = str(session_label or "").upper()
+    if sess in ("OVERNIGHT", "CLOSED", "WEEKEND", "HOLIDAY") and not auto_armed:
+        risks.append("Auto-trader off — software TTP idle")
+        score -= 15
+    elif sess in ("OVERNIGHT",) and auto_armed:
+        risks.append("Overnight session — RH stops matter if app stops")
+        score -= 5
+    score = max(0, min(100, score))
+    if score >= 90:
+        grade, label = "A", "Overnight: strong"
+    elif score >= 75:
+        grade, label = "B", "Overnight: OK"
+    elif score >= 60:
+        grade, label = "C", "Overnight: gaps"
+    else:
+        grade, label = "D", "Overnight: exposed"
+    if not risks:
+        tip = "RH stops healthy; ET flat or empty; companion can reauth."
+    elif et_equity_count and not et_flatten_enabled:
+        tip = "Enable ET flatten before close or hold with midnight reauth plan."
+    elif missing > 0:
+        tip = "Run Repair stops or pre-close pass before leaving desk."
+    else:
+        tip = "Review risks before overnight."
+    return {
+        "grade": grade,
+        "label": label,
+        "score": score,
+        "risks": risks,
+        "tip": tip,
+        "stops_ok": ok_stops,
+        "et_naked": et_equity_count,
+    }
+
+
+def capital_planner_snapshot(
+    *,
+    broker: str,
+    ticker: str,
+    price: float,
+    score: float,
+    equity: float,
+    buying_power: float,
+    holdings: list | None = None,
+    posture: str = "balanced",
+    broker_id: str = "ROBINHOOD",
+    settings: dict | None = None,
+) -> dict:
+    """
+    Dry-run BP + optional rotate funder for top radar candidate.
+    """
+    settings = settings or {}
+    out: dict = {
+        "broker": broker,
+        "ticker": ticker,
+        "deployable": 0.0,
+        "aim": 0.0,
+        "skip_reason": None,
+        "rotates_used": 0,
+        "rotates_cap": 0,
+        "rotate_preview": None,
+    }
+    try:
+        from scoring import (
+            risk_sizing_breakdown,
+            get_stop_distance_pct,
+            pick_rotation_funding,
+            opportunity_swap_params,
+            rotation_allowed_today,
+            rotates_today,
+        )
+        stop_d = get_stop_distance_pct(broker_id, ticker=ticker, for_sizing=True)
+        is_crypto = str(ticker or "").upper() in {
+            "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
+        }
+        alloc_key = "allocation_pct_crypto" if is_crypto else "allocation_pct_stock"
+        alloc = float(settings.get(alloc_key, settings.get("allocation_pct", 8.0))) / 100.0
+        util = float(settings.get("target_bp_utilization_pct", 88.0))
+        if util > 1.0:
+            util = util / 100.0
+        detail = risk_sizing_breakdown(
+            float(equity or 0),
+            float(buying_power or 0),
+            stop_d,
+            alloc,
+            min_dollars=float(settings.get("min_trade_dollars", 5.0) or 5.0),
+            conviction_score=float(score or 0),
+            target_bp_utilization=util,
+            sizing_focus_slots=int(settings.get("sizing_focus_slots", 6) or 6),
+            soft_name_equity_frac=float(settings.get("max_single_name_equity_pct", 15.0) or 15.0) / 100.0,
+            risk_pct_per_trade=float(settings.get("risk_pct_per_trade", 0.75) or 0.75),
+            max_open_risk_pct=float(settings.get("max_open_risk_pct", 6.0) or 6.0),
+        )
+        out["deployable"] = float(detail.get("deployable") or 0)
+        out["aim"] = float(detail.get("trade") or detail.get("aim") or 0)
+        out["skip_reason"] = detail.get("skip_reason")
+        params = opportunity_swap_params(posture)
+        out["rotates_cap"] = int(params.get("max_rotates_per_day") or 0)
+        out["rotates_used"] = int(rotates_today(broker_id) or 0)
+        ok_day, _ = rotation_allowed_today(broker_id, posture=posture)
+        if ok_day and params.get("enabled") and holdings:
+            fund = pick_rotation_funding(
+                ticker,
+                score,
+                is_crypto,
+                holdings,
+                posture=posture,
+                broker_id=broker_id,
+                need_dollars=float(detail.get("min_dollars") or 5.0) if out["aim"] <= 0 else None,
+                current_bp=float(buying_power or 0),
+            )
+            if fund:
+                out["rotate_preview"] = {
+                    "funder": fund.get("ticker"),
+                    "roi": fund.get("roi"),
+                    "value": fund.get("value"),
+                    "reason": fund.get("reason"),
+                }
+    except Exception as e:
+        out["error"] = str(e)[:120]
+    return out
+
+
+def format_capital_planner_label(snap: dict, *, money_fn=None) -> str:
+    money_fn = money_fn or (lambda x: f"${float(x):.2f}")
+    if not snap or not snap.get("ticker"):
+        return "Capital: —"
+    tick = snap.get("ticker")
+    dep = float(snap.get("deployable") or 0)
+    aim = float(snap.get("aim") or 0)
+    rot = snap.get("rotate_preview") or {}
+    parts = [f"Capital [{tick}]: deploy {money_fn(dep)} · aim {money_fn(aim)}"]
+    used = int(snap.get("rotates_used") or 0)
+    cap = int(snap.get("rotates_cap") or 0)
+    if cap:
+        parts.append(f"rotates {used}/{cap}")
+    if rot.get("funder"):
+        parts.append(f"rotate via {rot.get('funder')}")
+    elif snap.get("skip_reason"):
+        parts.append(str(snap.get("skip_reason"))[:40])
+    return " · ".join(parts)

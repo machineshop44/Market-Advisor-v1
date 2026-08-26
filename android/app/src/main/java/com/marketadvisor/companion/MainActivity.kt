@@ -92,7 +92,11 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
         binding.btnHaltAll.setOnClickListener { confirmHaltAll() }
+        binding.btnEodRun.setOnClickListener { confirmEodRun() }
+        binding.btnAdvisorApprove.setOnClickListener { confirmAdvisorApprove() }
         binding.btnHaltAll.isEnabled = false
+        binding.btnEodRun.isEnabled = false
+        binding.btnAdvisorApprove.isEnabled = false
         binding.btnScanSetupQr.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
@@ -466,6 +470,10 @@ class MainActivity : AppCompatActivity() {
                         policyBits += String.format(Locale.US, "ET BP $%,.2f", bp)
                     }
                 }
+                val oc = status.overnightScorecard
+                if (oc.present && oc.grade.isNotBlank()) {
+                    policyBits += "Overnight ${oc.grade} · ${oc.label}"
+                }
                 binding.policyLine.text = policyBits.joinToString(" · ").ifBlank { "—" }
                 binding.policyLine.setTextColor(
                     ContextCompat.getColor(
@@ -505,6 +513,24 @@ class MainActivity : AppCompatActivity() {
                     },
                 )
                 binding.btnHaltAll.isEnabled = status.controlsEnabled
+                val adv = status.advisor
+                val advPending = adv.pending.firstOrNull()
+                binding.advisorLine.text = if (adv.count > 0 && advPending != null) {
+                    String.format(
+                        Locale.US,
+                        "Advisor: %d pending · top %s %s ~$%.0f (score %.0f)",
+                        adv.count,
+                        advPending.broker,
+                        advPending.ticker,
+                        advPending.dollars,
+                        advPending.score,
+                    )
+                } else {
+                    "Advisor: no pending proposals"
+                }
+                binding.btnAdvisorApprove.isEnabled =
+                    status.controlsEnabled && adv.count > 0
+                binding.btnEodRun.isEnabled = status.controlsEnabled
 
                 val etNeedReauth = status.brokers["E*TRADE"]?.reauthNeeded == true
                 ReauthNotifier.maybeNotifyFromStatus(
@@ -513,6 +539,7 @@ class MainActivity : AppCompatActivity() {
                     ddPaused = status.portfolioHeat.ddPaused,
                     halted = status.halted,
                     signalAlert = status.signalAlert,
+                    advisorCount = adv.count,
                 )
 
                 syncingUi = true
@@ -577,6 +604,8 @@ class MainActivity : AppCompatActivity() {
                     row.binding.brokerSwitch.isEnabled = false
                 }
                 binding.btnHaltAll.isEnabled = false
+                binding.btnEodRun.isEnabled = false
+                binding.btnAdvisorApprove.isEnabled = false
                 syncingUi = false
             } finally {
                 binding.swipe.isRefreshing = false
@@ -605,6 +634,64 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(android.R.string.ok) { _, _ -> postHaltAll() }
             .show()
+    }
+
+    private fun confirmEodRun() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.eod_run)
+            .setMessage(R.string.confirm_eod)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(android.R.string.ok) { _, _ -> postEodRun() }
+            .show()
+    }
+
+    private fun confirmAdvisorApprove() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.advisor_approve_top)
+            .setMessage(R.string.confirm_advisor_approve)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(android.R.string.ok) { _, _ -> postAdvisorApprove() }
+            .show()
+    }
+
+    private fun postEodRun() {
+        lifecycleScope.launch {
+            statusEpoch += 1
+            val url = Prefs.baseUrl(this@MainActivity)
+            val user = Prefs.username(this@MainActivity)
+            val pass = Prefs.password(this@MainActivity)
+            val pin = Prefs.fingerprint(this@MainActivity)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { MonitorApi.runEodPass(url, user, pass, pin) }
+                    .getOrElse { MonitorApi.AutoResult(false, it.message) }
+            }
+            Toast.makeText(
+                this@MainActivity,
+                if (result.ok) "EOD check queued on desktop" else (result.error ?: "EOD failed"),
+                Toast.LENGTH_LONG,
+            ).show()
+            refreshStatus(force = true)
+        }
+    }
+
+    private fun postAdvisorApprove() {
+        lifecycleScope.launch {
+            statusEpoch += 1
+            val url = Prefs.baseUrl(this@MainActivity)
+            val user = Prefs.username(this@MainActivity)
+            val pass = Prefs.password(this@MainActivity)
+            val pin = Prefs.fingerprint(this@MainActivity)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { MonitorApi.advisorAction(url, user, pass, pin, "", "approve") }
+                    .getOrElse { MonitorApi.AutoResult(false, it.message) }
+            }
+            Toast.makeText(
+                this@MainActivity,
+                if (result.ok) "Advisor approve sent" else (result.error ?: "Approve failed"),
+                Toast.LENGTH_LONG,
+            ).show()
+            refreshStatus(force = true)
+        }
     }
 
     private fun startEtradeReauth() {
