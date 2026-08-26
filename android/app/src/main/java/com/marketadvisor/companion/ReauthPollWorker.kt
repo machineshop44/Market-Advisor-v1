@@ -21,7 +21,13 @@ class ReauthPollWorker(
         return try {
             val status = MonitorApi.fetchStatus(url, user, pass, pin)
             val need = status.brokers["E*TRADE"]?.reauthNeeded == true
-            ReauthNotifier.maybeNotify(applicationContext, need)
+            val dd = status.portfolioHeat.ddPaused
+            ReauthNotifier.maybeNotifyFromStatus(
+                applicationContext,
+                reauthNeeded = need,
+                ddPaused = dd,
+                halted = status.halted,
+            )
             Result.success()
         } catch (_: Exception) {
             Result.retry()

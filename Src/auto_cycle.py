@@ -269,6 +269,80 @@ DEFAULT_CRYPTO_TICKERS = frozenset({
     "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
 })
 
+CRYPTO_MOVER_BLOCKLIST = frozenset({
+    "USDT", "USDC", "DAI", "USD", "EUR", "GBP", "PYUSD", "EURC",
+})
+
+
+def merge_crypto_scan_universe(
+    curated: list[str] | None = None,
+    movers: list[str] | None = None,
+    *,
+    max_movers: int = 8,
+) -> list[dict]:
+    """
+    Curated crypto list plus optional live movers (deduped).
+    Returns [{'symbol', 'type'}] with type Crypto or Crypto Mover.
+    """
+    core = [str(s).upper().replace("-USD", "") for s in (curated or list(DEFAULT_CRYPTO_TICKERS))]
+    seen = set()
+    out: list[dict] = []
+    for sym in core:
+        if not sym or sym in seen or sym in CRYPTO_MOVER_BLOCKLIST:
+            continue
+        seen.add(sym)
+        out.append({"symbol": sym, "type": "Crypto"})
+    added = 0
+    for raw in movers or []:
+        if added >= max_movers:
+            break
+        sym = str(raw or "").upper().replace("-USD", "").strip()
+        if not sym or sym in seen or sym in CRYPTO_MOVER_BLOCKLIST:
+            continue
+        if not sym.isalpha() or not (2 <= len(sym) <= 10):
+            continue
+        seen.add(sym)
+        out.append({"symbol": sym, "type": "Crypto Mover"})
+        added += 1
+    return out
+
+
+def extract_coinbase_usd_movers(products_payload, *, limit: int = 8) -> list[str]:
+    """
+    Rank Coinbase product dicts by 24h % change (USD quote only).
+    Accepts list[dict] or {'products': [...]}.
+    """
+    if isinstance(products_payload, dict):
+        products = products_payload.get("products") or products_payload.get("Products") or []
+    else:
+        products = products_payload or []
+    ranked = []
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("product_id") or p.get("id") or "")
+        if not pid.endswith("-USD"):
+            continue
+        base = pid.replace("-USD", "").upper()
+        if base in CRYPTO_MOVER_BLOCKLIST or base in DEFAULT_CRYPTO_TICKERS:
+            continue
+        status = str(p.get("status") or "").lower()
+        if status and status not in ("online", "active", ""):
+            continue
+        try:
+            chg = float(
+                p.get("price_percentage_change_24h")
+                or p.get("price_percentage_change_24H")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            chg = 0.0
+        if chg <= 0:
+            continue
+        ranked.append((chg, base))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [b for _, b in ranked[: max(0, int(limit))]]
+
 
 def throttled_buy_skip_note(
     store: dict,

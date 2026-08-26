@@ -497,7 +497,7 @@ class ETradeAdapter(BaseBroker):
             use_limit = float(offset_pct or 0) > 0
             if use_limit:
                 price_type = "LIMIT"
-                limit_price = round(price * (1.0 + float(offset_pct) / 100.0), 2)
+                limit_price = round(price * (1.0 + float(offset_pct)), 2)
             else:
                 price_type = "MARKET"
                 limit_price = None
@@ -572,7 +572,7 @@ class ETradeAdapter(BaseBroker):
             use_limit = float(offset_pct or 0) > 0
             if use_limit:
                 price_type = "LIMIT"
-                limit_price = round(price * (1.0 - float(offset_pct) / 100.0), 2)
+                limit_price = round(price * (1.0 - float(offset_pct)), 2)
             else:
                 price_type = "MARKET"
                 limit_price = None

@@ -4168,6 +4168,18 @@ class MarketAdvisorGUI(QMainWindow):
                 "fractional_ok": False,
                 "equity_tradeable": False,
             }
+        try:
+            from market_calendar import is_nyse_holiday
+            if is_nyse_holiday(now.date()):
+                return {
+                    "label": "HOLIDAY",
+                    "market_hours": "regular_hours",
+                    "use_ext": False,
+                    "fractional_ok": False,
+                    "equity_tradeable": False,
+                }
+        except Exception:
+            pass
 
         t = now.hour + now.minute / 60.0
 
@@ -4340,8 +4352,8 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _maybe_session_boundary_wakeup(self, now_ts):
         """
-        Once per weekday (ET): equity cycles ~60s before 9:30 open, at/just after open,
-        and ~60s before 16:00 close. Weekends skipped; no holiday calendar (weekday RTH baseline).
+        Once per equity session day (ET): cycles ~60s before 9:30 open, at/just after open,
+        and ~60s before 16:00 close. Weekends and NYSE full holidays skipped.
         """
         equity_armed = any(
             self.auto_trade_enabled.get(b)
@@ -4354,6 +4366,12 @@ class MarketAdvisorGUI(QMainWindow):
         now_et = self._now_et()
         if now_et.weekday() >= 5:
             return
+        try:
+            from market_calendar import is_equity_session_day
+            if not is_equity_session_day(now_et.date()):
+                return
+        except Exception:
+            pass
 
         day = now_et.date()
         fired = self._session_wakeup_fired
@@ -4394,6 +4412,8 @@ class MarketAdvisorGUI(QMainWindow):
 
         if label == "WEEKEND":
             equity_text, equity_color = "WEEKEND", warn_color
+        elif label == "HOLIDAY":
+            equity_text, equity_color = "HOLIDAY", warn_color
         elif label == "REGULAR":
             equity_text, equity_color = "REGULAR", open_color
         elif label == "EXTENDED":
@@ -5421,6 +5441,119 @@ class MarketAdvisorGUI(QMainWindow):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "Portfolio")
 
+    def _build_scanner_signal_card(self, table, *, is_crypto=False):
+        """Research polish: factor strip + TradingView/Finviz deep links for selected row."""
+        card = QGroupBox("Signal card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(ui_px(10), ui_px(8), ui_px(10), ui_px(8))
+        lay.setSpacing(ui_px(6))
+        factors = QLabel("Select a row to see score factors (trend · RSI · volume · regime · edge).")
+        factors.setWordWrap(True)
+        factors.setObjectName("settingsHint")
+        factors.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        lay.addWidget(factors)
+        btn_row = QHBoxLayout()
+        tv_btn = QPushButton("TradingView")
+        fv_btn = QPushButton("Finviz / Coinbase")
+        btn_row.addWidget(tv_btn)
+        btn_row.addWidget(fv_btn)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        def _selected_ticker():
+            rows = table.selectionModel().selectedRows() if table.selectionModel() else []
+            row = rows[0].row() if rows else table.currentRow()
+            if row < 0:
+                return ""
+            item = table.item(row, 0)
+            return (item.text() if item else "").strip().upper().replace("-USD", "")
+
+        def _refresh_factors():
+            ticker = _selected_ticker()
+            if not ticker:
+                factors.setText("Select a row to see score factors (trend · RSI · volume · regime · edge).")
+                return
+            atype_item = table.item(table.currentRow(), 1) if table.currentRow() >= 0 else None
+            atype = (atype_item.text() if atype_item else "") or ""
+            crypto = is_crypto or "crypto" in atype.lower()
+            try:
+                from scoring import crypto_signal_factors
+                f = crypto_signal_factors(ticker, is_crypto=crypto)
+            except Exception as e:
+                factors.setText(f"{ticker}: factor load failed ({e})")
+                return
+            bits = [ticker]
+            if f.get("price"):
+                bits.append(f"@ {format_currency(f['price'])}")
+            bits.append(
+                "macro " + ("up" if f.get("macro_uptrend") else "down" if f.get("macro_uptrend") is False else "—")
+            )
+            bits.append(
+                "micro " + ("bull" if f.get("micro_bullish") else "flat" if f.get("micro_bullish") is False else "—")
+            )
+            bits.append(f"RSI {f['rsi']:.1f}" if f.get("rsi") is not None else "RSI —")
+            bits.append("vol OK" if f.get("has_volume") else "vol weak" if f.get("has_volume") is False else "vol —")
+            bits.append(f"score {f['score']:.0f}" if f.get("score") is not None else "score —")
+            if f.get("regime_ok") is True:
+                bits.append("regime OK")
+            elif f.get("regime_ok") is False:
+                bits.append(f"regime blocked ({(f.get('regime_reason') or '')[:40]})")
+            if f.get("fee_edge_pct") is not None:
+                bits.append(f"edge≈{f['fee_edge_pct']:.2f}%")
+            rec_item = table.item(table.currentRow(), 3) if table.currentRow() >= 0 else None
+            if rec_item and rec_item.text():
+                bits.append(rec_item.text()[:60])
+            factors.setText(" · ".join(bits))
+
+        def _open_tv():
+            ticker = _selected_ticker()
+            if not ticker:
+                return
+            atype_item = table.item(table.currentRow(), 1) if table.currentRow() >= 0 else None
+            atype = (atype_item.text() if atype_item else "") or ""
+            crypto = is_crypto or "crypto" in atype.lower()
+            path = f"{ticker}USD" if crypto else ticker
+            webbrowser.open(f"https://www.tradingview.com/chart/?symbol={path}")
+
+        def _open_research():
+            ticker = _selected_ticker()
+            if not ticker:
+                return
+            atype_item = table.item(table.currentRow(), 1) if table.currentRow() >= 0 else None
+            atype = (atype_item.text() if atype_item else "") or ""
+            crypto = is_crypto or "crypto" in atype.lower()
+            if crypto:
+                webbrowser.open(f"https://www.coinbase.com/price/{ticker.lower()}")
+            else:
+                webbrowser.open(f"https://finviz.com/quote.ashx?t={ticker}")
+
+        tv_btn.clicked.connect(_open_tv)
+        fv_btn.clicked.connect(_open_research)
+        table.itemSelectionChanged.connect(_refresh_factors)
+        table.currentCellChanged.connect(lambda *_: _refresh_factors())
+        return card
+
+    def _export_fills_csv(self):
+        try:
+            import journal as journal_mod
+            days = 7
+            if hasattr(self, "reports_days_combo"):
+                raw = self.reports_days_combo.currentData()
+                days = 7 if raw is None else int(raw)
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export fills CSV",
+                f"market_advisor_fills_{datetime.now().strftime('%Y%m%d')}.csv",
+                "CSV Files (*.csv)",
+            )
+            if not path:
+                return
+            n = journal_mod.export_fills_csv(path, days=days, limit=8000)
+            QMessageBox.information(self, "Export", f"Wrote {n} fill row(s) to:\n{path}")
+            self.log_event(f"[Reports] Exported {n} fills → {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+
     def build_crypto_screen(self):
         tab = QWidget()
         layout = QVBoxLayout()
@@ -5446,6 +5579,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.crypto_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         polish_table(self.crypto_table)
         layout.addWidget(self.crypto_table)
+        layout.addWidget(self._build_scanner_signal_card(self.crypto_table, is_crypto=True))
         
         scan_btn = QPushButton("Manual Scan: Crypto")
         scan_btn.setProperty("uiBtnKind", "success")
@@ -5493,6 +5627,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.penny_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         polish_table(self.penny_table)
         layout.addWidget(self.penny_table)
+        layout.addWidget(self._build_scanner_signal_card(self.penny_table, is_crypto=False))
         
         scan_btn = QPushButton("Manual Scan: Breakouts")
         scan_btn.setProperty("uiBtnKind", "success")
@@ -5540,6 +5675,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.core_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         polish_table(self.core_table)
         layout.addWidget(self.core_table)
+        layout.addWidget(self._build_scanner_signal_card(self.core_table, is_crypto=False))
         
         scan_btn = QPushButton("Manual Scan: Core ETFs")
         scan_btn.setProperty("uiBtnKind", "success")
@@ -5888,12 +6024,16 @@ class MarketAdvisorGUI(QMainWindow):
         refresh_btn.setStyleSheet(action_btn_style("primary"))
         refresh_btn.clicked.connect(self.refresh_reports)
         header_bar.addWidget(refresh_btn)
+        export_btn = QPushButton("Export fills CSV…")
+        export_btn.setToolTip("Export journal fills for the selected window (fee fields included).")
+        export_btn.clicked.connect(self._export_fills_csv)
+        header_bar.addWidget(export_btn)
         layout.addLayout(header_bar)
 
         hint = QLabel(
             "Hero = Net≈ (realized − fees) · fee drag · trade count. "
             "Fee confidence rises when broker invoice fields land on fills. "
-            "Bar WF = multi-symbol OHLCV · fee-aware (not QuantConnect)."
+            "Bar WF = multi-symbol OHLCV · fee-aware · holiday-filtered equities (not QuantConnect)."
         )
         hint.setObjectName("settingsHint")
         hint.setWordWrap(True)
@@ -6171,7 +6311,22 @@ class MarketAdvisorGUI(QMainWindow):
                         )
                     assumptions = bwf.get("assumptions") or []
                     if assumptions:
-                        bar_lines.append("Assumptions: " + " · ".join(assumptions[:4]))
+                        bar_lines.append("Assumptions: " + " · ".join(assumptions[:5]))
+                    fee_n = int(bwf.get("broker_fee_trades") or 0)
+                    n_tr = int(bwf.get("n_trades") or 0)
+                    if n_tr:
+                        bar_lines.append(
+                            f"Fee sources: {fee_n}/{n_tr} trades used broker invoice fields "
+                            f"(rest Est. profile)."
+                        )
+                    overall = bwf.get("overall") or {}
+                    if overall:
+                        bar_lines.insert(
+                            1,
+                            f"All bar trades: net≈ {format_currency(overall.get('net_after_fees') or 0)} · "
+                            f"fees {format_currency(overall.get('fee_est') or 0)} · "
+                            f"wins {overall.get('wins', 0)}/{n_tr}",
+                        )
                     syms = bwf.get("symbols") or []
                     if syms:
                         bar_lines.append(
@@ -6753,9 +6908,20 @@ class MarketAdvisorGUI(QMainWindow):
         self.offset_spin = QDoubleSpinBox()
         self.offset_spin.setRange(0.01, 5.0)
         self.offset_spin.setValue(self.settings.get("limit_offset_pct", 0.1))
+        self.offset_spin.setToolTip(
+            "Discretionary buy limit buffer (percent). RH & E*TRADE: limit at last×(1+buf). "
+            "Coinbase Advanced: GTC limit buy when buffer > 0 (else market). "
+            "Sells use the same buffer the other way."
+        )
         offset_box.addWidget(self.offset_spin)
         offset_box.addStretch()
         form_layout.addLayout(offset_box)
+        offset_hint = QLabel(
+            "Limit buys: RH · E*TRADE · Coinbase (GTC). Protective stop-limits remain sell-side only."
+        )
+        offset_hint.setWordWrap(True)
+        offset_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        form_layout.addWidget(offset_hint)
 
         profit_box = QHBoxLayout()
         profit_box.addWidget(QLabel("Daily Profit Target ($ [0 = Disabled]):"))
@@ -12011,7 +12177,11 @@ class MarketAdvisorGUI(QMainWindow):
             for entry in items:
                 row, ticker, shares, avg_cost, asset_type = entry[:5]
                 is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
-                is_penny = asset_type == "Penny Stock" or "mover" in str(asset_type).lower()
+                is_crypto_mover = "crypto mover" in str(asset_type).lower()
+                is_penny = (
+                    asset_type == "Penny Stock"
+                    or ("mover" in str(asset_type).lower() and not is_crypto)
+                )
                 if is_crypto:
                     broker = cycle
                     broker_id = cycle_id
@@ -12030,6 +12200,7 @@ class MarketAdvisorGUI(QMainWindow):
                         broker_id=broker_id,
                         live_price=price,
                         posture=self.settings.get("risk_posture", "balanced"),
+                        is_mover=is_crypto_mover,
                     )
                 else:
                     action = evaluate_opportunity(ticker, is_penny_stock=is_penny, broker_id=broker_id, live_price=price)
@@ -12529,7 +12700,46 @@ class MarketAdvisorGUI(QMainWindow):
         return _auto_cycle.unpack_scan_payload(payload)
 
     def _bg_scan_crypto(self):
-        return [{'symbol': c, 'type': 'Crypto'} for c in ["BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"]]
+        movers = []
+        # Coinbase Advanced: rank USD products by 24h % change
+        cb = self.brokers.get("Coinbase")
+        if cb and getattr(cb, "is_connected", False) and getattr(cb, "client", None):
+            try:
+                payload = cb._cb_payload(cb._cb_call(cb.client.get_products, product_type="SPOT", limit=250))
+                movers.extend(_auto_cycle.extract_coinbase_usd_movers(payload, limit=8))
+            except Exception:
+                pass
+        # Robinhood: top crypto movers when available
+        rh = self.brokers.get("Robinhood")
+        if rh and getattr(rh, "is_connected", False):
+            try:
+                import robin_stocks.robinhood as r
+                for item in (r.markets.get_top_100() or [])[:15]:
+                    sym = str(item.get("symbol") or item.get("ticker") or "").upper()
+                    # Equity list — skip; RH crypto movers API varies by version
+                    if not sym:
+                        continue
+                # Prefer dedicated crypto movers endpoint when present
+                fn = getattr(getattr(r, "crypto", None), "get_crypto_currency_pairs", None)
+                if callable(fn):
+                    for pair in (fn() or [])[:40]:
+                        if not isinstance(pair, dict):
+                            continue
+                        sym = str(pair.get("asset_currency", {}).get("code") or "").upper()
+                        if sym and sym not in _auto_cycle.DEFAULT_CRYPTO_TICKERS:
+                            movers.append(sym)
+            except Exception:
+                pass
+        universe = _auto_cycle.merge_crypto_scan_universe(
+            list(_auto_cycle.DEFAULT_CRYPTO_TICKERS),
+            movers,
+            max_movers=8,
+        )
+        for row in universe:
+            sym = str(row.get("symbol") or "").upper()
+            if sym:
+                KNOWN_CRYPTOS.add(sym)
+        return universe
 
     def _bg_scan_penny(self):
         discovered, seen = [], set()

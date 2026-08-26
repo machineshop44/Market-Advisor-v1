@@ -11,8 +11,8 @@ android {
         applicationId = "com.marketadvisor.companion"
         minSdk = 26
         targetSdk = 34
-        versionCode = 13
-        versionName = "1.33.2"
+        versionCode = 14
+        versionName = "1.34.0"
     }
 
     buildTypes {

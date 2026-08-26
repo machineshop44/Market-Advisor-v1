@@ -1681,13 +1681,20 @@ class CoinbaseAdapter(BaseBroker):
             "base_increment": 0.00000001,
             "base_min_size": 0.0,
             "quote_min_size": 1.0,
+            "quote_increment": 0.01,
         }
         if self.is_connected and self.client:
             try:
                 data = self._cb_payload(
                     self._cb_call(self.client.get_product, product_id=f"{clean}-USD")
                 )
-                for key in ("base_increment", "base_min_size", "quote_min_size", "min_market_funds"):
+                for key in (
+                    "base_increment",
+                    "base_min_size",
+                    "quote_min_size",
+                    "quote_increment",
+                    "min_market_funds",
+                ):
                     raw = data.get(key)
                     if raw is None:
                         continue
@@ -1750,19 +1757,46 @@ class CoinbaseAdapter(BaseBroker):
 
         try:
             client_order_id = str(int(time.time() * 1000))
-            res = self._cb_call(
-                self.client.market_order_buy,
-                client_order_id=client_order_id,
-                product_id=product_id,
-                quote_size=str(round(trade_dollars, 2)),
-            )
+            off = float(offset_pct or 0)
+            use_limit = off > 0 and float(price or 0) > 0
+            if use_limit:
+                limits = self._get_product_limits(clean)
+                base_inc = float(limits.get("base_increment", 0.00000001) or 0.00000001)
+                quote_inc = float(limits.get("quote_increment", 0.01) or 0.01)
+                limit_px = float(price) * (1.0 + off)
+                # Round limit to quote increment
+                d_q = Decimal(str(quote_inc))
+                limit_dec = (Decimal(str(limit_px)) / d_q).to_integral_value(
+                    rounding=ROUND_UP
+                ) * d_q
+                d_inc = Decimal(str(base_inc))
+                d_qty = Decimal(str(trade_dollars)) / limit_dec if limit_dec > 0 else Decimal("0")
+                base_qty = (d_qty / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
+                if base_qty <= 0:
+                    return "Fail: Quantity too small for limit buy", 0.0, None
+                res = self._cb_call(
+                    self.client.limit_order_gtc_buy,
+                    client_order_id=client_order_id,
+                    product_id=product_id,
+                    base_size=format(base_qty, "f"),
+                    limit_price=format(limit_dec, "f"),
+                    post_only=False,
+                )
+            else:
+                res = self._cb_call(
+                    self.client.market_order_buy,
+                    client_order_id=client_order_id,
+                    product_id=product_id,
+                    quote_size=str(round(trade_dollars, 2)),
+                )
             data = self._cb_payload(res)
 
             if data.get("success"):
                 oid = self._extract_order_id(data)
                 conf, state = self.confirm_order(oid, is_crypto=True) if oid else (False, "no_id")
                 tag = "Filled" if conf else f"Pending/{state}"
-                return f"Coinbase Buy {tag} ({trade_dollars:.2f})", trade_dollars, oid
+                kind = "limit" if use_limit else "market"
+                return f"Coinbase Buy {tag} ({kind} {trade_dollars:.2f})", trade_dollars, oid
             return f"Fail: {data.get('error_response', 'Unknown Error')}", 0.0, None
         except Exception as e:
             return f"Fail: {e}", 0.0, None

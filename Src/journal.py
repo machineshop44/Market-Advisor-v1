@@ -71,6 +71,36 @@ def read_since_days(days=7, limit=5000):
         return []
 
 
+def export_fills_csv(path, days=7, limit=8000):
+    """
+    Write fee-aware fill rows to CSV for tax/ops export.
+    Returns number of rows written (excluding header).
+    """
+    import csv
+    rows = read_since_days(days=days, limit=limit)
+    fields = [
+        "timestamp", "broker", "side", "ticker", "asset_type", "price", "qty",
+        "dollars", "status", "confirmed", "paper", "fee_est", "fee_paid",
+        "commission", "slippage_bps", "fee_profile", "order_id", "reason",
+    ]
+    written = 0
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            status = str(row.get("status") or "")
+            # Prefer confirmed fills; still include buys/sells that look like fills
+            side = str(row.get("side") or "").upper()
+            if side not in ("BUY", "SELL"):
+                continue
+            if any(x in status for x in ("Fail", "Skipped", "Reject")):
+                continue
+            out = {k: row.get(k, "") for k in fields}
+            w.writerow(out)
+            written += 1
+    return written
+
+
 def summarize_day(date_str=None):
     """Quick counts for today (or given YYYY-MM-DD)."""
     if date_str is None:

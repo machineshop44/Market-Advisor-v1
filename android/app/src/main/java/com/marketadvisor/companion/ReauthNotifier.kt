@@ -11,35 +11,94 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
+/**
+ * Edge-triggered desktop ops alerts: E*TRADE reauth, drawdown pause, and halt.
+ * Separate notify IDs so one clear does not dismiss the others.
+ */
 object ReauthNotifier {
-    private const val CHANNEL_ID = "ma_reauth"
-    private const val NOTIFY_ID = 3301
+    private const val CHANNEL_ID = "ma_ops_alerts"
     private const val PREF = "ma_companion"
-    private const val KEY_LAST = "last_reauth_needed"
+
+    private const val NOTIFY_REAUTH = 3301
+    private const val NOTIFY_DD = 3302
+    private const val NOTIFY_HALT = 3303
+
+    private const val KEY_LAST_REAUTH = "last_reauth_needed"
+    private const val KEY_LAST_DD = "last_dd_paused"
+    private const val KEY_LAST_HALT = "last_halted"
 
     fun ensureChannel(ctx: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val mgr = ctx.getSystemService(NotificationManager::class.java) ?: return
         val ch = NotificationChannel(
             CHANNEL_ID,
-            ctx.getString(R.string.reauth_channel_name),
+            ctx.getString(R.string.ops_alerts_channel_name),
             NotificationManager.IMPORTANCE_HIGH,
         )
         mgr.createNotificationChannel(ch)
+        // Legacy channel id from 1.33.x reauth-only notifier
+        mgr.deleteNotificationChannel("ma_reauth")
     }
 
     fun maybeNotify(ctx: Context, reauthNeeded: Boolean) {
+        edgeNotify(
+            ctx,
+            active = reauthNeeded,
+            key = KEY_LAST_REAUTH,
+            notifyId = NOTIFY_REAUTH,
+            titleRes = R.string.reauth_notify_title,
+            bodyRes = R.string.reauth_notify_body,
+        )
+    }
+
+    fun maybeNotifyDdPause(ctx: Context, ddPaused: Boolean) {
+        edgeNotify(
+            ctx,
+            active = ddPaused,
+            key = KEY_LAST_DD,
+            notifyId = NOTIFY_DD,
+            titleRes = R.string.dd_notify_title,
+            bodyRes = R.string.dd_notify_body,
+        )
+    }
+
+    fun maybeNotifyHalt(ctx: Context, halted: Boolean) {
+        edgeNotify(
+            ctx,
+            active = halted,
+            key = KEY_LAST_HALT,
+            notifyId = NOTIFY_HALT,
+            titleRes = R.string.halt_notify_title,
+            bodyRes = R.string.halt_notify_body,
+        )
+    }
+
+    /** Poll / status refresh: evaluate all edge alerts from one status snapshot. */
+    fun maybeNotifyFromStatus(ctx: Context, reauthNeeded: Boolean, ddPaused: Boolean, halted: Boolean) {
+        maybeNotify(ctx, reauthNeeded)
+        maybeNotifyDdPause(ctx, ddPaused)
+        maybeNotifyHalt(ctx, halted)
+    }
+
+    private fun edgeNotify(
+        ctx: Context,
+        active: Boolean,
+        key: String,
+        notifyId: Int,
+        titleRes: Int,
+        bodyRes: Int,
+    ) {
         ensureChannel(ctx)
         val prefs = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-        val wasNeeded = prefs.getBoolean(KEY_LAST, false)
-        prefs.edit().putBoolean(KEY_LAST, reauthNeeded).apply()
-        if (!reauthNeeded) {
-            if (wasNeeded) {
-                NotificationManagerCompat.from(ctx).cancel(NOTIFY_ID)
+        val wasActive = prefs.getBoolean(key, false)
+        prefs.edit().putBoolean(key, active).apply()
+        if (!active) {
+            if (wasActive) {
+                NotificationManagerCompat.from(ctx).cancel(notifyId)
             }
             return
         }
-        if (wasNeeded) return
+        if (wasActive) return
         if (Build.VERSION.SDK_INT >= 33) {
             val ok = ContextCompat.checkSelfPermission(
                 ctx,
@@ -52,24 +111,37 @@ object ReauthNotifier {
         }
         val pi = PendingIntent.getActivity(
             ctx,
-            0,
+            notifyId,
             open,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val note = NotificationCompat.Builder(ctx, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(ctx.getString(R.string.reauth_notify_title))
-            .setContentText(ctx.getString(R.string.reauth_notify_body))
+            .setContentTitle(ctx.getString(titleRes))
+            .setContentText(ctx.getString(bodyRes))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pi)
             .build()
-        NotificationManagerCompat.from(ctx).notify(NOTIFY_ID, note)
+        NotificationManagerCompat.from(ctx).notify(notifyId, note)
     }
 
     fun clear(ctx: Context) {
-        NotificationManagerCompat.from(ctx).cancel(NOTIFY_ID)
+        NotificationManagerCompat.from(ctx).cancel(NOTIFY_REAUTH)
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_LAST, false).apply()
+            .edit().putBoolean(KEY_LAST_REAUTH, false).apply()
+    }
+
+    fun clearAll(ctx: Context) {
+        val nm = NotificationManagerCompat.from(ctx)
+        nm.cancel(NOTIFY_REAUTH)
+        nm.cancel(NOTIFY_DD)
+        nm.cancel(NOTIFY_HALT)
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_LAST_REAUTH, false)
+            .putBoolean(KEY_LAST_DD, false)
+            .putBoolean(KEY_LAST_HALT, false)
+            .apply()
     }
 }

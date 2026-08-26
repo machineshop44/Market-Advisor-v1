@@ -36,7 +36,7 @@
     <string name="recent_trades_section">Recent Trades</string>
     <string name="queue_prefix">Queue:</string>
     <string name="pull_to_refresh">Pull down to refresh</string>
-    <string name="compat_note">Desktop 1.33.1+</string>
+    <string name="compat_note">Desktop 1.34.0+</string>
     <string name="reauth_etrade">Reauth E*TRADE</string>
     <string name="reauth_title">E*TRADE reauthorization</string>
     <string name="reauth_body">Open E*TRADE in the browser, approve access, then paste the verification code here.</string>
@@ -46,6 +46,11 @@
     <string name="reauth_notify_title">E*TRADE needs reauth</string>
     <string name="reauth_notify_body">Midnight token expired — open Market Advisor Companion to reauthorize.</string>
     <string name="reauth_channel_name">Broker reauth</string>
+    <string name="ops_alerts_channel_name">Desk alerts</string>
+    <string name="dd_notify_title">Drawdown pause</string>
+    <string name="dd_notify_body">Portfolio heat hit DD pause — open Companion to review risk.</string>
+    <string name="halt_notify_title">Trading halted</string>
+    <string name="halt_notify_body">Desktop halt is active — open Companion to review or resume.</string>
     <string name="share_apk">Share APK</string>
     <string name="share_apk_hint">Share this install via Nearby Share / Files / Drive so another phone can install the update.</string>
     <string name="stale_suffix"> · stale</string>

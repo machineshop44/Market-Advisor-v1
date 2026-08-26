@@ -507,7 +507,12 @@ class MainActivity : AppCompatActivity() {
                 binding.btnHaltAll.isEnabled = status.controlsEnabled
 
                 val etNeedReauth = status.brokers["E*TRADE"]?.reauthNeeded == true
-                ReauthNotifier.maybeNotify(this@MainActivity, etNeedReauth)
+                ReauthNotifier.maybeNotifyFromStatus(
+                    this@MainActivity,
+                    reauthNeeded = etNeedReauth,
+                    ddPaused = status.portfolioHeat.ddPaused,
+                    halted = status.halted,
+                )
 
                 syncingUi = true
                 for (row in brokerRows) {

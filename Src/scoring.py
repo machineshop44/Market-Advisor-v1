@@ -115,6 +115,7 @@ LOSS_STREAK_PAUSE_SEC = 45 * 60
 
 # Crypto entry bar: don't spray $5 tickets when edge ≪ ~2% RT
 CRYPTO_MIN_SCORE_FOR_ENTRY = 55.0
+CRYPTO_MOVER_MIN_SCORE_FOR_ENTRY = 62.0
 CRYPTO_THIN_MIN_SCORE = 70.0       # near broker floor needs stronger conviction
 CRYPTO_THIN_TICKET_MULT = 1.5      # ≤ 1.5× broker min = "thin"
 # BTC 1H ATR% above this → pause NEW crypto buys (all postures; no liquidate)
@@ -3294,7 +3295,9 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     return f"HOLD (ROI: {roi*100:.2f}%)"
 
 
-def evaluate_crypto_opportunity(ticker, broker_id="ROBINHOOD", live_price=None, posture="balanced"):
+def evaluate_crypto_opportunity(
+    ticker, broker_id="ROBINHOOD", live_price=None, posture="balanced", *, is_mover=False,
+):
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "DO NOT BUY (Awaiting Price)"
@@ -3320,20 +3323,83 @@ def evaluate_crypto_opportunity(ticker, broker_id="ROBINHOOD", live_price=None, 
     if rsi >= RSI_CEILING: return f"DO NOT BUY (RSI Overbought: {rsi:.1f})"
     if not has_volume: return "DO NOT BUY (Low Volume Fakeout)"
 
+    min_score = (
+        float(CRYPTO_MOVER_MIN_SCORE_FOR_ENTRY)
+        if is_mover
+        else float(CRYPTO_MIN_SCORE_FOR_ENTRY)
+    )
     if micro_bullish:
         # Hold bias: weak scores stay HOLD — prefer no-trade vs OW-fee churn
         try:
             sc = float(buy_rank_score(ticker, is_crypto=True))
         except Exception:
             sc = 0.0
-        if sc < float(CRYPTO_MIN_SCORE_FOR_ENTRY):
+        if sc < min_score:
             return (
                 f"DO NOT BUY (Hold bias: score {sc:.0f} < "
-                f"{CRYPTO_MIN_SCORE_FOR_ENTRY:.0f})"
+                f"{min_score:.0f})"
             )
-        return f"BUY (MTF Confirmed | RSI: {rsi:.1f} | Score: {sc:.0f})"
+        tag = "Mover " if is_mover else ""
+        return f"BUY ({tag}MTF Confirmed | RSI: {rsi:.1f} | Score: {sc:.0f})"
 
     return "DO NOT BUY (Consolidating)"
+
+
+def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live_price=None):
+    """
+    Research polish: transparent factors for the scanner signal card.
+    Best-effort — never raises; missing pieces become None/'—'.
+    """
+    clean = str(ticker or "").replace("-USD", "").upper()
+    out = {
+        "ticker": clean,
+        "price": None,
+        "macro_uptrend": None,
+        "micro_bullish": None,
+        "rsi": None,
+        "has_volume": None,
+        "score": None,
+        "regime_ok": None,
+        "regime_reason": "",
+        "fee_edge_pct": None,
+    }
+    try:
+        px = float(live_price) if live_price and live_price > 0 else fetch_current_price(clean)
+        out["price"] = px if px > 0 else None
+    except Exception:
+        pass
+    try:
+        ok, reason = market_regime_ok(is_crypto=bool(is_crypto) or uses_btc_regime(clean, False))
+        out["regime_ok"] = bool(ok)
+        out["regime_reason"] = str(reason or "")
+    except Exception:
+        pass
+    try:
+        _, macro_uptrend, _, _ = _get_trend_data(
+            clean, interval="60m", period="5d" if is_crypto else "1mo"
+        )
+        out["macro_uptrend"] = bool(macro_uptrend)
+    except Exception:
+        pass
+    try:
+        interval = "5m" if is_crypto else "15m"
+        period = "1d" if is_crypto else "5d"
+        micro_bullish, _, rsi, has_volume = _get_trend_data(clean, interval=interval, period=period)
+        out["micro_bullish"] = bool(micro_bullish)
+        out["rsi"] = float(rsi) if rsi is not None else None
+        out["has_volume"] = bool(has_volume)
+    except Exception:
+        pass
+    try:
+        out["score"] = float(buy_rank_score(clean, is_crypto=bool(is_crypto)))
+    except Exception:
+        pass
+    try:
+        sc = float(out.get("score") or 0)
+        out["fee_edge_pct"] = float(estimated_signal_edge_pct(sc, is_crypto=bool(is_crypto))) * 100.0
+    except Exception:
+        pass
+    return out
 
 
 def evaluate_opportunity(ticker, is_penny_stock=False, broker_id="ROBINHOOD", live_price=None):

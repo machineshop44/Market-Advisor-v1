@@ -983,6 +983,14 @@ def fetch_ohlcv_bars(
                 continue
             if c <= 0:
                 continue
+            if not is_crypto:
+                try:
+                    from market_calendar import is_equity_session_day
+                    d = ts.date() if hasattr(ts, "date") else None
+                    if d is not None and not is_equity_session_day(d):
+                        continue
+                except Exception:
+                    pass
             out.append({
                 "ts": ts,
                 "open": o if o > 0 else c,
@@ -1142,6 +1150,16 @@ def build_bar_candidates_from_journal(fill_rows: list[dict]) -> list[dict[str, A
                 take = min(remaining, float(lot["qty"]))
                 fee = _estimate_rt_fee(lot["row"], float(lot.get("notional") or 0) * (take / max(lot["qty"], 1e-12)))
                 fee_src = "broker" if _row_broker_fee_dollars(lot["row"]) is not None else "estimate"
+                stop_pct = DEFAULT_BAR_STOP_PCT
+                try:
+                    from scoring import get_stop_distance_pct
+                    stop_pct = abs(float(get_stop_distance_pct(
+                        lot["row"].get("broker") or broker,
+                        ticker=ticker,
+                        asset_type=lot["row"].get("asset_type") or "",
+                    ) or DEFAULT_BAR_STOP_PCT))
+                except Exception:
+                    stop_pct = DEFAULT_BAR_STOP_PCT
                 candidates.append({
                     "broker": broker,
                     "ticker": ticker,
@@ -1150,6 +1168,7 @@ def build_bar_candidates_from_journal(fill_rows: list[dict]) -> list[dict[str, A
                     "qty": take,
                     "fee_est": fee,
                     "fee_source": fee_src,
+                    "stop_pct": stop_pct,
                     "is_crypto": bool(lot.get("is_crypto")),
                     "source": "journal_pair",
                 })
@@ -1164,6 +1183,16 @@ def build_bar_candidates_from_journal(fill_rows: list[dict]) -> list[dict[str, A
                 continue
             fee = _estimate_rt_fee(lot["row"], float(lot.get("notional") or 0))
             fee_src = "broker" if _row_broker_fee_dollars(lot["row"]) is not None else "estimate"
+            stop_pct = DEFAULT_BAR_STOP_PCT
+            try:
+                from scoring import get_stop_distance_pct
+                stop_pct = abs(float(get_stop_distance_pct(
+                    lot["row"].get("broker") or broker,
+                    ticker=ticker,
+                    asset_type=lot["row"].get("asset_type") or "",
+                ) or DEFAULT_BAR_STOP_PCT))
+            except Exception:
+                stop_pct = DEFAULT_BAR_STOP_PCT
             candidates.append({
                 "broker": broker,
                 "ticker": ticker,
@@ -1172,6 +1201,7 @@ def build_bar_candidates_from_journal(fill_rows: list[dict]) -> list[dict[str, A
                 "qty": float(lot["qty"]),
                 "fee_est": fee,
                 "fee_source": fee_src,
+                "stop_pct": stop_pct,
                 "is_crypto": bool(lot.get("is_crypto")),
                 "source": "open_lot",
             })
@@ -1197,10 +1227,11 @@ def bar_walk_forward_replay(
     """
     assumptions = [
         "Entry = next bar open at/after journal BUY timestamp (not fill price).",
-        f"Exit = stop (−{stop_pct*100:.1f}% of entry) or journal SELL bar close or last bar.",
+        f"Exit = hard-stop (−{stop_pct*100:.1f}% of entry) or journal SELL bar close or last bar.",
         "Daily (or interval) Yahoo/yfinance bars — gaps, splits, and halts are not modeled.",
-        "Fees = broker fee_paid×2 when present, else fee_est×2 / profile RT.",
+        "Fees = broker fee_paid×2 when present, else fee_est×2 / profile RT (fee_source stamped).",
         "Multi-symbol: each ticker fetched independently; no portfolio heat / cash coupling.",
+        "Equity session days only when market_calendar filters bars (weekends/holidays skipped).",
         "Not QuantConnect: no partial fills, no shorting, no borrow.",
     ]
     n_folds = max(2, min(8, int(n_folds or 3)))
@@ -1249,7 +1280,7 @@ def bar_walk_forward_replay(
             cand["entry_ts"],
             cand["qty"],
             exit_ts=cand.get("exit_ts"),
-            stop_pct=stop_pct,
+            stop_pct=float(cand.get("stop_pct") or stop_pct),
             fee_dollars=float(cand.get("fee_est") or 0),
         )
         if sim is None:
@@ -1257,11 +1288,9 @@ def bar_walk_forward_replay(
         sim["ticker"] = ticker
         sim["broker"] = cand.get("broker")
         sim["source"] = cand.get("source")
+        sim["fee_source"] = cand.get("fee_source") or "estimate"
         if cand.get("fee_source") == "broker":
             broker_fee_n += 1
-            sim["fee_source"] = "broker"
-        else:
-            sim["fee_source"] = "estimate"
         trades.append(sim)
 
     symbols = sorted({str(t.get("ticker") or "") for t in trades if t.get("ticker")})
