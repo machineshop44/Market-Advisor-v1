@@ -1193,6 +1193,8 @@ class MarketAdvisorGUI(QMainWindow):
     _rh_sms_prompt = pyqtSignal(str)
     # Monitor HTTP thread → main: arm/disarm request object
     _monitor_control_req = pyqtSignal(object)
+    # Monitor HTTP thread → main: E*TRADE OAuth start/complete from companion
+    _monitor_etrade_oauth_req = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -1207,6 +1209,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._log_line_ready.connect(self._append_log_line_ui)
         self._rh_sms_prompt.connect(self._on_rh_sms_prompt)
         self._monitor_control_req.connect(self._on_monitor_control_req)
+        self._monitor_etrade_oauth_req.connect(self._on_monitor_etrade_oauth_req)
         self._rh_sms_event = threading.Event()
         self._rh_sms_code = ""
         self._rh_sms_dialog = None
@@ -2080,7 +2083,8 @@ class MarketAdvisorGUI(QMainWindow):
         broker_name = broker_name or self.cycle_broker_name
         by_b = getattr(self, "_last_locked_by_broker", None) or {}
         if broker_name in by_b:
-            return float(by_b.get(broker_name) or 0.0)
+            val, _cnt = _auto_cycle.locked_broker_entry(by_b.get(broker_name))
+            return val
         holdings = []
         for a in getattr(self, "_last_assets_snapshot", None) or []:
             if not isinstance(a, dict):
@@ -3459,6 +3463,7 @@ class MarketAdvisorGUI(QMainWindow):
         # Handlers must be set on the UI thread before the server thread accepts requests
         monitor.set_control_handler(self._monitor_control_from_http)
         monitor.set_halt_handler(self._monitor_halt_from_http)
+        monitor.set_etrade_oauth_handler(self._monitor_etrade_oauth_from_http)
 
         self._monitor_start_gen = getattr(self, "_monitor_start_gen", 0) + 1
         gen = self._monitor_start_gen
@@ -3804,7 +3809,11 @@ class MarketAdvisorGUI(QMainWindow):
                 req["result"] = {"ok": True, "broker": broker, "armed": True}
             else:
                 was_on = bool(self.auto_trade_enabled.get(broker))
-                self._disarm_broker(broker, notify_discord=was_on)
+                self._disarm_broker(
+                    broker,
+                    notify_discord=was_on,
+                    clear_arm_intent=(broker == "E*TRADE"),
+                )
                 self.publish_monitor_status()
                 self.log_event(f"[Companion] Auto-Trader DISARMED for {broker}")
                 req["result"] = {"ok": True, "broker": broker, "armed": False}
@@ -3814,6 +3823,127 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 pass
             self.log_event(f"[Companion] Control error: {e}")
+        finally:
+            try:
+                req["event"].set()
+            except Exception:
+                pass
+
+    def _monitor_etrade_oauth_from_http(self, action, verifier=""):
+        """Called on the monitor HTTP thread; blocks until the GUI handles it."""
+        req = {
+            "action": str(action or ""),
+            "verifier": str(verifier or "").strip(),
+            "event": threading.Event(),
+            "result": {"ok": False, "error": "timeout"},
+        }
+        self._monitor_etrade_oauth_req.emit(req)
+        if not req["event"].wait(timeout=20.0):
+            return {"ok": False, "error": "Timed out waiting for desktop app"}
+        return req.get("result") or {"ok": False, "error": "No result"}
+
+    def _companion_etrade_creds(self):
+        """Build E*TRADE creds from saved settings (no Settings dialog widgets required)."""
+        env = str(self.settings.get("etrade_environment", "sandbox") or "sandbox").lower()
+        if env not in ("live", "sandbox"):
+            env = "sandbox"
+        key = (self.settings.get("etrade_consumer_key") or "").strip()
+        if env == "live":
+            key = (self.settings.get("etrade_prod_consumer_key_pending") or key or "").strip()
+        secret = ""
+        try:
+            from etrade_broker import load_etrade_secret
+            secret = (load_etrade_secret("consumer_secret", env) or "").strip()
+        except Exception:
+            secret = ""
+        return {
+            "environment": env,
+            "consumer_key": key,
+            "consumer_secret": secret,
+            "live_trading_enabled": bool(self.settings.get("etrade_live_trading", False)),
+            "account_id_key": self.settings.get("etrade_account_id_key", ""),
+            "token_expires_at": self.settings.get("etrade_token_expires_at", 0),
+        }
+
+    def _on_monitor_etrade_oauth_req(self, req):
+        """Main-thread handler for companion E*TRADE OAuth start/complete."""
+        try:
+            if not bool(self.settings.get("monitor_controls_enabled", False)):
+                req["result"] = {"ok": False, "error": "Companion controls disabled"}
+                return
+            action = str((req or {}).get("action") or "").lower().strip()
+            et = self.brokers.get("E*TRADE")
+            if et is None:
+                req["result"] = {"ok": False, "error": "E*TRADE broker unavailable"}
+                return
+            creds = self._companion_etrade_creds()
+            if not creds.get("consumer_key") or not creds.get("consumer_secret"):
+                req["result"] = {
+                    "ok": False,
+                    "error": "E*TRADE keys missing on desktop — complete Setup once in Settings",
+                }
+                return
+            if action == "start":
+                creds["start_oauth"] = True
+                ok, msg = et.login(creds)
+                if ok and str(msg).startswith("AUTH_URL::"):
+                    url = str(msg).split("AUTH_URL::", 1)[1]
+                    self.log_event("[Companion] E*TRADE OAuth started — authorize URL issued")
+                    req["result"] = {"ok": True, "authorize_url": url}
+                else:
+                    req["result"] = {"ok": False, "error": str(msg or "Could not start OAuth")}
+                return
+            if action == "complete":
+                verifier = str((req or {}).get("verifier") or "").strip()
+                if not verifier:
+                    req["result"] = {"ok": False, "error": "Missing verification code"}
+                    return
+                creds["verifier"] = verifier
+                ok, msg = et.login(creds)
+                if not ok:
+                    if _is_manual_auth_failure(msg):
+                        self._broker_manual_auth_needed["E*TRADE"] = True
+                        self._update_autotrade_ui()
+                        self.publish_monitor_status()
+                    req["result"] = {"ok": False, "error": str(msg or "OAuth failed")}
+                    return
+                self._broker_manual_auth_needed["E*TRADE"] = False
+                if hasattr(self, "_reauth_nudge_sent"):
+                    self._reauth_nudge_sent["E*TRADE"] = False
+                    self._reauth_nudge_sent["E*TRADE_SOON"] = False
+                if hasattr(self, "_update_reauth_banner"):
+                    self._update_reauth_banner()
+                self.settings["etrade_environment"] = et.environment
+                self.settings["etrade_account_id_key"] = et.account_id_key or ""
+                self.settings["etrade_token_expires_at"] = float(et.token_expires_at or 0)
+                try:
+                    save_settings(self.settings)
+                except Exception:
+                    pass
+                self._set_broker_status(
+                    "E*TRADE", "🟢 Connected", "color: #00E676; font-weight: bold;"
+                )
+                self.log_event(
+                    f"[Companion] E*TRADE reauth complete ({et.environment}) "
+                    f"account={et.account_id_key}"
+                )
+                self.refresh_account_balances()
+                self._update_autotrade_ui()
+                self._maybe_restore_etrade_arm(source="companion_oauth")
+                self.publish_monitor_status()
+                req["result"] = {
+                    "ok": True,
+                    "armed": bool(self.auto_trade_enabled.get("E*TRADE")),
+                    "environment": str(et.environment or ""),
+                }
+                return
+            req["result"] = {"ok": False, "error": f"Unknown OAuth action: {action}"}
+        except Exception as e:
+            try:
+                req["result"] = {"ok": False, "error": str(e)}
+            except Exception:
+                pass
+            self.log_event(f"[Companion] E*TRADE OAuth error: {e}")
         finally:
             try:
                 req["event"].set()
@@ -3894,18 +4024,12 @@ class MarketAdvisorGUI(QMainWindow):
                 "cash": combined_cash,
                 "day_pnl": combined_pnl,
             }
-            locked_by = getattr(self, "_last_locked_by_broker", None) or {}
-            locked_capital = {"total": 0.0, "count": 0, "by_broker": {}}
-            for name in BROKER_NAMES:
-                summ = locked_by.get(name) or {}
-                val = float(summ.get("total_value") or 0.0)
-                cnt = int(summ.get("count") or 0)
-                if val <= 0 and cnt <= 0:
-                    holdings = (getattr(self, "_heat_holdings_by_broker", {}) or {}).get(name) or []
-                    val = float(_auto_cycle.locked_value_from_holdings(holdings))
-                locked_capital["by_broker"][name] = {"value": val, "count": cnt}
-                locked_capital["total"] += val
-                locked_capital["count"] += cnt
+            locked_capital = _auto_cycle.build_monitor_locked_capital(
+                getattr(self, "_last_locked_by_broker", None),
+                getattr(self, "_heat_holdings_by_broker", None),
+                BROKER_NAMES,
+                locked_summary=getattr(self, "_last_locked_summary", None),
+            )
             market = "Unknown"
             if hasattr(self, "market_status_lbl"):
                 txt = self.market_status_lbl.text() or ""
@@ -8900,7 +9024,7 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             summary = {"count": 0, "total_value": 0.0, "rows": []}
         self._last_locked_summary = summary
-        by_broker: dict[str, float] = {}
+        by_broker: dict[str, dict] = {}
         for row in summary.get("rows") or []:
             if not isinstance(row, dict):
                 continue
@@ -8908,11 +9032,14 @@ class MarketAdvisorGUI(QMainWindow):
             if not b:
                 continue
             try:
-                by_broker[b] = float(by_broker.get(b) or 0.0) + max(
-                    0.0, float(row.get("value") or 0.0)
-                )
+                row_val = max(0.0, float(row.get("value") or 0.0))
             except (TypeError, ValueError):
-                pass
+                row_val = 0.0
+            prev = by_broker.get(b) or {"value": 0.0, "count": 0}
+            by_broker[b] = {
+                "value": float(prev.get("value") or 0.0) + row_val,
+                "count": int(prev.get("count") or 0) + 1,
+            }
         self._last_locked_by_broker = by_broker
         n = int(summary.get("count") or 0)
         total = float(summary.get("total_value") or 0.0)
@@ -9320,18 +9447,10 @@ class MarketAdvisorGUI(QMainWindow):
         )
 
     def toggle_auto_trade(self):
-        """When OFF: open arm picker. When ON: confirm full-off or open manage picker."""
+        """Open per-broker arm picker (check to arm / uncheck to disarm, including re-arm)."""
         currently_on = [b for b, on in self.auto_trade_enabled.items() if on]
-        if currently_on:
-            dlg = AutoTraderOffDialog(self, currently_on, dark_mode=self.dark_mode)
-            if dlg.exec_() != QDialog.Accepted:
-                return
-            if dlg.choice == AutoTraderOffDialog.OFF_ALL:
-                self._disarm_all_engines(was=currently_on)
-                return
-            if dlg.choice != AutoTraderOffDialog.MANAGE:
-                return
-            # Fall through to checkbox picker (manage)
+        # Manage picker directly so a single disarmed broker can be re-armed without
+        # "Turn off all" first. Uncheck everyone + OK still disarms all.
         self._open_broker_arm_picker(currently_on)
 
     def _open_broker_arm_picker(self, currently_on=None):
@@ -11667,9 +11786,7 @@ class MarketAdvisorGUI(QMainWindow):
                 )
                 self._mark_frac_ext_ineligible(ticker, status)
                 st = str(status or "")
-                if "Fail" in st or (
-                    "Skipped" in st and ("dust" in st.lower() or "min" in st.lower() or "too small" in st.lower())
-                ):
+                if _auto_cycle.sell_status_should_backoff(st):
                     self._record_sell_fail_backoff(row_broker, ticker, st, notes)
                 elif "Fail" not in st and "Skipped" not in st:
                     self._clear_sell_fail_backoff(row_broker, ticker)
@@ -12169,7 +12286,6 @@ class MarketAdvisorGUI(QMainWindow):
             self.cycle_finished()
             return
 
-        sell_list = []
         for row, price, action, asset_type, err in results:
             if row >= len(assets):
                 continue
@@ -12177,21 +12293,36 @@ class MarketAdvisorGUI(QMainWindow):
             if not isinstance(a, dict):
                 continue
             ticker = a.get("ticker") or ""
-            if not ticker:
-                continue
-            self._patch_portfolio_row_action(broker, ticker, price, action)
-            if "SELL" in str(action).upper():
-                sell_list.append({
-                    'broker': broker,
-                    'ticker': ticker,
-                    'shares': float(a.get('shares') or 0),
-                    'price': float(price or 0),
-                    'avg_cost': float(a.get('cost') or 0),
-                    'type': a.get('type') or asset_type or '',
-                    'sell_all': True,
-                })
+            if ticker:
+                self._patch_portfolio_row_action(broker, ticker, price, action)
 
-        sell_n = len(sell_list)
+        sell_list = _auto_cycle.portfolio_sells_from_scored(assets, results, broker)
+        raw_sell_n = sum(
+            1 for _row, _px, act, _at, _e in results
+            if "SELL" in str(act or "").upper()
+        )
+        sell_list, locked_dropped = _auto_cycle.drop_locked_portfolio_sells(sell_list, assets)
+        if locked_dropped:
+            skip_key = f"{broker}:locked"
+            skip_store = getattr(self, "_port_locked_skip_logged", None)
+            if skip_store is None:
+                self._port_locked_skip_logged = {}
+                skip_store = self._port_locked_skip_logged
+            tick_sig = ",".join(sorted(set(locked_dropped)))
+            if skip_store.get(skip_key) != tick_sig:
+                skip_store[skip_key] = tick_sig
+                if sell_list:
+                    self.log_event(
+                        f"[AUTO] [{broker}] PORTFOLIO — skipped locked/untradeable: "
+                        f"{tick_sig.replace(',', ', ')}"
+                    )
+                else:
+                    self.log_event(
+                        f"[AUTO] [{broker}] PORTFOLIO — {raw_sell_n} sell signal(s) on "
+                        f"locked capital only ({tick_sig.replace(',', ', ')}); not executing"
+                    )
+
+        sell_n = len(sell_list) if sell_list else raw_sell_n
         session = self._sync_equity_session_state()
 
         def _note_defer(broker, tick, defer, label, notes_tmp):

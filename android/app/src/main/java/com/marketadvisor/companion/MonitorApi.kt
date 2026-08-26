@@ -67,10 +67,25 @@ object MonitorApi {
         val present: Boolean = false,
     )
 
+    data class BrokerBalance(
+        val equity: Double = 0.0,
+        val cash: Double = 0.0,
+        val dayPnl: Double = 0.0,
+    )
+
+    data class RecentTrade(
+        val timestamp: String = "",
+        val broker: String = "",
+        val side: String = "",
+        val ticker: String = "",
+        val status: String = "",
+    )
+
     data class LockedCapital(
         val total: Double = 0.0,
         val count: Int = 0,
         val byBroker: Map<String, Double> = emptyMap(),
+        val countByBroker: Map<String, Int> = emptyMap(),
         val present: Boolean = false,
     )
 
@@ -133,6 +148,11 @@ object MonitorApi {
         val walkForward: WalkForward = WalkForward(),
         val lockedCapital: LockedCapital = LockedCapital(),
         val halted: Boolean = false,
+        val brokerBalances: Map<String, BrokerBalance> = emptyMap(),
+        val recentTrades: List<RecentTrade> = emptyList(),
+        val recentLog: List<String> = emptyList(),
+        val queue: List<String> = emptyList(),
+        val updatedAt: String = "",
         val app: String = "",
         val version: String = "",
     )
@@ -365,6 +385,7 @@ object MonitorApi {
         val lockedObj = json.optJSONObject("locked_capital")
         val lockedCapital = if (lockedObj != null) {
             val byB = mutableMapOf<String, Double>()
+            val countByB = mutableMapOf<String, Int>()
             val byBrokerObj = lockedObj.optJSONObject("by_broker")
             if (byBrokerObj != null) {
                 val keys = byBrokerObj.keys()
@@ -372,13 +393,16 @@ object MonitorApi {
                     val k = keys.next()
                     val row = byBrokerObj.optJSONObject(k)
                     val v = row?.optDouble("value", 0.0) ?: byBrokerObj.optDouble(k, 0.0)
+                    val c = row?.optInt("count", 0) ?: 0
                     if (v > 0.001) byB[k] = v
+                    if (c > 0) countByB[k] = c
                 }
             }
             LockedCapital(
                 total = lockedObj.optDouble("total", 0.0),
                 count = lockedObj.optInt("count", 0),
                 byBroker = byB,
+                countByBroker = countByB,
                 present = true,
             )
         } else {
@@ -438,6 +462,55 @@ object MonitorApi {
             WalkForward()
         }
 
+        val brokerBalances = mutableMapOf<String, BrokerBalance>()
+        val balRoot = json.optJSONObject("balances")
+        if (balRoot != null) {
+            val balKeys = balRoot.keys()
+            while (balKeys.hasNext()) {
+                val k = balKeys.next()
+                if (k == "combined") continue
+                val o = balRoot.optJSONObject(k) ?: continue
+                brokerBalances[k] = BrokerBalance(
+                    equity = o.optDouble("equity", 0.0),
+                    cash = o.optDouble("cash", 0.0),
+                    dayPnl = o.optDouble("day_pnl", 0.0),
+                )
+            }
+        }
+
+        val recentTrades = mutableListOf<RecentTrade>()
+        val tradesArr = json.optJSONArray("recent_trades")
+        if (tradesArr != null) {
+            for (i in 0 until tradesArr.length()) {
+                val o = tradesArr.optJSONObject(i) ?: continue
+                recentTrades += RecentTrade(
+                    timestamp = o.optString("timestamp", ""),
+                    broker = o.optString("broker", ""),
+                    side = o.optString("side", ""),
+                    ticker = o.optString("ticker", ""),
+                    status = o.optString("status", ""),
+                )
+            }
+        }
+
+        val recentLog = mutableListOf<String>()
+        val logArr = json.optJSONArray("recent_log")
+        if (logArr != null) {
+            for (i in 0 until logArr.length()) {
+                val line = logArr.optString(i, "").trim()
+                if (line.isNotBlank()) recentLog += line
+            }
+        }
+
+        val queue = mutableListOf<String>()
+        val queueArr = json.optJSONArray("queue")
+        if (queueArr != null) {
+            for (i in 0 until queueArr.length()) {
+                val q = queueArr.optString(i, "").trim()
+                if (q.isNotBlank()) queue += q
+            }
+        }
+
         return Status(
             controlsEnabled = json.optBoolean("controls_enabled", false),
             autoTrader = autos,
@@ -459,6 +532,11 @@ object MonitorApi {
             walkForward = walkForward,
             lockedCapital = lockedCapital,
             halted = json.optBoolean("halted", false),
+            brokerBalances = brokerBalances,
+            recentTrades = recentTrades,
+            recentLog = recentLog,
+            queue = queue,
+            updatedAt = json.optString("updated_at", ""),
             app = json.optString("app", ""),
             version = json.optString("version", ""),
         )
@@ -527,6 +605,72 @@ object MonitorApi {
         } catch (_: Exception) {
             val (msg, lockout) = parseErrorMessage(text, code)
             AutoResult(ok = code in 200..299, error = msg, lockoutSeconds = lockout)
+        }
+    }
+
+    data class OAuthStartResult(
+        val ok: Boolean,
+        val authorizeUrl: String? = null,
+        val error: String? = null,
+    )
+
+    data class OAuthCompleteResult(
+        val ok: Boolean,
+        val armed: Boolean = false,
+        val error: String? = null,
+    )
+
+    fun etradeOauthStart(
+        baseUrl: String,
+        user: String,
+        pass: String,
+        pinFp: String,
+    ): OAuthStartResult {
+        val conn = open("${baseUrl.trimEnd('/')}/api/etrade/oauth/start", user, pass, "POST", pinFp)
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write("{}") }
+        val code = conn.responseCode
+        val text = readBody(conn, code)
+        return try {
+            val json = JSONObject(text.ifBlank { "{}" })
+            OAuthStartResult(
+                ok = json.optBoolean("ok", code in 200..299),
+                authorizeUrl = json.optString("authorize_url", "").takeIf { it.isNotBlank() },
+                error = json.optString("error", "").takeIf { it.isNotBlank() }
+                    ?: if (code !in 200..299) parseErrorMessage(text, code).first else null,
+            )
+        } catch (_: Exception) {
+            val (msg, _) = parseErrorMessage(text, code)
+            OAuthStartResult(ok = false, error = msg)
+        }
+    }
+
+    fun etradeOauthComplete(
+        baseUrl: String,
+        user: String,
+        pass: String,
+        pinFp: String,
+        verifier: String,
+    ): OAuthCompleteResult {
+        val conn = open("${baseUrl.trimEnd('/')}/api/etrade/oauth/complete", user, pass, "POST", pinFp)
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        val body = JSONObject().put("verifier", verifier).toString()
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body) }
+        val code = conn.responseCode
+        val text = readBody(conn, code)
+        return try {
+            val json = JSONObject(text.ifBlank { "{}" })
+            OAuthCompleteResult(
+                ok = json.optBoolean("ok", code in 200..299),
+                armed = json.optBoolean("armed", false),
+                error = json.optString("error", "").takeIf { it.isNotBlank() }
+                    ?: if (code !in 200..299) parseErrorMessage(text, code).first else null,
+            )
+        } catch (_: Exception) {
+            val (msg, _) = parseErrorMessage(text, code)
+            OAuthCompleteResult(ok = false, error = msg)
         }
     }
 }

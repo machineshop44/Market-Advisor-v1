@@ -309,6 +309,38 @@ class TestCycleBookExtract(unittest.TestCase):
         self.assertIn("Locked", label)
         self.assertIn("Open risk", label)
 
+    def test_wave3_portfolio_monitor_helpers(self):
+        self.assertTrue(
+            ac.sell_status_should_backoff(
+                "Skipped: RH cannot trade GOEVQ via API (OTC/delisted)"
+            )
+        )
+        self.assertFalse(ac.sell_status_should_backoff("Filled"))
+        locked = ac.build_monitor_locked_capital(
+            {"Robinhood": 12.5},
+            {},
+            ("Robinhood", "Coinbase"),
+        )
+        self.assertAlmostEqual(locked["by_broker"]["Robinhood"]["value"], 12.5)
+        self.assertAlmostEqual(locked["total"], 12.5)
+        locked2 = ac.build_monitor_locked_capital(
+            {"Robinhood": {"value": 3.0, "count": 1}},
+            {},
+            ("Robinhood",),
+        )
+        self.assertEqual(locked2["by_broker"]["Robinhood"]["count"], 1)
+        assets = [{"ticker": "GOEVQ", "shares": 1, "cost": 1.49, "type": "stock"}]
+        results = [(0, 0.01, "SELL (TTP)", "stock", None)]
+        sells = ac.portfolio_sells_from_scored(assets, results, "Robinhood")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["ticker"], "GOEVQ")
+        filtered, dropped = ac.drop_locked_portfolio_sells(
+            sells,
+            [{"broker": "Robinhood", "ticker": "GOEVQ", "shares": 1, "price": 0.01}],
+        )
+        self.assertEqual(filtered, [])
+        self.assertIn("GOEVQ", dropped)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,6 +62,7 @@ _auth_required = False
 _controls_enabled = False
 _control_handler = None
 _halt_handler = None
+_etrade_oauth_handler = None
 _server = None
 _thread = None
 _tls_enabled = False
@@ -111,6 +112,16 @@ def set_halt_handler(handler):
     """Register GUI callback for Panic Halt All: handler() -> {"ok": bool, ...}."""
     global _halt_handler
     _halt_handler = handler
+
+
+def set_etrade_oauth_handler(handler):
+    """
+    Register GUI callback for companion E*TRADE OAuth.
+    handler(action, verifier=None) -> dict
+      action: "start" | "complete"
+    """
+    global _etrade_oauth_handler
+    _etrade_oauth_handler = handler
 
 
 def configure_controls(enabled: bool):
@@ -662,7 +673,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/api/auto", "/api/halt"):
+        if path not in (
+            "/api/auto",
+            "/api/halt",
+            "/api/etrade/oauth/start",
+            "/api/etrade/oauth/complete",
+        ):
             self.send_response(404)
             self.end_headers()
             return
@@ -689,6 +705,30 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 result = handler()
+            except Exception as e:
+                self._json_response(500, {"ok": False, "error": str(e)})
+                return
+            if not isinstance(result, dict):
+                result = {"ok": bool(result)}
+            code = 200 if result.get("ok") else 400
+            self._json_response(code, result)
+            return
+
+        if path in ("/api/etrade/oauth/start", "/api/etrade/oauth/complete"):
+            handler = _etrade_oauth_handler
+            if handler is None:
+                self._json_response(503, {"ok": False, "error": "E*TRADE OAuth handler not ready"})
+                return
+            data = self._read_json_body()
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                self._json_response(400, {"ok": False, "error": "Expected JSON body"})
+                return
+            action = "start" if path.endswith("/start") else "complete"
+            verifier = str(data.get("verifier") or "").strip()
+            try:
+                result = handler(action, verifier)
             except Exception as e:
                 self._json_response(500, {"ok": False, "error": str(e)})
                 return

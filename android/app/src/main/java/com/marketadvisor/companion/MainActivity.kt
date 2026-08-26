@@ -1,20 +1,16 @@
 package com.marketadvisor.companion
 
-import android.annotation.SuppressLint
+import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.net.http.SslError
+import android.os.Build
 import android.os.Bundle
 import android.view.View
-import android.webkit.HttpAuthHandler
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -36,7 +32,10 @@ class MainActivity : AppCompatActivity() {
     private var pollJob: Job? = null
     private var refreshJob: Job? = null
     private var syncingUi = false
-    private var lastStatusOk = false
+    /** Bumped on local arm/disarm/halt so stale in-flight polls cannot paint old ON state. */
+    private var statusEpoch = 0L
+    /** Broker whose confirm dialog is open — poll must not overwrite that switch mid-tap. */
+    private var dialogBroker: String? = null
     private val moneyFmt: NumberFormat = NumberFormat.getCurrencyInstance(Locale.US)
 
     private data class BrokerRow(
@@ -46,11 +45,24 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var brokerRows: List<BrokerRow>
 
-    @SuppressLint("SetJavaScriptEnabled")
+    private val notifyPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* optional — background poll still works without toast spam */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        ReauthNotifier.ensureChannel(this)
+        if (Build.VERSION.SDK_INT >= 33) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
 
         val versionName = try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: "—"
@@ -71,47 +83,8 @@ class MainActivity : AppCompatActivity() {
                 if (syncingUi) return@setOnCheckedChangeListener
                 confirmAuto(row.name, checked, row.binding.brokerSwitch)
             }
-        }
-
-        binding.webView.settings.javaScriptEnabled = true
-        binding.webView.settings.domStorageEnabled = true
-        // Tablet readability: monitor WebView was tiny after metrics/controls stacked above.
-        binding.webView.settings.textZoom = 140
-        binding.webView.settings.loadWithOverviewMode = true
-        binding.webView.settings.useWideViewPort = true
-        binding.webView.webChromeClient = WebChromeClient()
-        binding.webView.webViewClient = object : WebViewClient() {
-            override fun onReceivedHttpAuthRequest(
-                view: WebView?,
-                handler: HttpAuthHandler?,
-                host: String?,
-                realm: String?,
-            ) {
-                handler?.proceed(Prefs.username(this@MainActivity), Prefs.password(this@MainActivity))
-            }
-
-            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                val pin = Prefs.fingerprint(this@MainActivity)
-                val got = TlsPin.fingerprintFromSslCertificate(error?.certificate)
-                if (pin.isNotBlank() && got != null && TlsPin.matches(pin, got)) {
-                    handler?.proceed()
-                } else {
-                    handler?.cancel()
-                    val msg = if (pin.isBlank()) {
-                        getString(R.string.tls_pin_required)
-                    } else {
-                        getString(R.string.tls_pin_mismatch)
-                    }
-                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
-                }
-            }
-
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                return false
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                binding.swipe.isRefreshing = false
+            row.binding.btnReauth.setOnClickListener {
+                if (row.name == "E*TRADE") startEtradeReauth()
             }
         }
 
@@ -123,23 +96,16 @@ class MainActivity : AppCompatActivity() {
         binding.btnScanSetupQr.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
-        binding.btnOpenMonitor.setOnClickListener { loadMonitor() }
-        binding.swipe.setOnRefreshListener {
-            loadMonitor()
-            refreshStatus()
-        }
+        binding.swipe.setOnRefreshListener { refreshStatus(force = true) }
 
         updateSetupOverlay()
-        if (!needsSetup()) {
-            loadMonitor()
-        }
     }
 
     override fun onResume() {
         super.onResume()
         updateSetupOverlay()
         if (!needsSetup()) {
-            loadMonitor()
+            ReauthPollWorker.schedule(this)
             startPolling()
         } else {
             pollJob?.cancel()
@@ -170,13 +136,6 @@ class MainActivity : AppCompatActivity() {
         binding.setupOverlay.visibility = if (show) View.VISIBLE else View.GONE
     }
 
-    private fun loadMonitor() {
-        if (needsSetup()) return
-        val url = Prefs.baseUrl(this)
-        binding.swipe.isRefreshing = true
-        binding.webView.loadUrl(url)
-    }
-
     private fun startPolling() {
         pollJob?.cancel()
         pollJob = lifecycleScope.launch {
@@ -194,6 +153,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun money(n: Double): String = moneyFmt.format(n)
+
+    private fun pnlColor(n: Double): Int = ContextCompat.getColor(
+        this,
+        when {
+            n > 0.001 -> R.color.ok
+            n < -0.001 -> R.color.danger
+            else -> R.color.text
+        },
+    )
 
     private fun setPill(view: TextView, armed: Boolean) {
         view.text = if (armed) "ON" else "OFF"
@@ -221,10 +189,19 @@ class MainActivity : AppCompatActivity() {
         stamp(binding.metricShadow)
         stamp(binding.policyLine)
         stamp(binding.walkForwardLine)
+        stamp(binding.recentTradesLine)
+        stamp(binding.activityLogLine)
     }
 
-    private fun brokerSubtitle(name: String, info: MonitorApi.BrokerInfo?, etrade: MonitorApi.EtradeInfo): String {
-        return brokerSubtitle(name, info, etrade, MonitorApi.LockedCapital())
+    private fun brokerBalanceLine(bal: MonitorApi.BrokerBalance?): String {
+        if (bal == null) return ""
+        return String.format(
+            Locale.US,
+            "%s equity · %s cash · %s day",
+            money(bal.equity),
+            money(bal.cash),
+            money(bal.dayPnl),
+        )
     }
 
     private fun brokerSubtitle(
@@ -241,10 +218,27 @@ class MainActivity : AppCompatActivity() {
                 info.connected -> "Connected"
                 else -> "Disconnected"
             }
-            if (info.ddPause) bits += "DD pause"
+            if (info.ddPause) {
+                val ddBit = if (info.ddReason.isNotBlank()) {
+                    val short = if (info.ddReason.length > 28) {
+                        info.ddReason.take(25) + "…"
+                    } else {
+                        info.ddReason
+                    }
+                    "DD pause · $short"
+                } else {
+                    "DD pause"
+                }
+                bits += ddBit
+            }
             val lk = locked.byBroker[name]
+            val lkCnt = locked.countByBroker[name]
             if (lk != null && lk > 0.01) {
-                bits += String.format(Locale.US, "locked $%,.0f", lk)
+                bits += if (lkCnt != null && lkCnt > 0) {
+                    String.format(Locale.US, "locked $%,.0f (%d)", lk, lkCnt)
+                } else {
+                    String.format(Locale.US, "locked $%,.0f", lk)
+                }
             }
             if (!info.liveTrading) bits += "live trading off"
             info.buyingPower?.let { bp ->
@@ -288,10 +282,35 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    /** Coalesced: one in-flight refresh; overlaps are skipped. */
-    private fun refreshStatus() {
-        if (refreshJob?.isActive == true) return
+    private fun formatRecentTrades(trades: List<MonitorApi.RecentTrade>): String {
+        if (trades.isEmpty()) return "No recent trades"
+        return trades.takeLast(8).joinToString("\n") { t ->
+            val ts = t.timestamp.takeLast(8).ifBlank { "—" }
+            val side = t.side.ifBlank { "?" }
+            val tick = t.ticker.ifBlank { "?" }
+            val st = t.status.ifBlank { "—" }
+            "$ts  ${t.broker}  $side $tick  $st"
+        }
+    }
+
+    private fun formatActivityLog(lines: List<String>): String {
+        if (lines.isEmpty()) return "Waiting for desktop activity…"
+        return lines.takeLast(18).joinToString("\n")
+    }
+
+    /**
+     * Fetch monitor status. [force] cancels an in-flight poll and always starts a new one
+     * (needed after arm/disarm/halt so stale ON state cannot win the race).
+     */
+    private fun refreshStatus(force: Boolean = false) {
+        if (!force && refreshJob?.isActive == true) return
+        val prior = refreshJob
+        val launchEpoch = statusEpoch
         refreshJob = lifecycleScope.launch {
+            if (force && prior != null && prior.isActive) {
+                prior.cancel()
+                runCatching { prior.join() }
+            }
             val url = Prefs.baseUrl(this@MainActivity)
             val user = Prefs.username(this@MainActivity)
             val pass = Prefs.password(this@MainActivity)
@@ -300,26 +319,19 @@ class MainActivity : AppCompatActivity() {
                 val status = withContext(Dispatchers.IO) {
                     MonitorApi.fetchStatus(url, user, pass, pin)
                 }
-                lastStatusOk = true
+                // Stale: a newer local control happened while this request was in flight.
+                if (launchEpoch != statusEpoch) return@launch
                 val tlsBit = if (status.tls) "HTTPS" else "HTTP"
                 val controlsBit = if (status.controlsEnabled) "controls on" else "read-only"
                 val haltBit = if (status.halted) " · HALTED" else ""
+                val updatedBit = if (status.updatedAt.isNotBlank()) " · ${status.updatedAt}" else ""
                 binding.statusLine.text =
-                    "$tlsBit · ${status.mode.ifBlank { "—" }} · ${status.market.ifBlank { "—" }} · $controlsBit$haltBit"
+                    "$tlsBit · ${status.mode.ifBlank { "—" }} · ${status.market.ifBlank { "—" }} · $controlsBit$haltBit$updatedBit"
                 binding.bannerLine.text = status.banner.ifBlank { "Waiting for desktop…" }
                 binding.metricEquity.text = money(status.combinedEquity)
                 binding.metricCash.text = money(status.combinedCash)
                 binding.metricPnl.text = money(status.combinedPnl)
-                binding.metricPnl.setTextColor(
-                    ContextCompat.getColor(
-                        this@MainActivity,
-                        when {
-                            status.combinedPnl > 0.001 -> R.color.ok
-                            status.combinedPnl < -0.001 -> R.color.danger
-                            else -> R.color.text
-                        },
-                    ),
-                )
+                binding.metricPnl.setTextColor(pnlColor(status.combinedPnl))
 
                 val ph = status.protectiveHealth
                 val stopParts = mutableListOf<String>()
@@ -378,7 +390,12 @@ class MainActivity : AppCompatActivity() {
                     }
                     val locked = status.lockedCapital
                     if (locked.present && locked.total > 0.01) {
-                        riskBits += String.format(Locale.US, "locked $%,.0f", locked.total)
+                        val lockedTxt = if (locked.count > 0) {
+                            String.format(Locale.US, "locked $%,.0f (%d)", locked.total, locked.count)
+                        } else {
+                            String.format(Locale.US, "locked $%,.0f", locked.total)
+                        }
+                        riskBits += lockedTxt
                     }
                     if (status.halted) riskBits += "HALTED"
                     binding.metricRisk.text = riskBits.joinToString(" · ")
@@ -469,6 +486,17 @@ class MainActivity : AppCompatActivity() {
                     binding.walkForwardLine.text = "—"
                 }
 
+                if (status.queue.isNotEmpty()) {
+                    binding.queueLine.visibility = View.VISIBLE
+                    binding.queueLine.text = getString(R.string.queue_prefix) + " " +
+                        status.queue.take(6).joinToString(" · ")
+                } else {
+                    binding.queueLine.visibility = View.GONE
+                }
+
+                binding.recentTradesLine.text = formatRecentTrades(status.recentTrades)
+                binding.activityLogLine.text = formatActivityLog(status.recentLog)
+
                 binding.controlsHint.setText(
                     if (status.controlsEnabled) {
                         R.string.controls_hint
@@ -478,18 +506,40 @@ class MainActivity : AppCompatActivity() {
                 )
                 binding.btnHaltAll.isEnabled = status.controlsEnabled
 
+                val etNeedReauth = status.brokers["E*TRADE"]?.reauthNeeded == true
+                ReauthNotifier.maybeNotify(this@MainActivity, etNeedReauth)
+
                 syncingUi = true
                 for (row in brokerRows) {
                     val info = status.brokers[row.name]
                     val armed = info?.armed ?: (status.autoTrader[row.name] == true)
-                    // Controls off → disabled. Controls on → disable if reauth or disconnected.
                     val switchEnabled = status.controlsEnabled &&
                         (info == null || (!info.reauthNeeded && info.connected))
                     row.binding.brokerSwitch.isEnabled = switchEnabled
-                    if (row.binding.brokerSwitch.isChecked != armed) {
-                        row.binding.brokerSwitch.isChecked = armed
+                    // Don't yank the switch while the user is confirming arm/disarm.
+                    if (dialogBroker != row.name) {
+                        if (row.binding.brokerSwitch.isChecked != armed) {
+                            row.binding.brokerSwitch.isChecked = armed
+                        }
+                        setPill(row.binding.brokerPill, armed)
                     }
-                    setPill(row.binding.brokerPill, armed)
+
+                    val showReauth = row.name == "E*TRADE" &&
+                        status.controlsEnabled &&
+                        (info?.reauthNeeded == true)
+                    row.binding.btnReauth.visibility = if (showReauth) View.VISIBLE else View.GONE
+
+                    val balLine = brokerBalanceLine(status.brokerBalances[row.name])
+                    if (balLine.isNotBlank()) {
+                        row.binding.brokerBalance.visibility = View.VISIBLE
+                        row.binding.brokerBalance.text = balLine
+                        row.binding.brokerBalance.setTextColor(
+                            ContextCompat.getColor(this@MainActivity, R.color.text),
+                        )
+                    } else {
+                        row.binding.brokerBalance.visibility = View.GONE
+                    }
+
                     val detail = brokerSubtitle(row.name, info, status.etrade, status.lockedCapital)
                     if (detail.isNotBlank()) {
                         row.binding.brokerDetail.visibility = View.VISIBLE
@@ -500,7 +550,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 syncingUi = false
             } catch (e: Exception) {
-                lastStatusOk = false
+                if (launchEpoch != statusEpoch) return@launch
                 val detail = when (e) {
                     is MonitorApiException -> {
                         val lock = e.lockoutSeconds
@@ -513,7 +563,7 @@ class MainActivity : AppCompatActivity() {
                     else -> e.message ?: e.javaClass.simpleName
                 }
                 binding.statusLine.text = "Offline / stale: $detail"
-                binding.bannerLine.text = "Monitor offline or app not publishing yet"
+                binding.bannerLine.text = "Desktop offline or not publishing yet"
                 binding.controlsHint.setText(R.string.controls_hint_offline)
                 markMetricsStale()
                 syncingUi = true
@@ -528,6 +578,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Paint switches/pills immediately after a successful control (before next poll). */
+    private fun applyArmedOptimistic(armedByBroker: Map<String, Boolean>) {
+        statusEpoch += 1
+        syncingUi = true
+        for (row in brokerRows) {
+            val armed = armedByBroker[row.name] ?: continue
+            if (row.binding.brokerSwitch.isChecked != armed) {
+                row.binding.brokerSwitch.isChecked = armed
+            }
+            setPill(row.binding.brokerPill, armed)
+        }
+        syncingUi = false
+    }
+
     private fun confirmHaltAll() {
         AlertDialog.Builder(this)
             .setTitle(R.string.halt_all)
@@ -535,6 +599,80 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(android.R.string.ok) { _, _ -> postHaltAll() }
             .show()
+    }
+
+    private fun startEtradeReauth() {
+        lifecycleScope.launch {
+            val url = Prefs.baseUrl(this@MainActivity)
+            val user = Prefs.username(this@MainActivity)
+            val pass = Prefs.password(this@MainActivity)
+            val pin = Prefs.fingerprint(this@MainActivity)
+            val start = withContext(Dispatchers.IO) {
+                runCatching { MonitorApi.etradeOauthStart(url, user, pass, pin) }
+                    .getOrElse { MonitorApi.OAuthStartResult(false, error = it.message) }
+            }
+            if (!start.ok || start.authorizeUrl.isNullOrBlank()) {
+                Toast.makeText(
+                    this@MainActivity,
+                    start.error ?: "Could not start E*TRADE OAuth",
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@launch
+            }
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(start.authorizeUrl)))
+            } catch (_: Exception) {
+                Toast.makeText(this@MainActivity, "No browser available", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            val input = EditText(this@MainActivity).apply {
+                hint = getString(R.string.reauth_paste_code)
+                setSingleLine()
+            }
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle(R.string.reauth_title)
+                .setMessage(R.string.reauth_body)
+                .setView(input)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.reauth_complete) { _, _ ->
+                    val code = input.text?.toString()?.trim().orEmpty()
+                    if (code.isBlank()) {
+                        Toast.makeText(this@MainActivity, "Enter the verification code", Toast.LENGTH_SHORT).show()
+                        return@setPositiveButton
+                    }
+                    completeEtradeReauth(code)
+                }
+                .show()
+        }
+    }
+
+    private fun completeEtradeReauth(verifier: String) {
+        lifecycleScope.launch {
+            val url = Prefs.baseUrl(this@MainActivity)
+            val user = Prefs.username(this@MainActivity)
+            val pass = Prefs.password(this@MainActivity)
+            val pin = Prefs.fingerprint(this@MainActivity)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { MonitorApi.etradeOauthComplete(url, user, pass, pin, verifier) }
+                    .getOrElse { MonitorApi.OAuthCompleteResult(false, error = it.message) }
+            }
+            if (result.ok) {
+                ReauthNotifier.clear(this@MainActivity)
+                val note = if (result.armed) {
+                    "E*TRADE reauthed and re-armed"
+                } else {
+                    "E*TRADE reauthed (arm from companion if needed)"
+                }
+                Toast.makeText(this@MainActivity, note, Toast.LENGTH_LONG).show()
+                refreshStatus(force = true)
+            } else {
+                Toast.makeText(
+                    this@MainActivity,
+                    result.error ?: "Reauth failed",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
     }
 
     private fun postHaltAll() {
@@ -548,30 +686,35 @@ class MainActivity : AppCompatActivity() {
                     .getOrElse { MonitorApi.AutoResult(false, it.message) }
             }
             if (result.ok) {
+                applyArmedOptimistic(brokerRows.associate { it.name to false })
                 Toast.makeText(this@MainActivity, "Halted all brokers", Toast.LENGTH_SHORT).show()
-                refreshStatus()
+                refreshStatus(force = true)
             } else {
                 Toast.makeText(
                     this@MainActivity,
                     result.error ?: "Halt failed",
                     Toast.LENGTH_LONG,
                 ).show()
+                refreshStatus(force = true)
             }
         }
     }
 
     private fun confirmAuto(broker: String, armed: Boolean, switch: SwitchMaterial) {
+        dialogBroker = broker
         val msg = getString(if (armed) R.string.confirm_arm else R.string.confirm_disarm, broker)
         AlertDialog.Builder(this)
             .setTitle(if (armed) R.string.arm else R.string.disarm)
             .setMessage(msg)
             .setNegativeButton(android.R.string.cancel) { _, _ ->
+                dialogBroker = null
                 syncingUi = true
                 switch.isChecked = !armed
                 syncingUi = false
             }
             .setPositiveButton(android.R.string.ok) { _, _ -> postAuto(broker, armed) }
             .setOnCancelListener {
+                dialogBroker = null
                 syncingUi = true
                 switch.isChecked = !armed
                 syncingUi = false
@@ -589,21 +732,22 @@ class MainActivity : AppCompatActivity() {
                 runCatching { MonitorApi.setArmed(url, user, pass, pin, broker, armed) }
                     .getOrElse { MonitorApi.AutoResult(false, it.message) }
             }
+            dialogBroker = null
             if (result.ok) {
+                applyArmedOptimistic(mapOf(broker to armed))
                 Toast.makeText(
                     this@MainActivity,
                     if (armed) "Armed $broker" else "Disarmed $broker",
                     Toast.LENGTH_SHORT,
                 ).show()
-                refreshStatus()
-                loadMonitor()
+                refreshStatus(force = true)
             } else {
                 val err = buildString {
                     append(result.error ?: "Request failed")
                     result.lockoutSeconds?.takeIf { it > 0 }?.let { append(" (lockout ${it}s)") }
                 }
                 Toast.makeText(this@MainActivity, err, Toast.LENGTH_LONG).show()
-                refreshStatus()
+                refreshStatus(force = true)
             }
         }
     }

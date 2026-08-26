@@ -941,3 +941,129 @@ def etrade_bp_label(bp: float, *, environment: str, min_trade_dollars: float = 5
             "and that the selected account can trade. Stops remain N/A (TTP only).",
         )
     return (f"Buying Power: {money}", "")
+
+
+# --- Portfolio cycle + monitor payload (gui.py extract wave 3) ---
+
+
+def sell_status_should_backoff(status: str) -> bool:
+    """
+    True when a sell result should enter fail-backoff (suppress repeat attempts).
+    Covers dust/min skips and OTC/delisted API blocks — not transient deferrals.
+    """
+    st = str(status or "")
+    if "Fail" in st:
+        return True
+    if "Skipped" not in st:
+        return False
+    low = st.lower()
+    if any(k in low for k in ("dust", "min", "too small", "otc", "delisted", "cannot trade", "no tradeable")):
+        return True
+    return False
+
+
+def locked_broker_entry(raw) -> tuple[float, int]:
+    """Normalize locked-by-broker cache values (float legacy or {value,count} dict)."""
+    if isinstance(raw, dict):
+        try:
+            val = float(raw.get("total_value") or raw.get("value") or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        try:
+            cnt = int(raw.get("count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        return max(0.0, val), max(0, cnt)
+    try:
+        return max(0.0, float(raw or 0.0)), 0
+    except (TypeError, ValueError):
+        return 0.0, 0
+
+
+def build_monitor_locked_capital(
+    locked_by: dict | None,
+    heat_holdings_by_broker: dict | None,
+    broker_names: Iterable[str],
+    *,
+    locked_summary: dict | None = None,
+) -> dict[str, Any]:
+    """
+    Monitor/companion locked_capital payload: {total, count, by_broker: {name: {value, count}}}.
+    Accepts legacy locked_by values that are plain floats per broker.
+    """
+    locked_by = locked_by if isinstance(locked_by, dict) else {}
+    heat_holdings_by_broker = heat_holdings_by_broker if isinstance(heat_holdings_by_broker, dict) else {}
+    summary_rows = list((locked_summary or {}).get("rows") or [])
+    out: dict[str, Any] = {"total": 0.0, "count": 0, "by_broker": {}}
+    for name in broker_names:
+        val, cnt = locked_broker_entry(locked_by.get(name))
+        if val <= 0 and cnt <= 0:
+            holdings = heat_holdings_by_broker.get(name) or []
+            val = locked_value_from_holdings(holdings, broker_name=name)
+            if val > 0 and not cnt:
+                cnt = sum(
+                    1 for r in summary_rows
+                    if isinstance(r, dict) and str(r.get("broker") or "") == name
+                )
+        out["by_broker"][name] = {"value": val, "count": cnt}
+        out["total"] += val
+        out["count"] += cnt
+    return out
+
+
+def portfolio_sells_from_scored(
+    assets: Iterable,
+    results: Iterable,
+    broker: str,
+) -> list[dict]:
+    """Build sell_list entries from _bg_score_portfolio (row, price, action, ...) tuples."""
+    sells: list[dict] = []
+    asset_list = list(assets or [])
+    for row, price, action, asset_type, _err in results or []:
+        if row >= len(asset_list):
+            continue
+        a = asset_list[row]
+        if not isinstance(a, dict):
+            continue
+        ticker = a.get("ticker") or ""
+        if not ticker:
+            continue
+        if "SELL" not in str(action or "").upper():
+            continue
+        sells.append({
+            "broker": broker,
+            "ticker": ticker,
+            "shares": float(a.get("shares") or 0),
+            "price": float(price or 0),
+            "avg_cost": float(a.get("cost") or 0),
+            "type": a.get("type") or asset_type or "",
+            "sell_all": True,
+        })
+    return sells
+
+
+def drop_locked_portfolio_sells(sell_list: Iterable, holdings: Iterable) -> tuple[list, list[str]]:
+    """
+    Remove locked/untradeable names from portfolio sell candidates before execution.
+    Returns (filtered_list, dropped_tickers).
+    """
+    locked_tickers: set[str] = set()
+    for h in holdings or []:
+        if not isinstance(h, dict):
+            continue
+        is_locked, _reason = classify_locked_holding(
+            h, broker_name=str(h.get("broker") or ""),
+        )
+        if is_locked:
+            locked_tickers.add(str(h.get("ticker") or "").upper())
+    if not locked_tickers:
+        return list(sell_list or []), []
+    kept: list = []
+    dropped: list[str] = []
+    for item in sell_list or []:
+        tick = str(item.get("ticker") or "").upper()
+        if tick in locked_tickers:
+            dropped.append(tick)
+        else:
+            kept.append(item)
+    return kept, dropped
