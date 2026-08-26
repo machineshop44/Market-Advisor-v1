@@ -208,6 +208,10 @@ def load_settings():
         "ttp_arm_scale": 1.0,
         "allow_flat_time_banks": False,  # Safer/Balanced: TTP trail only
         "limit_offset_pct": 0.1,
+        "use_limit_entries": True,
+        "use_limit_exits": True,
+        "attach_protective_stops": True,
+        "et_flatten_before_close": False,
         "risk_pct_per_trade": 0.75,
         "max_open_risk_pct": 6.0,
         "daily_profit_target": 0.0,
@@ -2519,7 +2523,7 @@ class MarketAdvisorGUI(QMainWindow):
                           market_hours="regular_hours", allow_fractional=True):
         """Paper-mode-aware buy. Never calls the real broker API when self.paper_mode is True."""
         broker_name = self.cycle_broker_name
-        offset_pct = self._effective_limit_offset(offset_pct)
+        offset_pct = self._effective_limit_offset(offset_pct, side="buy")
         if self.paper_mode:
             cash = self.sandbox_cash.get(broker_name, 0.0)
             if price <= 0 or trade_dollars < 1.0:
@@ -2581,8 +2585,15 @@ class MarketAdvisorGUI(QMainWindow):
             self._attach_protective_stop(broker_name, ticker, asset_type, price, spent)
         return status, spent
 
-    def _effective_limit_offset(self, offset_pct=None):
-        """Settings limit offset + conservative fill-quality bump (fraction, not %)."""
+    def _effective_limit_offset(self, offset_pct=None, *, side="buy"):
+        """Settings limit offset + conservative fill-quality bump (fraction, not %).
+
+        side='buy' respects use_limit_entries; side='sell' respects use_limit_exits.
+        Returns 0 → brokers place market (or market-equivalent) orders.
+        """
+        toggle = "use_limit_entries" if str(side).lower() != "sell" else "use_limit_exits"
+        if not bool(self.settings.get(toggle, True)):
+            return 0.0
         try:
             if offset_pct is None:
                 base = float(self.settings.get("limit_offset_pct", 0.1) or 0.1) / 100.0
@@ -2606,6 +2617,24 @@ class MarketAdvisorGUI(QMainWindow):
             pass
         return max(0.0, min(0.05, base + bump))
 
+    @staticmethod
+    def _sell_force_market_reason(action_or_reason=""):
+        """Hard/urgent exits skip limit preference — fill urgently via market."""
+        t = str(action_or_reason or "").upper()
+        return any(
+            x in t
+            for x in (
+                "HARD STOP",
+                "HARD_STOP",
+                "MAX DAILY",
+                "DD PAUSE",
+                "PANIC",
+                "FORCE FLATTEN",
+                "EOD FLATTEN",
+                "ET FLATTEN",
+            )
+        )
+
     def _journal_kwargs(self):
         meta = getattr(self, "_pending_journal_meta", None) or {}
         out = {}
@@ -2620,14 +2649,23 @@ class MarketAdvisorGUI(QMainWindow):
         return out
 
     def execute_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-                           market_hours="regular_hours", allow_fractional=True, sell_all=True):
+                           market_hours="regular_hours", allow_fractional=True, sell_all=True,
+                           sell_reason=""):
         """Paper-mode-aware sell. Never calls the real broker API when self.paper_mode is True.
 
         sell_all=True (default): full position exit — brokers use native close / live qty.
         sell_all=False: intentional partial — qty-based only.
+        Hard-stop / flatten reasons force market (offset 0) even when limit exits are ON.
         """
         broker_name = self.cycle_broker_name
-        offset_pct = self._effective_limit_offset(offset_pct)
+        meta = getattr(self, "_pending_journal_meta", None) or {}
+        reason_blob = " ".join(
+            str(x) for x in (sell_reason, meta.get("reason"), meta.get("action")) if x
+        )
+        if self._sell_force_market_reason(reason_blob):
+            offset_pct = 0.0
+        else:
+            offset_pct = self._effective_limit_offset(offset_pct, side="sell")
         if self.paper_mode:
             book = self.sandbox_holdings.setdefault(broker_name, {})
             pos = book.get(ticker)
@@ -4427,6 +4465,12 @@ class MarketAdvisorGUI(QMainWindow):
             "pre_close": "Pre-close session check…",
         }
         self.log_event(labels.get(kind, f"Session boundary check ({kind})…"))
+
+        if kind == "pre_close":
+            try:
+                self._run_eod_protective_pass()
+            except Exception as e:
+                self.log_event(f"[EOD] Protective pass error: {e}")
 
         equity_brokers = [
             b for b in BROKER_NAMES
@@ -7177,22 +7221,74 @@ class MarketAdvisorGUI(QMainWindow):
         offset_box = QHBoxLayout()
         offset_box.addWidget(QLabel("Limit Order Buffer Offset %:"))
         self.offset_spin = QDoubleSpinBox()
-        self.offset_spin.setRange(0.01, 5.0)
+        self.offset_spin.setRange(0.0, 5.0)
         self.offset_spin.setValue(self.settings.get("limit_offset_pct", 0.1))
         self.offset_spin.setToolTip(
-            "Discretionary buy limit buffer (percent). RH & E*TRADE: limit at last×(1+buf). "
+            "Discretionary limit buffer (percent). RH & E*TRADE: limit at last×(1±buf). "
             "Coinbase Advanced: GTC limit buy when buffer > 0 (else market). "
-            "Sells use the same buffer the other way."
+            "Applies to Limit entry buys and/or Limit exit sells when those toggles are ON. "
+            "Hard-stop / EOD flatten sells always use market."
         )
         offset_box.addWidget(self.offset_spin)
         offset_box.addStretch()
         form_layout.addLayout(offset_box)
+
+        order_opts = QHBoxLayout()
+        self.use_limit_entries_chk = QCheckBox("Limit entry buys")
+        self.use_limit_entries_chk.setChecked(bool(self.settings.get("use_limit_entries", True)))
+        self.use_limit_entries_chk.setToolTip(
+            "When ON and buffer > 0: bot places limit buys (RH · ET · CB GTC). "
+            "When OFF: market buys. Stop-limit *entries* are not used."
+        )
+        self.use_limit_exits_chk = QCheckBox("Limit exit sells")
+        self.use_limit_exits_chk.setChecked(bool(self.settings.get("use_limit_exits", True)))
+        self.use_limit_exits_chk.setToolTip(
+            "When ON: discretionary sells (TTP / time / stale / rotate) prefer limit, "
+            "then cancel→market on RH if unfilled. Hard stops and EOD flatten stay market."
+        )
+        self.attach_stops_chk = QCheckBox("Attach protective stops after buys")
+        self.attach_stops_chk.setChecked(bool(self.settings.get("attach_protective_stops", True)))
+        self.attach_stops_chk.setToolTip(
+            "When ON: after equity fills, attach broker stops where supported (Robinhood). "
+            "E*TRADE / Coinbase / crypto still use software TTP. Repair stops respects this too."
+        )
+        order_opts.addWidget(self.use_limit_entries_chk)
+        order_opts.addWidget(self.use_limit_exits_chk)
+        order_opts.addWidget(self.attach_stops_chk)
+        order_opts.addStretch()
+        form_layout.addLayout(order_opts)
+
+        eod_opts = QHBoxLayout()
+        self.et_flatten_close_chk = QCheckBox("Flatten E*TRADE equities before close")
+        self.et_flatten_close_chk.setChecked(bool(self.settings.get("et_flatten_before_close", False)))
+        self.et_flatten_close_chk.setToolTip(
+            "Optional. At ~15:59 ET pre-close: market-sell ET equity holdings so you are not "
+            "naked overnight if the app is off or midnight reauth fails. OFF by default — "
+            "RH uses resting protective stops instead; crypto is 24/7."
+        )
+        eod_opts.addWidget(self.et_flatten_close_chk)
+        eod_opts.addStretch()
+        form_layout.addLayout(eod_opts)
+
         offset_hint = QLabel(
-            "Limit buys: RH · E*TRADE · Coinbase (GTC). Protective stop-limits remain sell-side only."
+            "Limits = optional entry/exit preference. Protective stops = RH sell-side disaster rail. "
+            "Pre-close: repair RH stops + warn ET overnight (optional flatten). "
+            "Software TTP backs exits where broker stops are N/A."
         )
         offset_hint.setWordWrap(True)
         offset_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
         form_layout.addWidget(offset_hint)
+
+        def _sync_limit_spin_enabled(*_args):
+            on = (
+                self.use_limit_entries_chk.isChecked()
+                or self.use_limit_exits_chk.isChecked()
+            )
+            self.offset_spin.setEnabled(on)
+
+        self.use_limit_entries_chk.toggled.connect(_sync_limit_spin_enabled)
+        self.use_limit_exits_chk.toggled.connect(_sync_limit_spin_enabled)
+        _sync_limit_spin_enabled()
 
         profit_box = QHBoxLayout()
         profit_box.addWidget(QLabel("Daily Profit Target ($ [0 = Disabled]):"))
@@ -10750,6 +10846,8 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _attach_protective_stop(self, broker_name, ticker, asset_type, price, spent):
         """After a successful buy: broker stop if live; virtual stop in paper. Software TTP remains backup."""
+        if not bool(self.settings.get("attach_protective_stops", True)):
+            return
         from scoring import (
             get_stop_distance_pct, get_trail_pct, get_protective_order,
             set_protective_order, clear_protective_order,
@@ -10927,8 +11025,138 @@ class MarketAdvisorGUI(QMainWindow):
             return qty, px, asset_type
         return None
 
+    def _run_eod_protective_pass(self):
+        """
+        ~15:59 ET pre-close checklist (equity only):
+          1) Force RH protective-stop repair (whole shares).
+          2) Warn hard if E*TRADE still holds equities overnight (no broker stop API).
+          3) Optional: flatten ET equities when et_flatten_before_close is ON.
+        Crypto left alone (24/7 TTP while the app runs).
+        """
+        self.log_event("[EOD] Pre-close protective checklist…")
+        try:
+            self._maybe_repair_protective_stops(force=True)
+        except Exception as e:
+            self.log_event(f"[EOD] Stop repair error: {e}")
+
+        et = self.brokers.get("E*TRADE")
+        et_armed = bool(self.auto_trade_enabled.get("E*TRADE"))
+        et_live = bool(et and (self.paper_mode or getattr(et, "is_connected", False)))
+        if not (et_armed and et_live):
+            return
+
+        holdings = []
+        try:
+            if self.paper_mode:
+                book = self.sandbox_holdings.get("E*TRADE") or {}
+                for t, pos in book.items():
+                    holdings.append({
+                        "ticker": t,
+                        "shares": float((pos or {}).get("shares") or 0),
+                        "type": (pos or {}).get("type") or "stock",
+                        "price": float((pos or {}).get("cost") or 0),
+                    })
+            elif et:
+                holdings = list(et.get_current_holdings() or [])
+        except Exception as e:
+            self.log_event(f"[EOD] E*TRADE holdings read failed: {e}")
+            return
+
+        equity_rows = []
+        for h in holdings:
+            if not isinstance(h, dict):
+                continue
+            ticker = str(h.get("ticker") or "").replace("-USD", "").upper()
+            if not ticker:
+                continue
+            asset_type = str(h.get("type") or "")
+            is_crypto = "crypto" in asset_type.lower() or ticker in KNOWN_CRYPTOS
+            if is_crypto:
+                continue
+            try:
+                shares = float(h.get("shares") or 0)
+            except (TypeError, ValueError):
+                shares = 0.0
+            if shares <= 0:
+                continue
+            try:
+                price = float(h.get("price") or h.get("last") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            equity_rows.append({
+                "broker": "E*TRADE",
+                "ticker": ticker,
+                "shares": shares,
+                "price": price,
+                "avg_cost": float(h.get("cost") or h.get("avg_cost") or 0),
+                "type": asset_type or "stock",
+                "sell_all": True,
+                "action": "ET FLATTEN (EOD)",
+                "reason": "ET FLATTEN",
+            })
+
+        if not equity_rows:
+            return
+
+        names = ", ".join(r["ticker"] for r in equity_rows[:12])
+        more = f" (+{len(equity_rows) - 12})" if len(equity_rows) > 12 else ""
+        warn = (
+            f"[EOD] E*TRADE overnight risk: {len(equity_rows)} equity holding(s) "
+            f"({names}{more}) — no broker stop API; software TTP dies if the app is off "
+            f"or midnight reauth fails."
+        )
+        self.log_event(warn)
+        try:
+            self.send_discord_alert(warn, urgent=True, prefix="EOD")
+        except Exception:
+            pass
+
+        if not bool(self.settings.get("et_flatten_before_close", False)):
+            self.log_event(
+                "[EOD] Flatten OFF — holding ET overnight. Enable "
+                "'Flatten E*TRADE equities before close' in Settings if you want auto flat."
+            )
+            return
+
+        self.log_event(
+            f"[EOD] Flattening {len(equity_rows)} E*TRADE equity position(s) before close…"
+        )
+        self.set_working_state(True, "EOD E*TRADE flatten…")
+        self.run_thread(
+            self._bg_execute_sell_batch,
+            self._on_eod_flatten_done,
+            equity_rows,
+        )
+
+    def _on_eod_flatten_done(self, payload):
+        payload = payload or {}
+        for note in payload.get("notes") or []:
+            self.log_event(note)
+        n_ok = 0
+        for fill in payload.get("fills") or []:
+            st = str(fill.get("status") or "")
+            self.log_event(f"[EOD] [{fill.get('ticker')}] flatten: {st}")
+            if "Fail" not in st and "Skipped" not in st:
+                n_ok += 1
+        try:
+            self.send_discord_alert(
+                f"EOD ET flatten done — {n_ok}/{len(payload.get('fills') or [])} ok",
+                is_trade=True,
+                urgent=True,
+            )
+        except Exception:
+            pass
+        self.set_working_state(False)
+        self.refresh_recent_trades()
+        try:
+            self.manual_portfolio_reload(and_score=False, force=True)
+        except Exception:
+            pass
+
     def _maybe_repair_protective_stops(self, force=False):
         """Attach missing broker protective stops (throttled). Never flattens positions."""
+        if not bool(self.settings.get("attach_protective_stops", True)):
+            return
         now = time.time()
         if not force:
             last = float(getattr(self, "_last_stop_repair_pass", 0.0) or 0.0)
@@ -12220,6 +12448,7 @@ class MarketAdvisorGUI(QMainWindow):
                     offset, use_ext,
                     market_hours=market_hours, allow_fractional=allow_fractional,
                     sell_all=bool(item.get("sell_all", True)),
+                    sell_reason=str(item.get("action") or item.get("reason") or ""),
                 )
                 self._mark_frac_ext_ineligible(ticker, status)
                 st = str(status or "")
@@ -13303,6 +13532,14 @@ class MarketAdvisorGUI(QMainWindow):
             _prof.get("allow_flat_time_banks", False)
         )
         self.settings["limit_offset_pct"] = self.offset_spin.value()
+        if hasattr(self, "use_limit_entries_chk"):
+            self.settings["use_limit_entries"] = bool(self.use_limit_entries_chk.isChecked())
+        if hasattr(self, "use_limit_exits_chk"):
+            self.settings["use_limit_exits"] = bool(self.use_limit_exits_chk.isChecked())
+        if hasattr(self, "attach_stops_chk"):
+            self.settings["attach_protective_stops"] = bool(self.attach_stops_chk.isChecked())
+        if hasattr(self, "et_flatten_close_chk"):
+            self.settings["et_flatten_before_close"] = bool(self.et_flatten_close_chk.isChecked())
         self.settings["daily_profit_target"] = self.profit_spin.value()
         self.settings["daily_loss_limit"] = self.loss_spin.value()
         if hasattr(self, "day_dd_spin"):

@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.35.1"
+__version__ = "1.36.0"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Signal research tab (roomy sparkline); scanners stay uncluttered"
+    "Order policy toggles + EOD stop repair / ET overnight warn+optional flatten"
 )
 
 

@@ -1112,6 +1112,7 @@ def portfolio_sells_from_scored(
             "avg_cost": float(a.get("cost") or 0),
             "type": a.get("type") or asset_type or "",
             "sell_all": True,
+            "action": str(action or ""),
         })
     return sells
 

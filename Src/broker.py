@@ -1142,10 +1142,39 @@ class RobinhoodAdapter(BaseBroker):
                 or "instrument" in e and "none" in e
             )
 
-        # Whole-share-only path (limit → market fallback). Never int() a fractional full exit.
+        # Whole-share-only path. offset<=0 → market; else limit with cancel→market on timeout.
         if self._qty_is_whole_shares(shares_val):
             qty_to_sell = int(Decimal(str(shares_val)).to_integral_value())
-            limit_price = round(price * (1.0 - offset_pct), 4 if price < 1.0 else 2)
+
+            def _rh_market_sell(why_tag=""):
+                res_m = r.order_sell_market(
+                    symbol=ticker, quantity=qty_to_sell,
+                    timeInForce="gfd", extendedHours=use_ext_hours,
+                )
+                if isinstance(res_m, dict) and ("id" in res_m or "state" in res_m):
+                    oid = res_m.get("id")
+                    conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
+                    tag = "Filled" if conf else f"Pending/{state}"
+                    suffix = f" {why_tag}" if why_tag else ""
+                    return f"{all_tag} market{suffix} {tag} ({qty_to_sell})", oid
+                return None, res_m
+
+            if float(offset_pct or 0) <= 0:
+                try:
+                    out, raw = _rh_market_sell()
+                    if out:
+                        return out
+                    return f"Fail: {raw}", None
+                except Exception as e:
+                    if _is_instrument_miss(e):
+                        return (
+                            f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                            "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                            None,
+                        )
+                    return f"Fail: {e}", None
+
+            limit_price = round(price * (1.0 - float(offset_pct)), 4 if price < 1.0 else 2)
             try:
                 res = r.order_sell_limit(
                     symbol=ticker, quantity=qty_to_sell, limitPrice=limit_price,
@@ -1153,21 +1182,36 @@ class RobinhoodAdapter(BaseBroker):
                 )
                 if isinstance(res, dict) and ("id" in res or "state" in res):
                     oid = res.get("id")
-                    conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
-                    tag = "Filled" if conf else f"Pending/{state}"
-                    return f"{all_tag} {tag} ({qty_to_sell})", oid
+                    conf, state = self.confirm_order(
+                        oid, is_crypto=False, timeout_sec=45,
+                    ) if oid else (False, "unknown")
+                    if conf:
+                        return f"{all_tag} Filled ({qty_to_sell})", oid
+                    # Unfilled / timed out — cancel and market so disaster/exit rails don't stall
+                    if oid:
+                        try:
+                            self.cancel_order(oid, is_crypto=False)
+                        except Exception:
+                            pass
+                    try:
+                        out, raw = _rh_market_sell("after limit timeout")
+                        if out:
+                            return out
+                        return f"Fail: limit {state}; market {raw}", None
+                    except Exception as e2:
+                        if _is_instrument_miss(e2):
+                            return (
+                                f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                                "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                                None,
+                            )
+                        return f"Fail: limit {state}; market {e2}", None
                 # Limit rejected / empty — try market once (OTC leftovers sometimes need it)
                 try:
-                    res_m = r.order_sell_market(
-                        symbol=ticker, quantity=qty_to_sell,
-                        timeInForce="gfd", extendedHours=use_ext_hours,
-                    )
-                    if isinstance(res_m, dict) and ("id" in res_m or "state" in res_m):
-                        oid = res_m.get("id")
-                        conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
-                        tag = "Filled" if conf else f"Pending/{state}"
-                        return f"{all_tag} market {tag} ({qty_to_sell})", oid
-                    return f"Fail: {res_m or res}", None
+                    out, raw = _rh_market_sell()
+                    if out:
+                        return out
+                    return f"Fail: {raw or res}", None
                 except Exception as e2:
                     if _is_instrument_miss(e2):
                         return (
@@ -1181,15 +1225,9 @@ class RobinhoodAdapter(BaseBroker):
                 if _is_instrument_miss(err):
                     # Market fallback before giving up
                     try:
-                        res_m = r.order_sell_market(
-                            symbol=ticker, quantity=qty_to_sell,
-                            timeInForce="gfd", extendedHours=False,
-                        )
-                        if isinstance(res_m, dict) and ("id" in res_m or "state" in res_m):
-                            oid = res_m.get("id")
-                            conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
-                            tag = "Filled" if conf else f"Pending/{state}"
-                            return f"{all_tag} market {tag} ({qty_to_sell})", oid
+                        out, raw = _rh_market_sell()
+                        if out:
+                            return out
                     except Exception as e2:
                         if _is_instrument_miss(e2) or _is_instrument_miss(err):
                             return (
