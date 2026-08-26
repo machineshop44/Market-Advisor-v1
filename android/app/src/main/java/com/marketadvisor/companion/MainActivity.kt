@@ -512,6 +512,7 @@ class MainActivity : AppCompatActivity() {
                     reauthNeeded = etNeedReauth,
                     ddPaused = status.portfolioHeat.ddPaused,
                     halted = status.halted,
+                    signalAlert = status.signalAlert,
                 )
 
                 syncingUi = true

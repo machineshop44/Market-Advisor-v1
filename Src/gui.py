@@ -314,6 +314,102 @@ def format_money(value):
         return "$0.00"
 
 
+class SparklineWidget(QWidget):
+    """Compact close-series sparkline for the scanner signal card."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._closes = []
+        self.setMinimumHeight(ui_px(36))
+        self.setMaximumHeight(ui_px(48))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_closes(self, closes):
+        try:
+            self._closes = [float(x) for x in (closes or []) if x is not None]
+        except Exception:
+            self._closes = []
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(2, 4, -2, -4)
+        p.fillRect(self.rect(), QColor("#F5F7F6"))
+        if len(self._closes) < 2:
+            p.setPen(QColor("#9E9E9E"))
+            p.drawText(rect, Qt.AlignCenter, "No chart bars yet")
+            return
+        lo = min(self._closes)
+        hi = max(self._closes)
+        span = (hi - lo) or 1.0
+        w = max(1, rect.width())
+        h = max(1, rect.height())
+        pts = []
+        n = len(self._closes)
+        for i, c in enumerate(self._closes):
+            x = rect.left() + (i / (n - 1)) * w
+            y = rect.bottom() - ((c - lo) / span) * h
+            pts.append(QPoint(int(x), int(y)))
+        up = self._closes[-1] >= self._closes[0]
+        pen = QPen(QColor("#1F8A70" if up else "#C62828"), 2)
+        p.setPen(pen)
+        for i in range(1, len(pts)):
+            p.drawLine(pts[i - 1], pts[i])
+
+
+class FactorMeterRow(QWidget):
+    """Labeled 0–100 meter strip (trend / RSI / volume / regime / score / RS)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(ui_px(6))
+        self._bars = {}
+        for key, label in (
+            ("trend", "Trend"),
+            ("rsi", "RSI"),
+            ("volume", "Vol"),
+            ("regime", "Regime"),
+            ("score", "Score"),
+            ("rs", "RS"),
+        ):
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"font-size: {ui_px(10)}px; color: #666;")
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(ui_px(8))
+            bar.setMaximumWidth(ui_px(72))
+            col.addWidget(lbl)
+            col.addWidget(bar)
+            host = QWidget()
+            host.setLayout(col)
+            lay.addWidget(host)
+            self._bars[key] = bar
+        lay.addStretch(1)
+
+    def set_meters(self, meters: dict):
+        meters = meters or {}
+        for key, bar in self._bars.items():
+            raw = meters.get(key)
+            if raw is None:
+                bar.setValue(0)
+                bar.setStyleSheet("QProgressBar::chunk { background: #BDBDBD; }")
+                continue
+            try:
+                v = int(max(0, min(100, float(raw))))
+            except (TypeError, ValueError):
+                v = 0
+            bar.setValue(v)
+            color = "#1F8A70" if v >= 60 else ("#F9A825" if v >= 40 else "#C62828")
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
+
+
 # Brand-aligned UI tokens (splash green #0D3B2E → teal accent, softer radii)
 UI_ACCENT = "#1F8A70"
 UI_ACCENT_HOVER = "#26A69A"
@@ -1617,6 +1713,10 @@ class MarketAdvisorGUI(QMainWindow):
         # Deferred tabs already built with current ui_px; inherit window QSS — skip full apply_theme
         self._restyle_scaled_widgets()
         self._update_home_wide_layout()
+        try:
+            self._refresh_home_desk_radar()
+        except Exception:
+            pass
         QTimer.singleShot(0, lambda: self.director_timer.start(1000))
         # IPO calendar: first load shortly after UI settles; then every few hours
         QTimer.singleShot(8000, lambda: self.refresh_ipo_calendar(force=False))
@@ -3829,6 +3929,20 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 pass
 
+    def _monitor_desk_radar_payload(self):
+        try:
+            import desk_radar
+            return desk_radar.top_radar(8)
+        except Exception:
+            return getattr(self, "_last_desk_radar", None) or []
+
+    def _monitor_signal_alert_payload(self):
+        try:
+            import desk_radar
+            return desk_radar.latest_signal_alert()
+        except Exception:
+            return None
+
     def _monitor_etrade_oauth_from_http(self, action, verifier=""):
         """Called on the monitor HTTP thread; blocks until the GUI handles it."""
         req = {
@@ -4089,6 +4203,8 @@ class MarketAdvisorGUI(QMainWindow):
                 },
                 "etrade": self._etrade_monitor_snapshot(),
                 "halted": not any(self.auto_trade_enabled.values()),
+                "desk_radar": self._monitor_desk_radar_payload(),
+                "signal_alert": self._monitor_signal_alert_payload(),
             })
         except Exception as e:
             now = time.time()
@@ -5320,6 +5436,18 @@ class MarketAdvisorGUI(QMainWindow):
             "(excluded from rotate/sizing honesty)."
         )
         heat_lay.addWidget(self.home_heat_lbl)
+        self.home_radar_card = QGroupBox("Desk radar")
+        radar_lay = QVBoxLayout()
+        radar_lay.setContentsMargins(ui_px(10), ui_px(6), ui_px(10), ui_px(6))
+        self.home_radar_lbl = QLabel("No scored signals yet — run a CRYPTO / BREAKOUT / CORE cycle.")
+        self.home_radar_lbl.setWordWrap(True)
+        self.home_radar_lbl.setStyleSheet(f"font-size: {ui_px(11)}px;")
+        self.home_radar_lbl.setToolTip(
+            "Top scored BUY candidates across engines (last ~6h). Feeds companion signal alerts."
+        )
+        radar_lay.addWidget(self.home_radar_lbl)
+        self.home_radar_card.setLayout(radar_lay)
+        heat_lay.addWidget(self.home_radar_card)
         self.home_locked_nudge = QLabel("")
         self.home_locked_nudge.setWordWrap(True)
         self.home_locked_nudge.setVisible(False)
@@ -5442,21 +5570,40 @@ class MarketAdvisorGUI(QMainWindow):
         self.tabs.addTab(tab, "Portfolio")
 
     def _build_scanner_signal_card(self, table, *, is_crypto=False):
-        """Research polish: factor strip + TradingView/Finviz deep links for selected row."""
+        """Research polish: sparkline, factor meters, RS/levels, why-gate, deep links."""
         card = QGroupBox("Signal card")
         lay = QVBoxLayout(card)
         lay.setContentsMargins(ui_px(10), ui_px(8), ui_px(10), ui_px(8))
         lay.setSpacing(ui_px(6))
-        factors = QLabel("Select a row to see score factors (trend · RSI · volume · regime · edge).")
-        factors.setWordWrap(True)
-        factors.setObjectName("settingsHint")
-        factors.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
-        lay.addWidget(factors)
+
+        head = QLabel("Select a row for sparkline · factors · RS · levels.")
+        head.setWordWrap(True)
+        head.setObjectName("settingsHint")
+        head.setStyleSheet(f"color: #555; font-size: {ui_px(11)}px; font-weight: 600;")
+        lay.addWidget(head)
+
+        spark = SparklineWidget()
+        lay.addWidget(spark)
+        meters = FactorMeterRow()
+        lay.addWidget(meters)
+
+        why = QLabel("")
+        why.setWordWrap(True)
+        why.setStyleSheet(f"color: #444; font-size: {ui_px(11)}px;")
+        lay.addWidget(why)
+
+        levels = QLabel("")
+        levels.setWordWrap(True)
+        levels.setStyleSheet(f"color: #666; font-size: {ui_px(10)}px;")
+        lay.addWidget(levels)
+
         btn_row = QHBoxLayout()
         tv_btn = QPushButton("TradingView")
         fv_btn = QPushButton("Finviz / Coinbase")
+        broker_btn = QPushButton("Broker page")
         btn_row.addWidget(tv_btn)
         btn_row.addWidget(fv_btn)
+        btn_row.addWidget(broker_btn)
         btn_row.addStretch(1)
         lay.addLayout(btn_row)
 
@@ -5468,50 +5615,75 @@ class MarketAdvisorGUI(QMainWindow):
             item = table.item(row, 0)
             return (item.text() if item else "").strip().upper().replace("-USD", "")
 
+        def _row_asset_type():
+            row = table.currentRow()
+            if row < 0:
+                return ""
+            atype_item = table.item(row, 1)
+            return (atype_item.text() if atype_item else "") or ""
+
+        def _row_rec():
+            row = table.currentRow()
+            if row < 0:
+                return ""
+            rec_item = table.item(row, 3)
+            return (rec_item.text() if rec_item else "") or ""
+
         def _refresh_factors():
+            from scoring import signal_research_bundle, explain_gate_from_recommendation
             ticker = _selected_ticker()
             if not ticker:
-                factors.setText("Select a row to see score factors (trend · RSI · volume · regime · edge).")
+                head.setText("Select a row for sparkline · factors · RS · levels.")
+                spark.set_closes([])
+                meters.set_meters({})
+                why.setText("")
+                levels.setText("")
                 return
-            atype_item = table.item(table.currentRow(), 1) if table.currentRow() >= 0 else None
-            atype = (atype_item.text() if atype_item else "") or ""
+            atype = _row_asset_type()
             crypto = is_crypto or "crypto" in atype.lower()
             try:
-                from scoring import crypto_signal_factors
-                f = crypto_signal_factors(ticker, is_crypto=crypto)
+                f = signal_research_bundle(ticker, is_crypto=crypto)
             except Exception as e:
-                factors.setText(f"{ticker}: factor load failed ({e})")
+                head.setText(f"{ticker}: research load failed ({e})")
                 return
             bits = [ticker]
             if f.get("price"):
                 bits.append(f"@ {format_currency(f['price'])}")
-            bits.append(
-                "macro " + ("up" if f.get("macro_uptrend") else "down" if f.get("macro_uptrend") is False else "—")
-            )
-            bits.append(
-                "micro " + ("bull" if f.get("micro_bullish") else "flat" if f.get("micro_bullish") is False else "—")
-            )
-            bits.append(f"RSI {f['rsi']:.1f}" if f.get("rsi") is not None else "RSI —")
-            bits.append("vol OK" if f.get("has_volume") else "vol weak" if f.get("has_volume") is False else "vol —")
-            bits.append(f"score {f['score']:.0f}" if f.get("score") is not None else "score —")
-            if f.get("regime_ok") is True:
-                bits.append("regime OK")
-            elif f.get("regime_ok") is False:
-                bits.append(f"regime blocked ({(f.get('regime_reason') or '')[:40]})")
+            if f.get("score") is not None:
+                bits.append(f"score {f['score']:.0f}")
+            if f.get("rs_pct") is not None:
+                bits.append(f"RS vs {f.get('bench') or '—'} {f['rs_pct']:+.1f}%")
+            head.setText(" · ".join(bits))
+            spark.set_closes(f.get("closes") or [])
+            meters.set_meters(f.get("meters") or {})
+            rec = _row_rec()
+            gate = explain_gate_from_recommendation(rec)
+            if f.get("regime_ok") is False and f.get("regime_reason"):
+                gate = f"{gate} · regime: {(f.get('regime_reason') or '')[:50]}"
+            why.setText(f"Why: {gate}")
+            lvl_bits = []
+            if f.get("stop_pct") is not None:
+                if f.get("stop_price"):
+                    lvl_bits.append(
+                        f"hard-stop ~{f['stop_pct']:.1f}% ({format_currency(f['stop_price'])})"
+                    )
+                else:
+                    lvl_bits.append(f"hard-stop ~{f['stop_pct']:.1f}%")
+            if f.get("support_hint"):
+                lvl_bits.append(f"support≈{format_currency(f['support_hint'])}")
             if f.get("fee_edge_pct") is not None:
-                bits.append(f"edge≈{f['fee_edge_pct']:.2f}%")
-            rec_item = table.item(table.currentRow(), 3) if table.currentRow() >= 0 else None
-            if rec_item and rec_item.text():
-                bits.append(rec_item.text()[:60])
-            factors.setText(" · ".join(bits))
+                lvl_bits.append(f"fee edge≈{f['fee_edge_pct']:.2f}%")
+            if f.get("ticker_pct") is not None and f.get("bench_pct") is not None:
+                lvl_bits.append(
+                    f"5d {f['ticker_pct']:+.1f}% vs {f.get('bench')} {f['bench_pct']:+.1f}%"
+                )
+            levels.setText(" · ".join(lvl_bits) if lvl_bits else "Levels —")
 
         def _open_tv():
             ticker = _selected_ticker()
             if not ticker:
                 return
-            atype_item = table.item(table.currentRow(), 1) if table.currentRow() >= 0 else None
-            atype = (atype_item.text() if atype_item else "") or ""
-            crypto = is_crypto or "crypto" in atype.lower()
+            crypto = is_crypto or "crypto" in _row_asset_type().lower()
             path = f"{ticker}USD" if crypto else ticker
             webbrowser.open(f"https://www.tradingview.com/chart/?symbol={path}")
 
@@ -5519,16 +5691,26 @@ class MarketAdvisorGUI(QMainWindow):
             ticker = _selected_ticker()
             if not ticker:
                 return
-            atype_item = table.item(table.currentRow(), 1) if table.currentRow() >= 0 else None
-            atype = (atype_item.text() if atype_item else "") or ""
-            crypto = is_crypto or "crypto" in atype.lower()
+            crypto = is_crypto or "crypto" in _row_asset_type().lower()
             if crypto:
                 webbrowser.open(f"https://www.coinbase.com/price/{ticker.lower()}")
             else:
                 webbrowser.open(f"https://finviz.com/quote.ashx?t={ticker}")
 
+        def _open_broker():
+            ticker = _selected_ticker()
+            if not ticker:
+                return
+            crypto = is_crypto or "crypto" in _row_asset_type().lower()
+            if crypto:
+                webbrowser.open(f"https://www.coinbase.com/price/{ticker.lower()}")
+            else:
+                # RH public quote page (works without login for glance)
+                webbrowser.open(f"https://robinhood.com/stocks/{ticker}")
+
         tv_btn.clicked.connect(_open_tv)
         fv_btn.clicked.connect(_open_research)
+        broker_btn.clicked.connect(_open_broker)
         table.itemSelectionChanged.connect(_refresh_factors)
         table.currentCellChanged.connect(lambda *_: _refresh_factors())
         return card
@@ -12611,6 +12793,7 @@ class MarketAdvisorGUI(QMainWindow):
         actionable = len(buy_candidates or [])
         if actionable:
             self.log_event(f"[AUTO] [{broker}] {engine} scored — {actionable} BUY signal(s)")
+            self._upsert_desk_radar(engine, buy_candidates)
         else:
             self.log_event(f"[AUTO] [{broker}] {engine} scored — {raw_buys} BUY signal(s)")
         if raw_buys > 0 and actionable == 0 and self._is_broker_auto_trading():
@@ -12628,6 +12811,40 @@ class MarketAdvisorGUI(QMainWindow):
                 pass
             else:
                 self._coach_tip_for_scan_drops(broker, engine, dropped or [])
+
+    def _upsert_desk_radar(self, engine, buy_candidates):
+        try:
+            import desk_radar
+            items = desk_radar.upsert_candidates(
+                buy_candidates,
+                engine=engine,
+                broker=self.cycle_broker_name,
+            )
+            self._last_desk_radar = items
+            self._refresh_home_desk_radar()
+        except Exception:
+            pass
+
+    def _refresh_home_desk_radar(self):
+        lbl = getattr(self, "home_radar_lbl", None)
+        if lbl is None:
+            return
+        try:
+            import desk_radar
+            top = desk_radar.top_radar(6)
+            if not top:
+                lbl.setText("No scored signals yet — run a CRYPTO / BREAKOUT / CORE cycle.")
+                return
+            bits = []
+            for it in top:
+                age_m = max(0, int((time.time() - float(it.get("ts") or time.time())) // 60))
+                bits.append(
+                    f"{it.get('ticker')} {it.get('engine')} "
+                    f"{float(it.get('score') or 0):.0f} ({age_m}m)"
+                )
+            lbl.setText(" · ".join(bits))
+        except Exception as e:
+            lbl.setText(f"Radar unavailable ({e})")
 
     def _crypto_on_scored(self, payload):
         opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
@@ -12742,7 +12959,7 @@ class MarketAdvisorGUI(QMainWindow):
         return universe
 
     def _bg_scan_penny(self):
-        discovered, seen = [], set()
+        finviz_syms, rh_syms, yahoo_syms = [], [], []
         Overview = _get_overview_class()
         if Overview is not None:
             try:
@@ -12750,27 +12967,40 @@ class MarketAdvisorGUI(QMainWindow):
                 fs.set_filter(filters_dict={'Price': 'Under $5', 'Current Volume': 'Over 2M'})
                 df = fs.screener_view()
                 if df is not None and not df.empty and 'Ticker' in df.columns:
-                    for t in df['Ticker'].head(8).tolist():
-                        sym = str(t).upper().strip()
-                        # Skip Finviz junk / non-symbols (e.g. AABAT-style garbage)
-                        if not sym.isalpha() or not (1 <= len(sym) <= 5):
-                            continue
-                        if sym.startswith("AA") and len(sym) == 5:
-                            continue
-                        discovered.append({'symbol': sym, 'type': 'Penny Stock'})
-                        seen.add(sym)
+                    for t in df['Ticker'].head(10).tolist():
+                        finviz_syms.append(str(t).upper().strip())
             except Exception:
                 pass
         if self.brokers["Robinhood"].is_connected:
             try:
                 import robin_stocks.robinhood as rh
-                for item in rh.markets.get_top_100()[:10]:
+                for item in rh.markets.get_top_100()[:12]:
                     sym = item.get('symbol') or item.get('ticker')
-                    if sym and sym not in seen:
-                        discovered.append({'symbol': sym, 'type': 'RH Top Mover'})
-                        seen.add(sym)
+                    if sym:
+                        rh_syms.append(str(sym).upper().strip())
             except Exception:
                 pass
+        # Yahoo day gainers (equities) — soft third source
+        try:
+            import yfinance as yf
+            # curated high-beta names as gainers proxy when screener APIs fail
+            probe = ["SOUN", "PLUG", "RKLB", "SMCI", "IONQ", "OKLO", "ACHR", "JOBY"]
+            for sym in probe:
+                try:
+                    h = yf.Ticker(sym).history(period="5d", interval="1d")
+                    if h is None or h.empty or len(h) < 2:
+                        continue
+                    chg = float(h["Close"].iloc[-1]) / float(h["Close"].iloc[-2]) - 1.0
+                    if chg >= 0.03:
+                        yahoo_syms.append(sym)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        import desk_radar
+        discovered = desk_radar.merge_breakout_universe(
+            finviz_syms, rh_syms, yahoo_syms, max_total=16,
+        )
         if not discovered:
             for s in ["SNDL", "SOUN", "PLUG", "TSLA", "AMD"]:
                 discovered.append({'symbol': s, 'type': 'Penny Stock'})

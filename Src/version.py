@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.34.0"
+__version__ = "1.35.0"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Grade lift A-: crypto movers · limit buys · fee WF · holidays · signal card"
+    "A-max: sparkline signal card · desk radar · multi-source breakouts · RS · signal alerts"
 )
 
 

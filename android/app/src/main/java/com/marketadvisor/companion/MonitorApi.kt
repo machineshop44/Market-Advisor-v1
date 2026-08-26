@@ -127,6 +127,15 @@ object MonitorApi {
         val present: Boolean = false,
     )
 
+    data class SignalAlert(
+        val id: String = "",
+        val ticker: String = "",
+        val engine: String = "",
+        val score: Double = 0.0,
+        val broker: String = "",
+        val reason: String = "",
+    )
+
     data class Status(
         val controlsEnabled: Boolean,
         val autoTrader: Map<String, Boolean>,
@@ -148,6 +157,7 @@ object MonitorApi {
         val walkForward: WalkForward = WalkForward(),
         val lockedCapital: LockedCapital = LockedCapital(),
         val halted: Boolean = false,
+        val signalAlert: SignalAlert? = null,
         val brokerBalances: Map<String, BrokerBalance> = emptyMap(),
         val recentTrades: List<RecentTrade> = emptyList(),
         val recentLog: List<String> = emptyList(),
@@ -273,6 +283,20 @@ object MonitorApi {
             oosNetSum = optDoubleOrNull(obj, "oos_net_sum"),
             oosSteps = optIntOrNull(obj, "oos_steps"),
             nTrades = optIntOrNull(obj, "n_trades"),
+        )
+    }
+
+    private fun parseSignalAlert(obj: JSONObject?): SignalAlert? {
+        if (obj == null) return null
+        val id = obj.optString("id", "").trim()
+        if (id.isBlank()) return null
+        return SignalAlert(
+            id = id,
+            ticker = obj.optString("ticker", ""),
+            engine = obj.optString("engine", ""),
+            score = obj.optDouble("score", 0.0),
+            broker = obj.optString("broker", ""),
+            reason = obj.optString("reason", ""),
         )
     }
 
@@ -532,6 +556,7 @@ object MonitorApi {
             walkForward = walkForward,
             lockedCapital = lockedCapital,
             halted = json.optBoolean("halted", false),
+            signalAlert = parseSignalAlert(json.optJSONObject("signal_alert")),
             brokerBalances = brokerBalances,
             recentTrades = recentTrades,
             recentLog = recentLog,

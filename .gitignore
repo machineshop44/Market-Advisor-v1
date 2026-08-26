@@ -1,4 +1,5 @@
 # Secrets & local runtime state — never commit
+Src/desk_radar.json
 Src/settings.json
 Src/trade_journal.jsonl
 Src/scoring_state.json

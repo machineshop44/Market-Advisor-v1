@@ -3345,12 +3345,104 @@ def evaluate_crypto_opportunity(
     return "DO NOT BUY (Consolidating)"
 
 
-def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live_price=None):
+def _pct_change_from_closes(closes) -> float | None:
+    try:
+        if not closes or len(closes) < 2:
+            return None
+        a = float(closes[0])
+        b = float(closes[-1])
+        if a <= 0:
+            return None
+        return (b / a) - 1.0
+    except Exception:
+        return None
+
+
+def fetch_close_series(ticker, *, interval="15m", period="5d", max_bars=48):
+    """Best-effort OHLC closes for sparklines / RS (oldest → newest)."""
+    clean = str(ticker or "").replace("-USD", "").upper()
+    if not clean:
+        return []
+    try:
+        df = _get_yf().Ticker(_safe_ticker(clean)).history(period=period, interval=interval)
+        df = _closed_bars(df)
+        if df is None or df.empty or "Close" not in df.columns:
+            return []
+        closes = [float(x) for x in df["Close"].tolist() if x is not None]
+        if max_bars and len(closes) > max_bars:
+            closes = closes[-int(max_bars):]
+        return closes
+    except Exception:
+        return []
+
+
+def relative_strength_pct(ticker, *, is_crypto=False) -> dict:
     """
-    Research polish: transparent factors for the scanner signal card.
-    Best-effort — never raises; missing pieces become None/'—'.
+    5d-ish relative strength vs BTC (crypto) or SPY (equity).
+    Returns {rs_pct, ticker_pct, bench_pct, bench}.
     """
     clean = str(ticker or "").replace("-USD", "").upper()
+    bench = "BTC-USD" if is_crypto or uses_btc_regime(clean, False) else "SPY"
+    out = {"rs_pct": None, "ticker_pct": None, "bench_pct": None, "bench": bench.replace("-USD", "")}
+    try:
+        t_closes = fetch_close_series(clean, interval="1h", period="5d", max_bars=80)
+        b_closes = fetch_close_series(bench, interval="1h", period="5d", max_bars=80)
+        tp = _pct_change_from_closes(t_closes)
+        bp = _pct_change_from_closes(b_closes)
+        out["ticker_pct"] = None if tp is None else tp * 100.0
+        out["bench_pct"] = None if bp is None else bp * 100.0
+        if tp is not None and bp is not None:
+            out["rs_pct"] = (tp - bp) * 100.0
+    except Exception:
+        pass
+    return out
+
+
+def explain_gate_from_recommendation(rec: str) -> str:
+    """Short human why from evaluate_* recommendation text."""
+    text = str(rec or "").strip()
+    if not text:
+        return "No recommendation yet — run scoring."
+    low = text.lower()
+    # Prefer explicit BUY — do not match the substring inside "do not buy"
+    if low.startswith("buy") or low.startswith("hold (buy"):
+        return "Gate open — MTF/score path cleared for entry."
+    mapping = (
+        ("cooldown", "Cooldown lockout after a recent sell."),
+        ("regime", "Broad market regime gate blocked entry."),
+        ("turbulence", "BTC turbulence pause on new crypto."),
+        ("overbought", "RSI overbought — wait for a pullback."),
+        ("low volume", "Volume too thin vs recent average."),
+        ("macro downtrend", "1H macro below EMA — trend filter."),
+        ("hold bias", "Score below entry bar (hold bias)."),
+        ("consolidating", "Micro structure consolidating — no trigger."),
+        ("awaiting price", "No live price yet."),
+        ("waiting for dip", "Post-sell dip filter — waiting for lower print."),
+        ("drawdown", "Drawdown pause active."),
+        ("loss streak", "Loss-streak circuit breaker."),
+    )
+    for needle, why in mapping:
+        if needle in low:
+            return why
+    if "do not buy" in low:
+        return text.split("(", 1)[-1].rstrip(")")[:80] if "(" in text else text[:80]
+    return text[:100]
+
+
+def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live_price=None):
+    """Alias for signal_research_bundle (scanner signal card)."""
+    return signal_research_bundle(
+        ticker, is_crypto=is_crypto, broker_id=broker_id, live_price=live_price,
+    )
+
+
+def signal_research_bundle(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live_price=None):
+    """
+    Research polish: factors + sparkline closes + RS + levels for the signal card.
+    Best-effort — never raises; missing pieces become None.
+    """
+    clean = str(ticker or "").replace("-USD", "").upper()
+    crypto = bool(is_crypto) or uses_btc_regime(clean, False)
     out = {
         "ticker": clean,
         "price": None,
@@ -3362,6 +3454,15 @@ def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live
         "regime_ok": None,
         "regime_reason": "",
         "fee_edge_pct": None,
+        "closes": [],
+        "rs_pct": None,
+        "bench": "BTC" if crypto else "SPY",
+        "ticker_pct": None,
+        "bench_pct": None,
+        "stop_pct": None,
+        "stop_price": None,
+        "support_hint": None,
+        "meters": {},
     }
     try:
         px = float(live_price) if live_price and live_price > 0 else fetch_current_price(clean)
@@ -3369,21 +3470,21 @@ def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live
     except Exception:
         pass
     try:
-        ok, reason = market_regime_ok(is_crypto=bool(is_crypto) or uses_btc_regime(clean, False))
+        ok, reason = market_regime_ok(is_crypto=crypto)
         out["regime_ok"] = bool(ok)
         out["regime_reason"] = str(reason or "")
     except Exception:
         pass
     try:
         _, macro_uptrend, _, _ = _get_trend_data(
-            clean, interval="60m", period="5d" if is_crypto else "1mo"
+            clean, interval="60m", period="5d" if crypto else "1mo"
         )
         out["macro_uptrend"] = bool(macro_uptrend)
     except Exception:
         pass
     try:
-        interval = "5m" if is_crypto else "15m"
-        period = "1d" if is_crypto else "5d"
+        interval = "5m" if crypto else "15m"
+        period = "1d" if crypto else "5d"
         micro_bullish, _, rsi, has_volume = _get_trend_data(clean, interval=interval, period=period)
         out["micro_bullish"] = bool(micro_bullish)
         out["rsi"] = float(rsi) if rsi is not None else None
@@ -3391,14 +3492,65 @@ def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live
     except Exception:
         pass
     try:
-        out["score"] = float(buy_rank_score(clean, is_crypto=bool(is_crypto)))
+        out["score"] = float(buy_rank_score(clean, is_crypto=crypto))
     except Exception:
         pass
     try:
         sc = float(out.get("score") or 0)
-        out["fee_edge_pct"] = float(estimated_signal_edge_pct(sc, is_crypto=bool(is_crypto))) * 100.0
+        out["fee_edge_pct"] = float(estimated_signal_edge_pct(sc, is_crypto=crypto)) * 100.0
     except Exception:
         pass
+    try:
+        out["closes"] = fetch_close_series(
+            clean,
+            interval="15m" if not crypto else "5m",
+            period="5d" if not crypto else "1d",
+            max_bars=48,
+        )
+    except Exception:
+        out["closes"] = []
+    try:
+        rs = relative_strength_pct(clean, is_crypto=crypto)
+        out["rs_pct"] = rs.get("rs_pct")
+        out["bench"] = rs.get("bench") or out["bench"]
+        out["ticker_pct"] = rs.get("ticker_pct")
+        out["bench_pct"] = rs.get("bench_pct")
+    except Exception:
+        pass
+    try:
+        stop = abs(float(get_stop_distance_pct(broker_id, ticker=clean, asset_type="crypto" if crypto else "stock")))
+        out["stop_pct"] = stop * 100.0
+        if out.get("price"):
+            out["stop_price"] = float(out["price"]) * (1.0 - stop)
+    except Exception:
+        pass
+    try:
+        px = float(out.get("price") or 0)
+        if px > 0:
+            ok_sup, level, detail = find_support_revisit(clean, px, near_pct=0.02, min_touches=2)
+            if level:
+                out["support_hint"] = float(level)
+            elif detail:
+                out["support_hint"] = None
+    except Exception:
+        pass
+
+    # 0–100 meters for UI
+    rsi = out.get("rsi")
+    score = out.get("score")
+    edge = out.get("fee_edge_pct")
+    rs = out.get("rs_pct")
+    out["meters"] = {
+        "trend": 85 if out.get("macro_uptrend") and out.get("micro_bullish") else (
+            55 if out.get("macro_uptrend") or out.get("micro_bullish") else 25
+        ),
+        "rsi": None if rsi is None else max(0, min(100, float(rsi))),
+        "volume": 80 if out.get("has_volume") else (20 if out.get("has_volume") is False else 50),
+        "regime": 90 if out.get("regime_ok") else (15 if out.get("regime_ok") is False else 50),
+        "score": None if score is None else max(0, min(100, float(score))),
+        "edge": None if edge is None else max(0, min(100, 50.0 + float(edge) * 8.0)),
+        "rs": None if rs is None else max(0, min(100, 50.0 + float(rs) * 4.0)),
+    }
     return out
 
 

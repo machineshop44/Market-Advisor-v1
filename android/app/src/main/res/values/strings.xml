@@ -36,7 +36,7 @@
     <string name="recent_trades_section">Recent Trades</string>
     <string name="queue_prefix">Queue:</string>
     <string name="pull_to_refresh">Pull down to refresh</string>
-    <string name="compat_note">Desktop 1.34.0+</string>
+    <string name="compat_note">Desktop 1.35.0+</string>
     <string name="reauth_etrade">Reauth E*TRADE</string>
     <string name="reauth_title">E*TRADE reauthorization</string>
     <string name="reauth_body">Open E*TRADE in the browser, approve access, then paste the verification code here.</string>
@@ -51,6 +51,8 @@
     <string name="dd_notify_body">Portfolio heat hit DD pause — open Companion to review risk.</string>
     <string name="halt_notify_title">Trading halted</string>
     <string name="halt_notify_body">Desktop halt is active — open Companion to review or resume.</string>
+    <string name="signal_notify_title">New desk signal</string>
+    <string name="signal_notify_body">%1$s · %2$s score %3$.0f — open Companion to review.</string>
     <string name="share_apk">Share APK</string>
     <string name="share_apk_hint">Share this install via Nearby Share / Files / Drive so another phone can install the update.</string>
     <string name="stale_suffix"> · stale</string>

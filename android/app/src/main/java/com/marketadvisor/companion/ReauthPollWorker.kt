@@ -27,6 +27,7 @@ class ReauthPollWorker(
                 reauthNeeded = need,
                 ddPaused = dd,
                 halted = status.halted,
+                signalAlert = status.signalAlert,
             )
             Result.success()
         } catch (_: Exception) {
