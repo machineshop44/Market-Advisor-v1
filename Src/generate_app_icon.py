@@ -110,20 +110,22 @@ def render(size: int) -> Image.Image:
 
 
 def main():
-    master = render(512)
+    # Master PNG for docs / high-DPI references
+    master = render(1024)
     master.save(PNG_PATH, "PNG")
 
-    # Multi-resolution ICO for Windows taskbar / shortcuts / tray
-    sizes = [16, 24, 32, 48, 64, 128, 256]
-    icons = [render(sz) for sz in sizes]
-    icons[0].save(
+    # Windows 10/11: include common logical sizes + DPI multiples so desktop
+    # shortcuts stay sharp at 125–200% scaling (not just 16/32 upscaled).
+    sizes = [16, 20, 24, 32, 40, 48, 64, 72, 96, 128, 256, 512]
+    # Save from the largest bitmap — Pillow downsamples into each ICO layer.
+    ico_base = render(512)
+    ico_base.save(
         ICO_PATH,
         format="ICO",
-        sizes=[(im.width, im.height) for im in icons],
-        append_images=icons[1:],
+        sizes=[(s, s) for s in sizes],
     )
-    print(f"Wrote {PNG_PATH}")
-    print(f"Wrote {ICO_PATH} sizes={sizes}")
+    print(f"Wrote {PNG_PATH} ({master.width}x{master.height})")
+    print(f"Wrote {ICO_PATH} sizes={sizes} ({os.path.getsize(ICO_PATH)} bytes)")
 
 
 if __name__ == "__main__":

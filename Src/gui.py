@@ -9517,6 +9517,29 @@ class MarketAdvisorGUI(QMainWindow):
         )
         self.log_event("[Discord] Test webhook sent.")
 
+    def _maybe_coach_growth_posture(self):
+        """One-time tip when book is small and posture is not already Growth."""
+        if getattr(self, "_growth_posture_coached", False):
+            return
+        try:
+            from scoring import normalize_risk_posture, SMALL_BOOK_EQUITY
+            posture = normalize_risk_posture(self.settings.get("risk_posture", "balanced"))
+            if posture == "growth":
+                self._growth_posture_coached = True
+                return
+            master = float(self._launch_equity_total() or 0.0)
+            if master <= 0 or master >= float(SMALL_BOOK_EQUITY):
+                return
+            self._growth_posture_coached = True
+            self._coach_tip(
+                "growth_posture_small_book",
+                f"Combined equity ~{format_currency(master)} — try Risk Posture → Growth "
+                f"or Advanced → Apply Growth preset for larger tickets and wider DD rails.",
+                cooldown_sec=86400,
+            )
+        except Exception:
+            pass
+
     def _apply_growth_preset(self):
         """Growth posture + knobs tuned for small accounts (~$50–$500)."""
         from scoring import get_risk_posture_profile
@@ -12059,6 +12082,33 @@ class MarketAdvisorGUI(QMainWindow):
             sell_list,
         )
 
+    def _affordable_scan_buy_candidates(self, buy_candidates):
+        """Drop unaffordable scan BUYs before ranked log / buy batch (esp. E*TRADE $100 BP)."""
+        if not buy_candidates:
+            return [], []
+        broker = self.cycle_broker_name
+        broker_obj = self.brokers.get(broker)
+        broker_id = getattr(broker_obj, "broker_id", None) or str(broker).upper()
+        equity, bp, _ = self.get_effective_balances(broker)
+        prefer_equity_rth = False
+        try:
+            prefer_equity_rth = str(self.get_equity_session_info().get("label") or "") == "REGULAR"
+        except Exception:
+            prefer_equity_rth = False
+        prefer_whole = _auto_cycle.affordability_prefer_whole_shares(
+            broker_id,
+            prefer_equity_rth=prefer_equity_rth,
+            settings=self.settings,
+        )
+        return _auto_cycle.filter_affordable_buy_candidates(
+            buy_candidates,
+            buying_power=bp,
+            equity=equity,
+            broker_id=broker_id,
+            settings=self.settings,
+            prefer_whole_shares=prefer_whole,
+        )
+
     def execute_scanner_trades(self, table, auto_mode=False, buy_candidates=None):
         """Execute BUY rows. Auto mode prefers pre-ranked buy_candidates from the bg scan."""
         total_rows = table.rowCount()
@@ -12342,14 +12392,18 @@ class MarketAdvisorGUI(QMainWindow):
                         c["score"] = float(c.get("score") or 0.0)
                         c["scale_in"] = bool(c.get("scale_in"))
             ranked.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-            prefer_whole = bool(self.settings.get("prefer_whole_shares_for_stops", True))
+            prefer_whole = _auto_cycle.affordability_prefer_whole_shares(
+                broker_id,
+                prefer_equity_rth=prefer_equity_rth,
+                settings=self.settings,
+            )
             affordable, unaff = _auto_cycle.filter_affordable_buy_candidates(
                 ranked,
                 buying_power=bp,
                 equity=equity,
                 broker_id=broker_id,
                 settings=self.settings,
-                prefer_whole_shares=prefer_equity_rth and prefer_whole,
+                prefer_whole_shares=prefer_whole,
             )
             if unaff:
                 sample = ", ".join(unaff[:5])
@@ -12377,14 +12431,18 @@ class MarketAdvisorGUI(QMainWindow):
 
         elif ranked and pre_ranked:
             ranked.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
-            prefer_whole = bool(self.settings.get("prefer_whole_shares_for_stops", True))
+            prefer_whole = _auto_cycle.affordability_prefer_whole_shares(
+                broker_id,
+                prefer_equity_rth=prefer_equity_rth,
+                settings=self.settings,
+            )
             affordable, unaff = _auto_cycle.filter_affordable_buy_candidates(
                 ranked,
                 buying_power=bp,
                 equity=equity,
                 broker_id=broker_id,
                 settings=self.settings,
-                prefer_whole_shares=prefer_equity_rth and prefer_whole,
+                prefer_whole_shares=prefer_whole,
             )
             if unaff:
                 sample = ", ".join(unaff[:5])
@@ -13017,10 +13075,14 @@ class MarketAdvisorGUI(QMainWindow):
                     bought = True
                     break
 
-                status, spent = self.execute_buy_order(
-                    ticker, asset_type, price, row_dollars, offset, use_ext,
-                    market_hours=market_hours, allow_fractional=allow_fractional,
-                )
+                try:
+                    status, spent = self.execute_buy_order(
+                        ticker, asset_type, price, row_dollars, offset, use_ext,
+                        market_hours=market_hours, allow_fractional=allow_fractional,
+                    )
+                except Exception as e:
+                    status = f"Buy execution error: {e}"
+                    spent = 0.0
                 # If broker rejected for crypto floor and we haven't rotated yet, free BP once
                 if (
                     (not scale_in)
@@ -13666,14 +13728,18 @@ class MarketAdvisorGUI(QMainWindow):
                     "table_row": row,
                     "scale_in": False,
                 })
-        prefer_whole = bool(self.settings.get("prefer_whole_shares_for_stops", True))
+        prefer_whole = _auto_cycle.affordability_prefer_whole_shares(
+            broker_id,
+            prefer_equity_rth=prefer_equity_rth,
+            settings=self.settings,
+        )
         affordable, unaff = _auto_cycle.filter_affordable_buy_candidates(
             buy_candidates,
             buying_power=bp,
             equity=equity,
             broker_id=broker_id,
             settings=self.settings,
-            prefer_whole_shares=prefer_equity_rth and prefer_whole,
+            prefer_whole_shares=prefer_whole,
         )
         if unaff:
             dropped.extend(unaff)
@@ -13983,6 +14049,11 @@ class MarketAdvisorGUI(QMainWindow):
     def _crypto_on_scored(self, payload):
         opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
         self._apply_scored_opportunities(self.crypto_table, opps, results)
+        if buy_candidates:
+            affordable, unaff = self._affordable_scan_buy_candidates(buy_candidates)
+            if unaff:
+                dropped = list(dropped or []) + list(unaff)
+            buy_candidates = affordable
         self._log_scan_buy_outcome("CRYPTO", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
             self.log_event(
@@ -14013,6 +14084,11 @@ class MarketAdvisorGUI(QMainWindow):
     def _penny_on_scored(self, payload):
         opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
         self._apply_scored_opportunities(self.penny_table, opps, results)
+        if buy_candidates:
+            affordable, unaff = self._affordable_scan_buy_candidates(buy_candidates)
+            if unaff:
+                dropped = list(dropped or []) + list(unaff)
+            buy_candidates = affordable
         self._log_scan_buy_outcome("BREAKOUT", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
             self.log_event(
@@ -14043,6 +14119,11 @@ class MarketAdvisorGUI(QMainWindow):
     def _core_on_scored(self, payload):
         opps, results, buy_candidates, dropped = self._unpack_scan_payload(payload)
         self._apply_scored_opportunities(self.core_table, opps, results)
+        if buy_candidates:
+            affordable, unaff = self._affordable_scan_buy_candidates(buy_candidates)
+            if unaff:
+                dropped = list(dropped or []) + list(unaff)
+            buy_candidates = affordable
         self._log_scan_buy_outcome("CORE", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
             self.log_event(

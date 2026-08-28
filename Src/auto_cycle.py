@@ -675,6 +675,24 @@ def etrade_home_env_chip(
     return chip, tip, col
 
 
+def affordability_prefer_whole_shares(
+    broker_id,
+    *,
+    prefer_equity_rth: bool = False,
+    settings=None,
+) -> bool:
+    """
+    Whole-share affordability gate for filter_affordable_buy_candidates.
+    E*TRADE small-BP books must not pass $300+ names as fractional — preview/order
+    path is fragile and pre-RTH fractional uses REGULAR session only.
+    """
+    bid = str(broker_id or "").upper().replace("*", "").replace(" ", "")
+    if "ETRADE" in bid or bid == "ET":
+        return True
+    prefer_whole = bool((settings or {}).get("prefer_whole_shares_for_stops", True))
+    return bool(prefer_equity_rth and prefer_whole)
+
+
 def filter_affordable_buy_candidates(
     candidates,
     *,

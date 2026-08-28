@@ -10,10 +10,11 @@ if SRC not in sys.path:
 
 class TestCryptoBookCap(unittest.TestCase):
     def test_multi_asset_blocks_over_cap(self):
-        """Robinhood-style: crypto may not exceed ~30% of that broker's equity."""
-        from scoring import concentration_blocks_buy, MAX_CRYPTO_BOOK_FRAC
+        """Robinhood-style: crypto may not exceed book cap for that broker's equity."""
+        from scoring import concentration_blocks_buy, effective_max_crypto_book_frac
 
         equity = 33.0
+        cap = effective_max_crypto_book_frac(equity)
         meta = [
             {"ticker": "SHIB", "value": 6.19, "is_crypto": True},
             {"ticker": "BONK", "value": 6.18, "is_crypto": True},
@@ -30,7 +31,7 @@ class TestCryptoBookCap(unittest.TestCase):
         )
         self.assertTrue(blocked)
         self.assertIn("crypto book cap", reason)
-        self.assertIn(f"{MAX_CRYPTO_BOOK_FRAC * 100:.0f}%", reason)
+        self.assertIn(f"{cap * 100:.0f}%", reason)
 
     def test_crypto_only_skips_book_cap(self):
         """Coinbase: book is crypto — BP util / cash reserve is the deploy rail."""

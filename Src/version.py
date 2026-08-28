@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.38.2"
+__version__ = "1.38.3"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Boot fix; deferred UI error surfacing; Companion Controls sync; session/EOD/crypto routing"
+    "Hi-DPI desktop icon; E*TRADE small-BP buy fix; Growth posture; session/EOD/crypto"
 )
 
 
