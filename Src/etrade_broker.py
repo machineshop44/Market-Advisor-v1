@@ -206,6 +206,7 @@ class ETradeAdapter(BaseBroker):
         self.live_trading_enabled = False
         self.consumer_key = ""
         self._last_order_meta = {}
+        self._quote_cache = {}  # symbol -> (ts, price)
         # Survives dialog close + login() recreating ETradeClient between Authorize and Complete.
         self._pending_request_token = None
         self._pending_request_token_secret = None
@@ -420,13 +421,43 @@ class ETradeAdapter(BaseBroker):
         except Exception:
             return []
 
+    def prefetch_quotes(self, tickers):
+        """Batch quote fetch — one API round-trip for many symbols."""
+        syms = []
+        for t in tickers or []:
+            clean = str(t).upper().replace("-USD", "")
+            if clean and clean not in syms:
+                syms.append(clean)
+        if not syms or not self.is_connected or not self.client:
+            return
+        try:
+            data = self.client.get_quotes(syms[:25])
+            now = time.time()
+            for sym in syms:
+                px = parse_etrade_quote_price(data, sym)
+                if px > 0:
+                    self._quote_cache[sym] = (now, float(px))
+        except Exception:
+            pass
+
+    def _cached_quote(self, ticker, max_age_sec=30.0):
+        clean = str(ticker).upper().replace("-USD", "")
+        row = self._quote_cache.get(clean)
+        if row and (time.time() - float(row[0])) <= float(max_age_sec):
+            return float(row[1])
+        return 0.0
+
     def get_live_price(self, ticker, allow_yahoo_fallback=True):
         clean = str(ticker).upper().replace("-USD", "")
+        cached = self._cached_quote(clean)
+        if cached > 0:
+            return cached
         if self.is_connected and self.client:
             try:
                 data = self.client.get_quotes(clean)
                 px = parse_etrade_quote_price(data, clean)
                 if px > 0:
+                    self._quote_cache[clean] = (time.time(), float(px))
                     return px
             except Exception:
                 pass
@@ -484,6 +515,12 @@ class ETradeAdapter(BaseBroker):
         frac = bool(allow_fractional and self.supports_fractional_equities)
         qty = qty_for_notional(dollars, price, allow_fractional=frac)
         if qty <= 0:
+            if price > dollars + 1e-9:
+                return (
+                    f"Cannot afford 1 share @ ${price:.2f} (sized ${dollars:.2f})",
+                    0.0,
+                    None,
+                )
             return "Quantity rounds to zero", 0.0, None
         if qty < 1.0 and not frac:
             return "Fractional shares required for this size", 0.0, None

@@ -1311,6 +1311,140 @@ def capital_planner_snapshot(
     return out
 
 
+def buy_batch_candidates_pre_ranked(candidates) -> bool:
+    """True when scan already attached scores — skip duplicate yfinance re-rank in buy batch."""
+    rows = list(candidates or [])
+    if not rows:
+        return False
+    for c in rows:
+        if not isinstance(c, dict):
+            return False
+        if c.get("score") is None and not c.get("scale_in"):
+            return False
+    return True
+
+
+def equity_buy_defer_reason(
+    ticker,
+    projected_shares,
+    price,
+    asset_type,
+    session: dict,
+    *,
+    frac_ext_ineligible=None,
+    known_cryptos: Optional[Iterable] = None,
+) -> Optional[str]:
+    """
+    Defer equity BUY when the resulting position could not be sold overnight
+    (mirror of rh_equity_sell_defer_reason on projected size).
+    """
+    overnight = {
+        "label": "OVERNIGHT",
+        "market_hours": "all_day_hours",
+        "use_ext": True,
+        "fractional_ok": False,
+        "equity_tradeable": True,
+    }
+    why = rh_equity_sell_defer_reason(
+        ticker, projected_shares, price, asset_type, overnight,
+        frac_ext_ineligible=frac_ext_ineligible,
+        known_cryptos=known_cryptos,
+    )
+    if why:
+        return f"would be stuck overnight — {why}"
+    ext = dict(session or {})
+    if ext.get("label") == "EXTENDED" and not ext.get("fractional_ok"):
+        why2 = rh_equity_sell_defer_reason(
+            ticker, projected_shares, price, asset_type, ext,
+            frac_ext_ineligible=frac_ext_ineligible,
+            known_cryptos=known_cryptos,
+        )
+        if why2:
+            return f"extended session exit risk — {why2}"
+    return None
+
+
+def equity_eod_action_for_holding(
+    ticker,
+    shares,
+    price,
+    asset_type,
+    *,
+    broker_name: str = "Robinhood",
+    frac_ext_ineligible=None,
+    known_cryptos: Optional[Iterable] = None,
+) -> str:
+    """
+    Pre-close EOD action: keep | flatten | repair.
+    ET equities without flatten setting are keep (warn handled in gui).
+    """
+    bn = str(broker_name or "").upper()
+    if "ETRADE" in bn.replace("*", "").replace(" ", ""):
+        return "keep"
+    overnight = {
+        "label": "OVERNIGHT",
+        "fractional_ok": False,
+        "equity_tradeable": True,
+    }
+    defer = rh_equity_sell_defer_reason(
+        ticker, shares, price, asset_type, overnight,
+        frac_ext_ineligible=frac_ext_ineligible,
+        known_cryptos=known_cryptos,
+    )
+    if defer:
+        return "flatten"
+    if float(shares or 0) >= 1.0:
+        return "repair"
+    return "keep"
+
+
+def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
+    """Map crypto ticker -> broker name holding it."""
+    out: dict = {}
+    for broker, rows in (holdings_by_broker or {}).items():
+        for h in rows or []:
+            if not isinstance(h, dict):
+                continue
+            t = str(h.get("ticker") or "").upper().replace("-USD", "")
+            if not t:
+                continue
+            at = str(h.get("type") or h.get("asset_type") or "")
+            is_c = "crypto" in at.lower() or t in DEFAULT_CRYPTO_TICKERS
+            if not is_c:
+                continue
+            try:
+                sh = float(h.get("shares") or 0)
+            except (TypeError, ValueError):
+                sh = 0.0
+            if sh <= 0:
+                continue
+            out[t] = str(broker)
+    return out
+
+
+def crypto_held_on_other_broker(ticker, broker_name, held_map: dict) -> Optional[str]:
+    """Return broker name if ticker is held elsewhere."""
+    clean = str(ticker or "").upper().replace("-USD", "")
+    owner = (held_map or {}).get(clean)
+    if owner and str(owner) != str(broker_name):
+        return str(owner)
+    return None
+
+
+def format_discord_settings_summary(*, webhook_set: bool, level: str) -> str:
+    wh = "set" if webhook_set else "not set"
+    lvl = str(level or "All Alerts").split("(")[0].strip()
+    if "Disabled" in str(level or ""):
+        return f"Webhook: {wh} · Disabled"
+    return f"Webhook: {wh} · {lvl}"
+
+
+def format_advisor_settings_summary(*, advisor_on: bool, remote_on: bool) -> str:
+    a = "ON" if advisor_on else "OFF"
+    r = "ON" if remote_on else "OFF"
+    return f"Advisor: {a} · Remote: {r}"
+
+
 def format_capital_planner_label(snap: dict, *, money_fn=None) -> str:
     money_fn = money_fn or (lambda x: f"${float(x):.2f}")
     if not snap or not snap.get("ticker"):

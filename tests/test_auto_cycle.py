@@ -341,6 +341,30 @@ class TestCycleBookExtract(unittest.TestCase):
         self.assertEqual(filtered, [])
         self.assertIn("GOEVQ", dropped)
 
+    def test_buy_batch_pre_ranked(self):
+        rows = [{"ticker": "AMC", "score": 92.0}, {"ticker": "GOOGL", "score": 85.0}]
+        self.assertTrue(ac.buy_batch_candidates_pre_ranked(rows))
+        self.assertFalse(ac.buy_batch_candidates_pre_ranked([{"ticker": "X"}]))
+
+    def test_crypto_held_across_brokers(self):
+        held = ac.crypto_held_across_brokers({
+            "Robinhood": [{"ticker": "BTC", "shares": 0.01, "type": "crypto"}],
+            "Coinbase": [{"ticker": "ETH", "shares": 0.1, "type": "crypto"}],
+        })
+        self.assertEqual(held.get("BTC"), "Robinhood")
+        self.assertEqual(ac.crypto_held_on_other_broker("BTC", "Coinbase", held), "Robinhood")
+        self.assertIsNone(ac.crypto_held_on_other_broker("BTC", "Robinhood", held))
+
+    def test_equity_eod_action_fractional_flatten(self):
+        action = ac.equity_eod_action_for_holding(
+            "AMC", 0.5, 5.0, "stock", broker_name="Robinhood",
+        )
+        self.assertEqual(action, "flatten")
+        action2 = ac.equity_eod_action_for_holding(
+            "MSFT", 2.0, 400.0, "stock", broker_name="Robinhood",
+        )
+        self.assertIn(action2, ("keep", "repair"))
+
 
 if __name__ == "__main__":
     unittest.main()

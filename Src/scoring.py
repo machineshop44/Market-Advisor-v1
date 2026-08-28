@@ -150,7 +150,7 @@ MAX_CRYPTO_BOOK_FRAC = 0.30       # max crypto share on multi-asset brokers (RH)
 RTH_EQUITY_RANK_BOOST = 12.0
 RTH_CRYPTO_RANK_PENALTY = 10.0
 SMALL_BOOK_EQUITY = 500.0         # below this, crypto soft penalties start earlier
-SMALL_BOOK_CRYPTO_MIN_DOLLARS = 8.0  # aim ≥ this on small books — ~2% RT fees need room
+SMALL_BOOK_CRYPTO_MIN_DOLLARS = 6.0  # aim ≥ this on small books — fits 3-slot sizing on ~$50 BP
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
 MAX_SINGLE_NAME_EQUITY_FRAC = 0.15  # soft cap: one name ≤ ~15% of equity
 # Fill-quality feedback (conservative; throttled)
@@ -282,12 +282,81 @@ RISK_POSTURE_PROFILES = {
         "dd_pause_minutes": 30,
         "daily_loss_limit_equity_pct": 0.08,
     },
+    "growth": {
+        "label": "Growth",
+        "hint": (
+            "Small-book mode (~$50–$500): 3 focus slots, 2 buys/cycle, faster green takes, "
+            "wider DD pause (22% peak) so one rough patch doesn't freeze entries. "
+            "No BTC regime gate; still hard-stopped. Best for RH/CB micro accounts."
+        ),
+        "require_crypto_regime": False,
+        "target_bp_utilization_pct": 92.0,
+        "sizing_focus_slots": 3,
+        "max_open_positions": 4,
+        "max_buys_per_cycle": 2,
+        "risk_pct_per_trade": 0.90,
+        "max_open_risk_pct": 8.0,
+        "max_single_name_equity_pct": 25.0,
+        "conviction_alloc_mult_max": 1.65,
+        "exit_roi_scale": 0.80,
+        "exit_time_scale": 0.80,
+        "ttp_arm_scale": 0.75,
+        "allow_flat_time_banks": True,
+        "allow_scale_in": True,
+        "scale_in_size_frac": 0.55,
+        "scale_in_max_adds": 1,
+        "scale_in_roi_min": -0.022,
+        "scale_in_roi_max": -0.008,
+        "scale_in_near_pct": 0.015,
+        "scale_in_min_score": 45.0,
+        "day_dd_pause_pct": 0.10,
+        "peak_dd_pause_pct": 0.22,
+        "dd_pause_minutes": 20,
+        "daily_loss_limit_equity_pct": 0.10,
+    },
 }
 
 
 def normalize_risk_posture(name):
     key = str(name or "balanced").strip().lower()
     return key if key in RISK_POSTURE_PROFILES else "balanced"
+
+
+def is_small_book(equity) -> bool:
+    try:
+        return float(equity or 0.0) > 0 and float(equity) < SMALL_BOOK_EQUITY
+    except (TypeError, ValueError):
+        return False
+
+
+def crypto_min_score_for_entry(equity=None, *, is_mover=False) -> float:
+    """Score floor for new crypto entries — lower on small books."""
+    if is_mover:
+        base = float(CRYPTO_MOVER_MIN_SCORE_FOR_ENTRY)
+        small_delta = 6.0
+    else:
+        base = float(CRYPTO_MIN_SCORE_FOR_ENTRY)
+        small_delta = 5.0
+    if is_small_book(equity):
+        return max(45.0, base - small_delta)
+    return base
+
+
+def crypto_thin_min_score(equity=None) -> float:
+    if is_small_book(equity):
+        return max(55.0, float(CRYPTO_THIN_MIN_SCORE) - 12.0)
+    return float(CRYPTO_THIN_MIN_SCORE)
+
+
+def effective_max_crypto_book_frac(portfolio_value=0.0) -> float:
+    """Small books can run a higher crypto share — fees dominate if tickets are tiny."""
+    try:
+        pv = float(portfolio_value or 0.0)
+    except (TypeError, ValueError):
+        pv = 0.0
+    if pv > 0 and pv < SMALL_BOOK_EQUITY:
+        return 0.45
+    return float(MAX_CRYPTO_BOOK_FRAC)
 
 
 def get_risk_posture_profile(name=None):
@@ -485,7 +554,9 @@ def estimated_signal_edge_pct(score, *, is_crypto=False):
     return max(0.0, (sc - base) * per_pt)
 
 
-def crypto_new_entry_ok(broker_id, ticker, score=0.0, notional=None, *, skip_turbulence=False):
+def crypto_new_entry_ok(
+    broker_id, ticker, score=0.0, notional=None, *, skip_turbulence=False, equity=None,
+):
     """
     FinRL hold-bias for NEW crypto buys (not scale-in / not protective).
     Raises the bar vs hold; blocks thin $5 tickets when edge ≪ RT+edge.
@@ -499,10 +570,11 @@ def crypto_new_entry_ok(broker_id, ticker, score=0.0, notional=None, *, skip_tur
         sc = float(score or 0.0)
     except (TypeError, ValueError):
         sc = 0.0
-    if sc < float(CRYPTO_MIN_SCORE_FOR_ENTRY):
+    min_score = crypto_min_score_for_entry(equity, is_mover=False)
+    if sc < min_score:
         return False, (
             f"DO NOT BUY (Hold bias: score {sc:.0f} < "
-            f"{CRYPTO_MIN_SCORE_FOR_ENTRY:.0f})"
+            f"{min_score:.0f})"
         )
     need = min_entry_edge_pct(broker_id, ticker, "cryptocurrency")
     edge = estimated_signal_edge_pct(sc, is_crypto=True)
@@ -512,10 +584,11 @@ def crypto_new_entry_ok(broker_id, ticker, score=0.0, notional=None, *, skip_tur
     except (TypeError, ValueError):
         notion = None
     if notion is not None and notion > 0 and notion <= floor * float(CRYPTO_THIN_TICKET_MULT):
-        if sc < float(CRYPTO_THIN_MIN_SCORE):
+        thin_min = crypto_thin_min_score(equity)
+        if sc < thin_min:
             return False, (
                 f"DO NOT BUY (Thin ${notion:.2f} ticket: score {sc:.0f} < "
-                f"{CRYPTO_THIN_MIN_SCORE:.0f} — edge ≪ ~{need*100:.1f}% RT+edge)"
+                f"{thin_min:.0f} — edge ≪ ~{need*100:.1f}% RT+edge)"
             )
         if edge + 1e-12 < need:
             return False, (
@@ -825,6 +898,15 @@ _equity_dd = {
 }
 _trend_cache = {}
 _TREND_CACHE_TTL = 45  # seconds
+_trend_fetch_lock = None  # lazy threading.Lock — yfinance is not thread-safe on Windows
+
+
+def _trend_lock():
+    global _trend_fetch_lock
+    if _trend_fetch_lock is None:
+        import threading
+        _trend_fetch_lock = threading.Lock()
+    return _trend_fetch_lock
 _atr_cache = {}  # ticker -> (ts, atr_pct or None)
 
 # Regime multi-source state (GUI registers connected broker adapters)
@@ -1107,34 +1189,38 @@ def _get_trend_data(ticker, interval="5m", period="5d"):
         return cached[1]
 
     result = (False, False, None, False)
-    try:
-        df = _get_yf().Ticker(_safe_ticker(ticker)).history(period=period, interval=interval)
-        df = _closed_bars(df)
-        if df is None or df.empty or len(df) < 20:
-            _trend_cache[cache_key] = (time.time(), result)
-            return result
+    with _trend_lock():
+        cached = _trend_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < _TREND_CACHE_TTL:
+            return cached[1]
+        try:
+            df = _get_yf().Ticker(_safe_ticker(ticker)).history(period=period, interval=interval)
+            df = _closed_bars(df)
+            if df is None or df.empty or len(df) < 20:
+                _trend_cache[cache_key] = (time.time(), result)
+                return result
 
-        macd, sig = _calculate_macd(df)
-        if macd is None or sig is None:
-            _trend_cache[cache_key] = (time.time(), result)
-            return result
+            macd, sig = _calculate_macd(df)
+            if macd is None or sig is None:
+                _trend_cache[cache_key] = (time.time(), result)
+                return result
 
-        ema20 = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        rsi = _calculate_rsi(df, RSI_PERIOD)
+            ema20 = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
+            rsi = _calculate_rsi(df, RSI_PERIOD)
 
-        current_vol = df['Volume'].iloc[-1]
-        avg_vol_1h = df['Volume'].iloc[-13:-1].mean() if len(df) > 13 else current_vol
-        has_volume = current_vol >= (avg_vol_1h * 0.8)
+            current_vol = df['Volume'].iloc[-1]
+            avg_vol_1h = df['Volume'].iloc[-13:-1].mean() if len(df) > 13 else current_vol
+            has_volume = current_vol >= (avg_vol_1h * 0.8)
 
-        is_uptrend = df['Close'].iloc[-1] > ema20
-        # Crossover only — requiring macd > 0 blocked early (still-bullish) entries
-        is_bullish = (macd > sig)
+            is_uptrend = df['Close'].iloc[-1] > ema20
+            # Crossover only — requiring macd > 0 blocked early (still-bullish) entries
+            is_bullish = (macd > sig)
 
-        result = (is_bullish, is_uptrend, rsi, has_volume)
-    except Exception:
-        result = (False, False, None, False)
+            result = (is_bullish, is_uptrend, rsi, has_volume)
+        except Exception:
+            result = (False, False, None, False)
 
-    _trend_cache[cache_key] = (time.time(), result)
+        _trend_cache[cache_key] = (time.time(), result)
     return result
 
 
@@ -1939,8 +2025,9 @@ def concentration_blocks_buy(ticker, held_tickers, holdings_meta=None, portfolio
         pv = float(portfolio_value or 0.0)
         if pv > 0:
             projected = (crypto_val + float(proposed_dollars or 0.0)) / pv
-            if projected > MAX_CRYPTO_BOOK_FRAC:
-                return True, f"crypto book cap ({projected*100:.0f}% > {MAX_CRYPTO_BOOK_FRAC*100:.0f}%)"
+            cap = effective_max_crypto_book_frac(pv)
+            if projected > cap:
+                return True, f"crypto book cap ({projected*100:.0f}% > {cap*100:.0f}%)"
 
     return False, ""
 
@@ -2716,6 +2803,19 @@ def opportunity_swap_params(posture=None):
             "score_to_edge_pct": 0.0012,  # need larger score gap to clear fees
             "freeze_on_regime_fail": True,
         }
+    if p == "growth":
+        return {
+            "enabled": True,
+            "roi_floor": -0.02,
+            "score_gap": 12.0,
+            "min_hold_crypto_min": 45.0,
+            "min_hold_equity_min": 60.0,
+            "hard_stop_buffer": 0.005,
+            "max_rotates_per_day": 2,
+            "fee_buffer_pct": max(MIN_PROFIT_OVER_FEES_PCT, 0.012),
+            "score_to_edge_pct": 0.0012,
+            "freeze_on_regime_fail": True,
+        }
     # balanced — tighter hold bias / fewer rotates (FinRL fewer actions)
     return {
         "enabled": True,
@@ -3371,6 +3471,7 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
 
 def evaluate_crypto_opportunity(
     ticker, broker_id="ROBINHOOD", live_price=None, posture="balanced", *, is_mover=False,
+    equity=None,
 ):
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
@@ -3397,11 +3498,7 @@ def evaluate_crypto_opportunity(
     if rsi >= RSI_CEILING: return f"DO NOT BUY (RSI Overbought: {rsi:.1f})"
     if not has_volume: return "DO NOT BUY (Low Volume Fakeout)"
 
-    min_score = (
-        float(CRYPTO_MOVER_MIN_SCORE_FOR_ENTRY)
-        if is_mover
-        else float(CRYPTO_MIN_SCORE_FOR_ENTRY)
-    )
+    min_score = crypto_min_score_for_entry(equity, is_mover=bool(is_mover))
     if micro_bullish:
         # Hold bias: weak scores stay HOLD — prefer no-trade vs OW-fee churn
         try:

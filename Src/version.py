@@ -14,12 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.37.1"
+__version__ = "1.38.2"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Honesty patch: per-broker posture actually drives size/DD/exits, "
-    "Advisor claim-then-fill, overnight gaps, halt vs disarmed"
+    "Boot fix; deferred UI error surfacing; Companion Controls sync; session/EOD/crypto routing"
 )
 
 
