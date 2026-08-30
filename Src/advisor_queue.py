@@ -88,6 +88,28 @@ def list_pending(limit: int = 12) -> list[dict]:
     return list(reversed(out))
 
 
+def patch_ai(proposal_id: str, ai: dict) -> dict | None:
+    """Attach AI brief/verdict to a pending proposal."""
+    pid = str(proposal_id or "").strip()
+    if not pid or not isinstance(ai, dict):
+        return None
+    with _lock:
+        data = _load()
+        for p in data.get("proposals") or []:
+            if isinstance(p, dict) and str(p.get("id") or "") == pid:
+                if str(p.get("status") or "") not in ("pending", "executing"):
+                    return None
+                p["ai_verdict"] = str(ai.get("verdict") or "")
+                p["ai_brief"] = str(ai.get("brief") or "")[:500]
+                p["ai_detail"] = str(ai.get("detail") or "")[:500]
+                p["ai_source"] = str(ai.get("source") or "")
+                p["ai_error"] = str(ai.get("error") or "")[:200]
+                p["ai_at"] = float(time.time())
+                _save(data)
+                return dict(p)
+    return None
+
+
 def get(proposal_id: str) -> dict | None:
     pid = str(proposal_id or "").strip()
     if not pid:
@@ -153,6 +175,11 @@ def propose(
             "created_at": now,
             "updated_at": now,
             "expires_at": now + float(ttl_sec or DEFAULT_TTL_SEC),
+            "ai_verdict": "",
+            "ai_brief": "",
+            "ai_detail": "",
+            "ai_source": "",
+            "ai_at": 0.0,
         }
         proposals.append(prop)
         data["proposals"] = proposals[-80:]
@@ -227,6 +254,12 @@ def monitor_payload(limit: int = 5) -> dict:
                 "dollars": p.get("dollars"),
                 "score": p.get("score"),
                 "engine": p.get("engine"),
+                "price": p.get("price"),
+                "ai_verdict": p.get("ai_verdict") or "",
+                "ai_brief": p.get("ai_brief") or "",
+                "ai_detail": p.get("ai_detail") or "",
+                "ai_source": p.get("ai_source") or "",
+                "ai_pending": not bool(p.get("ai_brief")),
             }
             for p in pending
         ],

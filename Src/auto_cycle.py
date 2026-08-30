@@ -1457,10 +1457,26 @@ def format_discord_settings_summary(*, webhook_set: bool, level: str) -> str:
     return f"Webhook: {wh} · {lvl}"
 
 
-def format_advisor_settings_summary(*, advisor_on: bool, remote_on: bool) -> str:
+def format_advisor_settings_summary(
+    *,
+    advisor_on: bool,
+    remote_on: bool,
+    ai_on: bool = False,
+    ai_ready: bool = False,
+    ai_source: str = "local",
+    cursor_on: bool = False,
+) -> str:
     a = "ON" if advisor_on else "OFF"
     r = "ON" if remote_on else "OFF"
-    return f"Advisor: {a} · Remote: {r}"
+    src = str(ai_source or "local").lower()
+    if src == "local":
+        brief = "local briefs"
+    elif ai_ready:
+        brief = f"{src} API"
+    else:
+        brief = f"{src} (no key)"
+    cur = " · Cursor on" if cursor_on else ""
+    return f"Advisor: {a} · {brief}{cur} · Remote: {r}"
 
 
 def format_capital_planner_label(snap: dict, *, money_fn=None) -> str:

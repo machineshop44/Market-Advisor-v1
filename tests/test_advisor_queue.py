@@ -77,6 +77,7 @@ def test_posture_for_broker_override():
 
     settings = {
         "risk_posture": "balanced",
+        "auto_scale_growth": False,
         "risk_posture_by_broker": {"Robinhood": "aggressive", "E*TRADE": "safer"},
     }
     assert posture_for_broker("Robinhood", settings) == "aggressive"
@@ -89,6 +90,7 @@ def test_posture_knobs_override_ignores_global_advanced():
 
     settings = {
         "risk_posture": "balanced",
+        "auto_scale_growth": False,
         "risk_posture_by_broker": {"Robinhood": "aggressive"},
         "max_open_positions": 99,
         "day_dd_pause_pct": 0.03,

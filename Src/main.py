@@ -126,6 +126,7 @@ def main():
     splash.showMessage("Building interface…", Qt.AlignBottom | Qt.AlignHCenter, QColor("#E8F5E9"))
     app.processEvents()
     window = MarketAdvisorGUI()
+    window.attach_boot_splash(splash, app)
     if not icon.isNull():
         window.setWindowIcon(icon)
         QTimer.singleShot(0, lambda: window.setWindowIcon(icon))
@@ -136,7 +137,7 @@ def main():
         boot_tray.hide()
         boot_tray.deleteLater()
 
-    splash.finish(window)
+    # Splash stays on top until balances + holdings load (see attach_boot_splash).
     window.show()
     window.raise_()
     window.activateWindow()

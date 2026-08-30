@@ -191,6 +191,7 @@ def load_settings():
         "allocation_pct_stock": 5.0,
         "min_trade_dollars": 5.0,
         "risk_posture": "balanced",
+        "auto_scale_growth": True,
         "target_bp_utilization_pct": 88.0,
         "sizing_focus_slots": 6,
         "max_single_name_equity_pct": 15.0,
@@ -213,6 +214,15 @@ def load_settings():
         "attach_protective_stops": True,
         "et_flatten_before_close": False,
         "advisor_ask_before_apply": True,
+        "advisor_ai_source": "local",
+        "advisor_ai_enabled": True,
+        "advisor_ai_provider": "gemini",
+        "advisor_ai_api_key": "",
+        "advisor_ai_model": "",
+        "advisor_ai_auto_reject_skip": True,
+        "cursor_monitor_enabled": False,
+        "cursor_monitor_token": "",
+        "desk_snag_discord_alerts": True,
         "risk_posture_by_broker": {},
         "risk_pct_per_trade": 0.75,
         "max_open_risk_pct": 6.0,
@@ -326,6 +336,7 @@ class SparklineWidget(QWidget):
     def __init__(self, parent=None, *, min_h=36, max_h=48):
         super().__init__(parent)
         self._closes = []
+        self._dark = False
         self.setMinimumHeight(ui_px(min_h))
         if max_h is None:
             self.setMaximumHeight(16777215)
@@ -333,6 +344,10 @@ class SparklineWidget(QWidget):
         else:
             self.setMaximumHeight(ui_px(max_h))
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_dark_mode(self, dark: bool):
+        self._dark = bool(dark)
+        self.update()
 
     def set_closes(self, closes):
         try:
@@ -345,13 +360,16 @@ class SparklineWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(2, 4, -2, -4)
-        p.fillRect(self.rect(), QColor("#F5F7F6"))
+        bg = QColor("#1A1D24" if self._dark else "#F5F7F6")
+        fg = QColor("#9AA0A6" if self._dark else "#9E9E9E")
+        p.fillRect(self.rect(), bg)
         if len(self._closes) < 2:
-            p.setPen(QColor("#9E9E9E"))
+            p.setPen(fg)
             p.drawText(rect, Qt.AlignCenter, "No chart bars yet")
             return
         lo = min(self._closes)
         hi = max(self._closes)
+        last = self._closes[-1]
         span = (hi - lo) or 1.0
         w = max(1, rect.width())
         h = max(1, rect.height())
@@ -362,10 +380,19 @@ class SparklineWidget(QWidget):
             y = rect.bottom() - ((c - lo) / span) * h
             pts.append(QPoint(int(x), int(y)))
         up = self._closes[-1] >= self._closes[0]
-        pen = QPen(QColor("#1F8A70" if up else "#C62828"), 2)
+        pen = QPen(QColor("#26A69A" if up else "#E57373"), 2)
         p.setPen(pen)
         for i in range(1, len(pts)):
             p.drawLine(pts[i - 1], pts[i])
+        # Price labels (shape-only chart — numbers live here + header line)
+        label_fg = QColor("#B0BEC5" if self._dark else "#546E7A")
+        p.setPen(label_fg)
+        font = p.font()
+        font.setPointSize(max(8, int(9 * ui_scale())))
+        p.setFont(font)
+        p.drawText(rect.adjusted(2, 0, 0, 0), Qt.AlignTop | Qt.AlignLeft, format_currency(last))
+        p.drawText(rect.adjusted(0, 0, -2, 0), Qt.AlignTop | Qt.AlignRight, format_currency(hi))
+        p.drawText(rect.adjusted(2, 0, 0, 0), Qt.AlignBottom | Qt.AlignLeft, format_currency(lo))
 
 
 class FactorMeterRow(QWidget):
@@ -373,10 +400,12 @@ class FactorMeterRow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._dark = False
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(ui_px(6))
         self._bars = {}
+        self._labels = {}
         for key, label in (
             ("trend", "Trend"),
             ("rsi", "RSI"),
@@ -401,7 +430,30 @@ class FactorMeterRow(QWidget):
             host.setLayout(col)
             lay.addWidget(host)
             self._bars[key] = bar
+            self._labels[key] = lbl
         lay.addStretch(1)
+
+    def set_dark_mode(self, dark: bool):
+        self._dark = bool(dark)
+        tc = theme_colors(self._dark)
+        for lbl in self._labels.values():
+            lbl.setStyleSheet(f"font-size: {ui_px(10)}px; color: {tc['muted']};")
+        # Re-apply bar colors for current values
+        for key, bar in self._bars.items():
+            self._style_bar(key, bar.value())
+
+    def _style_bar(self, key, value):
+        bar = self._bars.get(key)
+        if bar is None:
+            return
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            v = 0
+        if v <= 0 and value == 0:
+            bar.setStyleSheet(factor_meter_bar_style(self._dark, value=0))
+        else:
+            bar.setStyleSheet(factor_meter_bar_style(self._dark, value=v))
 
     def set_meters(self, meters: dict):
         meters = meters or {}
@@ -409,15 +461,14 @@ class FactorMeterRow(QWidget):
             raw = meters.get(key)
             if raw is None:
                 bar.setValue(0)
-                bar.setStyleSheet("QProgressBar::chunk { background: #BDBDBD; }")
+                self._style_bar(key, 0)
                 continue
             try:
                 v = int(max(0, min(100, float(raw))))
             except (TypeError, ValueError):
                 v = 0
             bar.setValue(v)
-            color = "#1F8A70" if v >= 60 else ("#F9A825" if v >= 40 else "#C62828")
-            bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
+            self._style_bar(key, v)
 
 
 # Brand-aligned UI tokens (splash green #0D3B2E → teal accent, softer radii)
@@ -465,6 +516,23 @@ def compute_ui_scale(width, height):
 def ui_px(base, minimum=1):
     """Scale a design-pixel value for the current window size."""
     return max(minimum, int(round(float(base) * _UI_SCALE)))
+
+
+def factor_meter_bar_style(dark_mode, *, value=50):
+    """QProgressBar stylesheet for Signal tab factor meters."""
+    if value >= 60:
+        chunk = "#26A69A" if dark_mode else "#1F8A70"
+    elif value >= 40:
+        chunk = "#FFB300" if dark_mode else "#F9A825"
+    else:
+        chunk = "#E57373" if dark_mode else "#C62828"
+    track = "#1A2E28" if dark_mode else "#E8ECEA"
+    border = "#2A2F3A" if dark_mode else "#C5CAD3"
+    return (
+        f"QProgressBar {{ border: 1px solid {border}; border-radius: {ui_px(3)}px; "
+        f"background-color: {track}; }}"
+        f"QProgressBar::chunk {{ background: {chunk}; border-radius: {ui_px(2)}px; }}"
+    )
 
 
 def cluster_heat_bar_style(dark_mode, *, full=False):
@@ -1756,6 +1824,72 @@ class MarketAdvisorGUI(QMainWindow):
         self._ipo_auto_timer.timeout.connect(lambda: self.refresh_ipo_calendar(force=False))
         self._ipo_auto_timer.start(3 * 3600 * 1000)
         self._post_show_init()
+
+    BOOT_SPLASH_MIN_SEC = 1.6
+    BOOT_SPLASH_MAX_SEC = 14.0
+
+    def attach_boot_splash(self, splash, app=None):
+        """Keep splash on top until first portfolio + BP load (avoids Not Responding flash)."""
+        self._boot_splash = splash
+        self._boot_app = app
+        self._boot_splash_started = time.time()
+        self._boot_splash_dismissed = False
+        self._boot_splash_balances_ok = False
+        self._boot_splash_holdings_ok = False
+        self._boot_splash_waiting_holdings = False
+        QTimer.singleShot(int(self.BOOT_SPLASH_MAX_SEC * 1000), self._boot_splash_timeout)
+
+    def _splash_boot_message(self, msg: str):
+        splash = getattr(self, "_boot_splash", None)
+        if not splash:
+            return
+        try:
+            splash.showMessage(str(msg), Qt.AlignBottom | Qt.AlignHCenter, QColor("#E8F5E9"))
+            app = getattr(self, "_boot_app", None) or QApplication.instance()
+            if app:
+                app.processEvents()
+        except Exception:
+            pass
+
+    def _check_boot_splash_ready(self):
+        if getattr(self, "_boot_splash_dismissed", False):
+            return
+        if not getattr(self, "_boot_splash", None):
+            return
+        if not getattr(self, "_boot_splash_balances_ok", False):
+            return
+        if getattr(self, "_boot_splash_waiting_holdings", False):
+            if not getattr(self, "_boot_splash_holdings_ok", False):
+                return
+        elapsed = time.time() - float(getattr(self, "_boot_splash_started", time.time()))
+        wait_ms = max(0, int((self.BOOT_SPLASH_MIN_SEC - elapsed) * 1000)) + 180
+        QTimer.singleShot(wait_ms, self._dismiss_boot_splash_now)
+
+    def _boot_splash_timeout(self):
+        if getattr(self, "_boot_splash_dismissed", False):
+            return
+        if getattr(self, "_boot_splash", None):
+            self.log_event("Boot splash timeout — opening desk (balances may still be loading).")
+            self._dismiss_boot_splash_now()
+
+    def _dismiss_boot_splash_now(self):
+        if getattr(self, "_boot_splash_dismissed", False):
+            return
+        splash = getattr(self, "_boot_splash", None)
+        if not splash:
+            return
+        self._boot_splash_dismissed = True
+        self._boot_splash = None
+        try:
+            self._splash_boot_message("Ready")
+            splash.finish(self)
+        except Exception:
+            try:
+                splash.close()
+            except Exception:
+                pass
+        self.raise_()
+        self.activateWindow()
 
     def _post_show_init(self):
         """Runs right after first event-loop tick so the window appears sooner."""
@@ -3115,6 +3249,8 @@ class MarketAdvisorGUI(QMainWindow):
             self.log_event("🌅 Midnight reached. Daily P&L Tracker reset for the new day.")
 
         self._balances_refresh_in_flight = True
+        if getattr(self, "_boot_splash", None) and not quiet:
+            self._splash_boot_message("Fetching portfolio & buying power…")
         if not quiet:
             self.set_working_state(True, f"Fetching {self.active_broker_name} balances...")
 
@@ -3125,6 +3261,9 @@ class MarketAdvisorGUI(QMainWindow):
         def _fail(err):
             self._balances_refresh_in_flight = False
             self.log_event(f"Balance fetch error: {err}")
+            if getattr(self, "_boot_splash", None):
+                self._boot_splash_balances_ok = True
+                self._check_boot_splash_ready()
             # Keep last known totals — do not overwrite with zeros (corrupts Day P&L / Discord)
             if not quiet:
                 self.set_working_state(False)
@@ -3465,6 +3604,7 @@ class MarketAdvisorGUI(QMainWindow):
     def _on_all_balances_fetched(self, totals):
         merged, trusted = self._merge_balance_totals(totals if isinstance(totals, dict) else {})
         self._last_balance_totals = merged
+        self._sync_equity_posture_snapshot()
         # Update Master Totals
         master_val = sum(float((d or {}).get("p_val", 0) or 0) for d in merged.values())
         master_bp = sum(float((d or {}).get("bp", 0) or 0) for d in merged.values())
@@ -3580,6 +3720,9 @@ class MarketAdvisorGUI(QMainWindow):
 
         # Launch Discord: first ping after balances, or upgrade an empty/$0 ping
         self._balances_fetched_once = True
+        if getattr(self, "_boot_splash", None):
+            self._boot_splash_balances_ok = True
+            self._check_boot_splash_ready()
         self._maybe_coach_growth_posture()
         master_val = self._launch_equity_total(merged)
         in_flight = getattr(self, "_launch_checkin_in_flight", False)
@@ -3640,6 +3783,8 @@ class MarketAdvisorGUI(QMainWindow):
             "password": pwd,
             "controls_enabled": controls,
             "use_tls": use_tls,
+            "cursor_agent_enabled": bool(self.settings.get("cursor_monitor_enabled", False)),
+            "cursor_agent_token": str(self.settings.get("cursor_monitor_token") or "").strip(),
         }
 
         def _bg():
@@ -4005,9 +4150,346 @@ class MarketAdvisorGUI(QMainWindow):
     def _monitor_advisor_payload(self):
         try:
             import advisor_queue as aq
-            return aq.monitor_payload(limit=5)
+            import desk_advisor_ai as dai
+
+            payload = aq.monitor_payload(limit=5)
+            payload["ai_enabled"] = dai.ai_enabled(self.settings)
+            payload["ai_configured"] = dai.ai_configured(self.settings)
+            payload["desk_health"] = dict(getattr(self, "_last_desk_health", None) or {})
+            return payload
         except Exception:
-            return {"count": 0, "pending": []}
+            return {"count": 0, "pending": [], "ai_enabled": False, "ai_configured": False}
+
+    def _session_market_labels(self) -> tuple[str, str]:
+        market = "Unknown"
+        if hasattr(self, "market_status_lbl"):
+            txt = self.market_status_lbl.text() or ""
+            market = txt.replace("Market: ", "").strip() or market
+        session = market
+        return session, market
+
+    def _build_trader_context_map(self) -> dict:
+        """Per-broker desk snapshot — same facts a human checks before buying."""
+        import trader_context as tc
+        from scoring import get_drawdown_status
+
+        totals = getattr(self, "_last_balance_totals", {}) or {}
+        session, market = self._session_market_labels()
+        advisor_gate = bool(self.settings.get("advisor_ask_before_apply", True))
+        halted = bool(getattr(self, "_panic_halted", False))
+        bid_map = {
+            "Robinhood": "ROBINHOOD",
+            "Coinbase": "COINBASE",
+            "E*TRADE": "ETRADE",
+        }
+        out = {}
+        for name in BROKER_NAMES:
+            snap = totals.get(name) or {}
+            bp = float(snap.get("bp") or 0)
+            equity = float(snap.get("p_val") or 0)
+            b = self.brokers.get(name)
+            connected = bool(getattr(b, "is_connected", False)) or self.paper_mode
+            reauth = bool(getattr(self, "_broker_manual_auth_needed", {}).get(name))
+            armed = bool(self.auto_trade_enabled.get(name))
+            dd_paused = False
+            dd_reason = ""
+            dd_mins = 0
+            try:
+                st = get_drawdown_status(bid_map.get(name, name), equity=equity)
+                dd_paused = bool(st.get("paused"))
+                dd_reason = str(st.get("pause_reason") or "")
+                if dd_paused:
+                    dd_mins = int(
+                        max(0.0, float(st.get("pause_until") or 0.0) - time.time()) / 60.0
+                    ) + 1
+            except Exception:
+                pass
+            idle = ""
+            try:
+                idle = str(self._buy_engines_idle_reason(name) or "")
+            except Exception:
+                pass
+            out[name] = tc.build_trader_context(
+                name,
+                equity=equity,
+                buying_power=bp,
+                settings=self.settings,
+                session_label=session,
+                market_label=market,
+                open_positions=int(
+                    (getattr(self, "_holdings_count_cache", {}) or {}).get(name, 0) or 0
+                ),
+                dd_paused=dd_paused,
+                dd_reason=dd_reason,
+                dd_mins_left=dd_mins,
+                armed=armed,
+                connected=connected,
+                halted=halted,
+                reauth_needed=reauth,
+                idle_reason=idle,
+                supports_crypto=name == "Coinbase",
+                supports_equities=name != "Coinbase",
+                advisor_gate=advisor_gate,
+            )
+        return out
+
+    def _format_trader_context_home(self, ctx_map: dict | None = None) -> str:
+        """One-line Home summary from trader context."""
+        rows = []
+        for name in BROKER_NAMES:
+            ctx = (ctx_map or {}).get(name) or {}
+            if not ctx:
+                continue
+            flag = "✓" if ctx.get("auto_ready") else ("⏸" if ctx.get("can_place_new_buy") else "✗")
+            bp = float(ctx.get("buying_power") or 0)
+            max_sh = float(ctx.get("max_affordable_share_price") or 0)
+            posture = str(ctx.get("posture_label") or ctx.get("posture") or "?")
+            blockers = ctx.get("blockers") or []
+            tail = ""
+            if blockers:
+                tail = f" — {blockers[0].get('message', '')[:48]}"
+            elif ctx.get("small_book"):
+                tail = " — breakouts first"
+            rows.append(
+                f"{flag} {name}: ${bp:.0f} BP · ≤${max_sh:.0f}/sh · {posture}{tail}"
+            )
+        return "  |  ".join(rows) if rows else "Desk context — no broker data yet"
+
+    def _advisor_ai_context(self, broker_name: str) -> dict:
+        """Book + session context for AI / local advisor briefs."""
+        ctx_map = getattr(self, "_last_trader_context", None)
+        if not ctx_map:
+            ctx_map = self._build_trader_context_map()
+            self._last_trader_context = ctx_map
+        ctx = dict((ctx_map or {}).get(broker_name) or {})
+        if not ctx:
+            ctx = self._build_trader_context_map().get(broker_name) or {}
+        return ctx
+
+    def _schedule_advisor_ai_analysis(self, proposal_id: str, broker_name: str):
+        """Background AI/local brief for a pending proposal."""
+        import advisor_queue as aq
+        import desk_advisor_ai as dai
+
+        pid = str(proposal_id or "").strip()
+        if not pid:
+            return
+
+        def work():
+            prop = aq.get(pid)
+            if not prop or str(prop.get("status") or "") != "pending":
+                return None
+            ctx = self._advisor_ai_context(broker_name)
+            result = dai.analyze_proposal(prop, ctx, self.settings)
+            patched = aq.patch_ai(pid, result)
+            return {"proposal_id": pid, "result": result, "proposal": patched}
+
+        def done(payload):
+            if not payload:
+                return
+            result = (payload or {}).get("result") or {}
+            prop = (payload or {}).get("proposal") or {}
+            tick = prop.get("ticker") or "?"
+            verdict = str(result.get("verdict") or "")
+            brief = str(result.get("brief") or "")
+            src = str(result.get("source") or "local")
+            if brief:
+                self.log_event(f"[Advisor AI] {tick} → {verdict or '—'} ({src}): {brief}")
+            if (
+                verdict == "skip"
+                and bool(self.settings.get("advisor_ai_auto_reject_skip", True))
+                and prop.get("id")
+            ):
+                import advisor_queue as aq
+
+                rejected = aq.reject(prop["id"])
+                if rejected:
+                    self.log_event(f"[Advisor AI] Auto-rejected {tick} (AI skip).")
+            self._refresh_advisor_card()
+            self.publish_monitor_status()
+            if brief:
+                self.send_discord_alert(
+                    f"**Advisor AI** {tick}: {verdict.upper()} — {brief}",
+                    is_trade=False,
+                )
+
+        self.run_thread(work, done)
+
+    def _refresh_desk_health_local(self):
+        try:
+            import desk_advisor_ai as dai
+
+            log_lines = list(getattr(self, "_recent_log_lines", []) or [])[-40:]
+            snap = {"halted": bool(getattr(self, "_panic_halted", False))}
+            self._last_desk_health = dai.analyze_desk_health(log_lines, snap, None)
+        except Exception:
+            self._last_desk_health = {}
+
+    def _maybe_schedule_desk_health_ai(self):
+        try:
+            import desk_advisor_ai as dai
+
+            if not dai.ai_configured(self.settings):
+                return
+            now = time.time()
+            last = float(getattr(self, "_desk_health_ai_at", 0.0) or 0.0)
+            if now - last < 900.0:
+                return
+            self._desk_health_ai_at = now
+            log_lines = list(getattr(self, "_recent_log_lines", []) or [])[-40:]
+            snap = {"halted": bool(getattr(self, "_panic_halted", False))}
+
+            def work():
+                return dai.analyze_desk_health(log_lines, snap, self.settings)
+
+            def done(health):
+                if isinstance(health, dict):
+                    self._last_desk_health = health
+                    self.publish_monitor_status()
+
+            self.run_thread(work, done)
+        except Exception:
+            pass
+
+    def _sync_advisor_ai_fields(self):
+        combo = getattr(self, "advisor_ai_source_combo", None)
+        group = getattr(self, "advisor_ai_cloud_group", None)
+        if combo is None or group is None:
+            return
+        src = str(combo.currentData() or "local").lower()
+        group.setVisible(src in ("gemini", "openai"))
+
+    def _sync_cursor_monitor_fields(self):
+        fields = getattr(self, "cursor_monitor_fields", None)
+        chk = getattr(self, "cursor_monitor_chk", None)
+        if fields is None or chk is None:
+            return
+        fields.setVisible(bool(chk.isChecked()))
+
+    def _regenerate_cursor_monitor_token(self):
+        import cursor_monitor as cm
+
+        tok = cm.generate_token()
+        self.settings["cursor_monitor_token"] = tok
+        if hasattr(self, "cursor_monitor_token_edit"):
+            self.cursor_monitor_token_edit.setText(tok)
+        self.log_event("[Cursor] Generated new read-only monitor token.")
+
+    def _copy_cursor_mcp_config(self):
+        import cursor_monitor as cm
+
+        self._pull_advisor_settings_from_widgets()
+        if bool(self.settings.get("cursor_monitor_enabled")) and not str(
+            self.settings.get("cursor_monitor_token") or ""
+        ).strip():
+            self.settings["cursor_monitor_token"] = cm.ensure_token(self.settings)
+            if hasattr(self, "cursor_monitor_token_edit"):
+                self.cursor_monitor_token_edit.setText(self.settings["cursor_monitor_token"])
+        snippet = cm.build_mcp_config_snippet(self.settings)
+        QApplication.clipboard().setText(snippet)
+        QMessageBox.information(
+            self,
+            "Cursor MCP setup",
+            "Copied MCP JSON to clipboard.\n\n"
+            "In Cursor: Settings → MCP → add or merge this into your mcpServers config, "
+            "then restart Cursor. Install bridge once: pip install -r requirements-mcp.txt",
+        )
+
+    def _pull_advisor_settings_from_widgets(self):
+        if hasattr(self, "advisor_ai_source_combo"):
+            src = str(self.advisor_ai_source_combo.currentData() or "local").lower()
+            self.settings["advisor_ai_source"] = src
+            self.settings["advisor_ai_enabled"] = src != "local"
+            self.settings["advisor_ai_provider"] = src if src in ("gemini", "openai") else "gemini"
+        if hasattr(self, "advisor_ai_key_edit"):
+            self.settings["advisor_ai_api_key"] = self.advisor_ai_key_edit.text().strip()
+        if hasattr(self, "advisor_ai_model_edit"):
+            self.settings["advisor_ai_model"] = self.advisor_ai_model_edit.text().strip()
+        if hasattr(self, "cursor_monitor_chk"):
+            self.settings["cursor_monitor_enabled"] = bool(self.cursor_monitor_chk.isChecked())
+        if hasattr(self, "cursor_monitor_token_edit"):
+            self.settings["cursor_monitor_token"] = (
+                self.cursor_monitor_token_edit.text().strip()
+                or self.settings.get("cursor_monitor_token")
+                or ""
+            )
+
+    def _maybe_desk_snag_discord(self):
+        """Discord when watchdog finds new warn/critical snags (throttled)."""
+        if not bool(self.settings.get("desk_snag_discord_alerts", True)):
+            return
+        report = getattr(self, "_last_desk_snag_report", None)
+        if not report or not (report.get("snags") or []):
+            return
+        now = time.time()
+        last = float(getattr(self, "_desk_snag_discord_at", 0.0) or 0.0)
+        if now - last < 90.0:
+            return
+        self._desk_snag_discord_at = now
+        try:
+            import desk_watchdog as dw
+            prev = getattr(self, "_desk_snag_alert_keys", None)
+            if prev is None:
+                self._desk_snag_alert_keys = {
+                    dw.snag_alert_key(s) for s in (report.get("snags") or [])
+                }
+                return
+            new_items = dw.new_snags_for_alert(report, prev, min_severity=dw.SEV_WARN)
+            if not new_items:
+                return
+            lines = [f"**Desk watchdog** ({report.get('status', '?').upper()})"]
+            for s in new_items[:4]:
+                b = f" [{s.get('broker')}]" if s.get("broker") else ""
+                lines.append(f"• {s.get('severity', '').upper()}{b}: {s.get('message')}")
+            self.send_discord_alert(
+                "\n".join(lines),
+                urgent=any(s.get("severity") == dw.SEV_CRITICAL for s in new_items),
+                prefix="[WATCHDOG]",
+            )
+            self._desk_snag_alert_keys = prev | {dw.snag_alert_key(s) for s in new_items}
+        except Exception:
+            pass
+
+    def _test_advisor_ai_connection(self):
+        import desk_advisor_ai as dai
+
+        self._pull_advisor_settings_from_widgets()
+        src = dai.resolve_ai_source(self.settings)
+        if src == "local":
+            QMessageBox.information(
+                self,
+                "Desk Advisor",
+                "Trade briefs are set to Local rules only — no cloud API key needed.",
+            )
+            return
+        self.advisor_ai_test_btn.setEnabled(False)
+
+        def work():
+            return dai.test_connection(self.settings)
+
+        def done(res):
+            self.advisor_ai_test_btn.setEnabled(True)
+            res = res or {}
+            if res.get("ok"):
+                used = str(res.get("model") or "").strip()
+                if used and hasattr(self, "advisor_ai_model_edit"):
+                    if not self.advisor_ai_model_edit.text().strip():
+                        self.advisor_ai_model_edit.setText(used)
+                        self.settings["advisor_ai_model"] = used
+                QMessageBox.information(
+                    self,
+                    "Advisor AI",
+                    f"Connected ({res.get('provider') or 'ai'} / {res.get('model') or 'default'}).\n"
+                    f"{res.get('message') or 'OK'}",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Advisor AI",
+                    str(res.get("error") or "Connection failed."),
+                )
+
+        self.run_thread(work, done)
 
     def _monitor_signal_alert_payload(self):
         try:
@@ -4140,6 +4622,8 @@ class MarketAdvisorGUI(QMainWindow):
     def publish_monitor_status(self):
         """Push a read-only snapshot to the web monitor (safe to call often)."""
         try:
+            self._refresh_desk_health_local()
+            self._maybe_schedule_desk_health_ai()
             totals = getattr(self, "_last_balance_totals", {}) or {}
             balances = {}
             combined_eq = combined_cash = combined_pnl = 0.0
@@ -4217,10 +4701,9 @@ class MarketAdvisorGUI(QMainWindow):
                 BROKER_NAMES,
                 locked_summary=getattr(self, "_last_locked_summary", None),
             )
-            market = "Unknown"
-            if hasattr(self, "market_status_lbl"):
-                txt = self.market_status_lbl.text() or ""
-                market = txt.replace("Market: ", "").strip() or market
+            session, market = self._session_market_labels()
+            trader_ctx = self._build_trader_context_map()
+            self._last_trader_context = trader_ctx
             queue = []
             for item in list(getattr(self, "task_queue", []) or []):
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -4236,7 +4719,10 @@ class MarketAdvisorGUI(QMainWindow):
                     "ticker": row.get("ticker", ""),
                     "status": row.get("status", ""),
                 })
-            monitor.update_status({
+            stall_sec = 0
+            if getattr(self, "_queue_started_at", None):
+                stall_sec = int(max(0, time.time() - float(self._queue_started_at)))
+            status_payload = {
                 "mode": "PAPER" if self.paper_mode else "LIVE",
                 "market": market,
                 "auto_trader": {
@@ -4277,13 +4763,32 @@ class MarketAdvisorGUI(QMainWindow):
                 "etrade": self._etrade_monitor_snapshot(),
                 "halted": bool(getattr(self, "_panic_halted", False)),
                 "armed_any": any(self.auto_trade_enabled.values()),
+                "desk_runtime": {
+                    "queue_processing": bool(getattr(self, "is_processing_queue", False)),
+                    "cycle_broker": getattr(self, "_cycle_broker", None),
+                    "queue_depth": len(getattr(self, "task_queue", []) or []),
+                    "stall_sec": stall_sec,
+                },
                 "desk_radar": self._monitor_desk_radar_payload(),
                 "signal_alert": self._monitor_signal_alert_payload(),
                 "advisor": self._monitor_advisor_payload(),
+                "desk_health": dict(getattr(self, "_last_desk_health", None) or {}),
                 "overnight_scorecard": getattr(self, "_last_overnight_scorecard", {}) or {},
                 "execution_quality": getattr(self, "_last_execution_quality", {}) or {},
                 "capital_planner": getattr(self, "_last_capital_planner", {}) or {},
-            })
+                "trader": {
+                    "by_broker": trader_ctx,
+                    "digest": self._format_trader_context_home(trader_ctx),
+                },
+            }
+            try:
+                import desk_watchdog as dw
+                snag_report = dw.scan_snags(status_payload)
+                status_payload["desk_snags"] = snag_report
+                self._last_desk_snag_report = snag_report
+            except Exception:
+                status_payload["desk_snags"] = {"status": "ok", "snags": []}
+            monitor.update_status(status_payload)
         except Exception as e:
             now = time.time()
             last = float(getattr(self, "_monitor_publish_fail_log_at", 0.0) or 0.0)
@@ -5523,6 +6028,14 @@ class MarketAdvisorGUI(QMainWindow):
             "(excluded from rotate/sizing honesty)."
         )
         heat_lay.addWidget(self.home_heat_lbl)
+        self.home_trader_lbl = QLabel("Desk context — loading…")
+        self.home_trader_lbl.setWordWrap(True)
+        self.home_trader_lbl.setStyleSheet(f"font-size: {ui_px(11)}px; color: #555;")
+        self.home_trader_lbl.setToolTip(
+            "What the bot sees before buying: BP, affordable share price, posture, "
+            "regime, engines, and blockers — same snapshot as Advisor AI and remote monitor."
+        )
+        heat_lay.addWidget(self.home_trader_lbl)
         self.home_radar_card = QGroupBox("Desk radar")
         radar_lay = QVBoxLayout()
         radar_lay.setContentsMargins(ui_px(10), ui_px(6), ui_px(10), ui_px(6))
@@ -5697,7 +6210,8 @@ class MarketAdvisorGUI(QMainWindow):
 
         hint = QLabel(
             "Pick a row on Crypto / Breakouts / Core, or type a ticker below. "
-            "This tab keeps the sparkline roomy so scanner lists stay clean."
+            "Small books (~$50–$500): prefer Breakouts — names under ~$5 that fit your BP. "
+            "Core is mega-cap/ETF watchlist (often unaffordable on micro accounts)."
         )
         hint.setWordWrap(True)
         hint.setObjectName("settingsHint")
@@ -5728,6 +6242,7 @@ class MarketAdvisorGUI(QMainWindow):
         layout.addWidget(self.signal_source_lbl)
 
         self.signal_head_lbl = QLabel("No ticker selected.")
+        self.signal_head_lbl.setObjectName("signalHead")
         self.signal_head_lbl.setWordWrap(True)
         self.signal_head_lbl.setStyleSheet(
             f"color: #333; font-size: {ui_px(13)}px; font-weight: 600;"
@@ -5735,18 +6250,22 @@ class MarketAdvisorGUI(QMainWindow):
         layout.addWidget(self.signal_head_lbl)
 
         self.signal_spark = SparklineWidget(min_h=120, max_h=None)
+        self.signal_spark.set_dark_mode(bool(getattr(self, "dark_mode", False)))
         self.signal_spark.setMinimumHeight(ui_px(140))
         layout.addWidget(self.signal_spark, stretch=1)
 
         self.signal_meters = FactorMeterRow()
+        self.signal_meters.set_dark_mode(bool(getattr(self, "dark_mode", False)))
         layout.addWidget(self.signal_meters)
 
         self.signal_why_lbl = QLabel("")
+        self.signal_why_lbl.setObjectName("signalWhy")
         self.signal_why_lbl.setWordWrap(True)
         self.signal_why_lbl.setStyleSheet(f"color: #444; font-size: {ui_px(12)}px;")
         layout.addWidget(self.signal_why_lbl)
 
         self.signal_levels_lbl = QLabel("")
+        self.signal_levels_lbl.setObjectName("signalLevels")
         self.signal_levels_lbl.setWordWrap(True)
         self.signal_levels_lbl.setStyleSheet(f"color: #666; font-size: {ui_px(11)}px;")
         layout.addWidget(self.signal_levels_lbl)
@@ -5835,6 +6354,32 @@ class MarketAdvisorGUI(QMainWindow):
             "asset_type": focus.get("asset_type") or "",
         }
         self._refresh_signal_panel()
+
+    def _apply_signal_panel_theme(self):
+        """Signal tab uses custom widgets — refresh colors on theme toggle."""
+        if not hasattr(self, "signal_head_lbl"):
+            return
+        tc = theme_colors(self.dark_mode)
+        if hasattr(self, "signal_spark"):
+            self.signal_spark.set_dark_mode(self.dark_mode)
+            self.signal_spark.update()
+        if hasattr(self, "signal_meters"):
+            self.signal_meters.set_dark_mode(self.dark_mode)
+        self.signal_head_lbl.setStyleSheet(
+            f"color: {tc['text']}; font-size: {ui_px(13)}px; font-weight: 600;"
+        )
+        if hasattr(self, "signal_why_lbl"):
+            self.signal_why_lbl.setStyleSheet(
+                f"color: {tc['text']}; font-size: {ui_px(12)}px;"
+            )
+        if hasattr(self, "signal_levels_lbl"):
+            self.signal_levels_lbl.setStyleSheet(
+                f"color: {tc['muted']}; font-size: {ui_px(11)}px;"
+            )
+        if hasattr(self, "signal_source_lbl"):
+            self.signal_source_lbl.setStyleSheet(
+                f"color: {tc['muted']}; font-size: {ui_px(11)}px;"
+            )
 
     def _refresh_signal_panel(self):
         from scoring import signal_research_bundle, explain_gate_from_recommendation
@@ -7092,6 +7637,14 @@ class MarketAdvisorGUI(QMainWindow):
         )
         self.risk_posture_combo.currentIndexChanged.connect(self._on_risk_posture_changed)
         posture_box.addWidget(self.risk_posture_combo)
+        self.auto_scale_growth_chk = QCheckBox("Auto-scale posture to book size")
+        self.auto_scale_growth_chk.setChecked(bool(self.settings.get("auto_scale_growth", True)))
+        self.auto_scale_growth_chk.setToolTip(
+            "Micro book (<$500/broker) → Growth automatically. "
+            "$500–$2.5k → Balanced. Above $2.5k → your saved Mode. "
+            "No need to click Apply Growth preset as you grow."
+        )
+        posture_box.addWidget(self.auto_scale_growth_chk)
         posture_box.addStretch()
         posture_outer.addLayout(posture_box)
         self.risk_posture_hint = QLabel(get_risk_posture_profile(saved_posture).get("hint", ""))
@@ -7145,8 +7698,9 @@ class MarketAdvisorGUI(QMainWindow):
         advisor_outer = QVBoxLayout()
         advisor_outer.setSpacing(ui_px(6))
         advisor_intro = QLabel(
-            "Desk Advisor proposes BUYs for your approval. Companion Controls enables "
-            "phone actions when the web monitor is on with user/pass set."
+            "Desk Advisor proposes BUYs for your approval. Turn on AI analysis for plain-English "
+            "briefs (uses your Gemini or OpenAI key on this PC, or local rules without a key). "
+            "Companion Controls enables phone approve/reject when the web monitor is on."
         )
         advisor_intro.setObjectName("settingsHint")
         advisor_intro.setWordWrap(True)
@@ -7164,6 +7718,139 @@ class MarketAdvisorGUI(QMainWindow):
         advisor_row.addStretch()
         advisor_outer.addLayout(advisor_row)
 
+        ai_row = QHBoxLayout()
+        ai_row.addWidget(QLabel("Trade briefs:"))
+        self.advisor_ai_source_combo = QComboBox()
+        self.advisor_ai_source_combo.addItem("Local rules only (no API key)", "local")
+        self.advisor_ai_source_combo.addItem("Google Gemini API", "gemini")
+        self.advisor_ai_source_combo.addItem("OpenAI API", "openai")
+        saved_src = str(self.settings.get("advisor_ai_source") or "").strip().lower()
+        if not saved_src:
+            import desk_advisor_ai as _dai
+            saved_src = _dai.resolve_ai_source(self.settings)
+        idx_src = self.advisor_ai_source_combo.findData(saved_src)
+        if idx_src >= 0:
+            self.advisor_ai_source_combo.setCurrentIndex(idx_src)
+        self.advisor_ai_source_combo.setToolTip(
+            "How Desk Advisor explains each BUY proposal. Pick one — not both cloud providers."
+        )
+        self.advisor_ai_source_combo.currentIndexChanged.connect(self._sync_advisor_ai_fields)
+        ai_row.addWidget(self.advisor_ai_source_combo, 1)
+        advisor_outer.addLayout(ai_row)
+
+        ai_cloud_hint = QLabel(
+            "Get a free key at aistudio.google.com/apikey (AIza… or newer AQ.… format). "
+            "Gemini Pro chat subscription is separate. Keys stay in settings.json on this PC only."
+        )
+        ai_cloud_hint.setObjectName("settingsHint")
+        ai_cloud_hint.setWordWrap(True)
+        ai_cloud_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        advisor_outer.addWidget(ai_cloud_hint)
+
+        self.advisor_ai_cloud_group = QWidget()
+        ai_cloud_lay = QVBoxLayout(self.advisor_ai_cloud_group)
+        ai_cloud_lay.setContentsMargins(0, 0, 0, 0)
+        ai_cloud_lay.setSpacing(ui_px(6))
+
+        ai_provider_row = QHBoxLayout()
+        ai_provider_row.addWidget(QLabel("Model (optional):"))
+        self.advisor_ai_model_edit = QLineEdit()
+        self.advisor_ai_model_edit.setPlaceholderText("blank = auto-pick flash model from your key")
+        self.advisor_ai_model_edit.setText(str(self.settings.get("advisor_ai_model") or ""))
+        ai_provider_row.addWidget(self.advisor_ai_model_edit, 1)
+        ai_cloud_lay.addLayout(ai_provider_row)
+
+        ai_key_row = QHBoxLayout()
+        ai_key_row.addWidget(QLabel("API key:"))
+        self.advisor_ai_key_edit = QLineEdit()
+        self.advisor_ai_key_edit.setEchoMode(QLineEdit.Password)
+        self.advisor_ai_key_edit.setPlaceholderText("Paste Gemini or OpenAI API key")
+        self.advisor_ai_key_edit.setText(str(self.settings.get("advisor_ai_api_key") or ""))
+        ai_key_row.addWidget(self.advisor_ai_key_edit, 1)
+        self.advisor_ai_show_key_chk = QCheckBox("Show")
+        self.advisor_ai_show_key_chk.toggled.connect(
+            lambda on: self.advisor_ai_key_edit.setEchoMode(
+                QLineEdit.Normal if on else QLineEdit.Password
+            )
+        )
+        ai_key_row.addWidget(self.advisor_ai_show_key_chk)
+        self.advisor_ai_test_btn = QPushButton("Test")
+        self.advisor_ai_test_btn.clicked.connect(self._test_advisor_ai_connection)
+        ai_key_row.addWidget(self.advisor_ai_test_btn)
+        ai_cloud_lay.addLayout(ai_key_row)
+        advisor_outer.addWidget(self.advisor_ai_cloud_group)
+
+        cursor_sep = QLabel("Cursor IDE monitor (optional — separate from trade briefs)")
+        cursor_sep.setStyleSheet(f"color: #aaa; font-size: {ui_px(11)}px; font-weight: 600;")
+        advisor_outer.addWidget(cursor_sep)
+        cursor_hint = QLabel(
+            "Lets Cursor chat watch your desk via MCP. Your Cursor API key (cursor_…) goes in the "
+            "Cursor app (Dashboard → Integrations), not here. This section only issues a read-only "
+            "desk token for the Market Advisor MCP bridge."
+        )
+        cursor_hint.setObjectName("settingsHint")
+        cursor_hint.setWordWrap(True)
+        cursor_hint.setStyleSheet(f"color: #888; font-size: {ui_px(11)}px;")
+        advisor_outer.addWidget(cursor_hint)
+
+        cursor_row = QHBoxLayout()
+        self.cursor_monitor_chk = QCheckBox("Enable Cursor read-only monitor token")
+        self.cursor_monitor_chk.setChecked(bool(self.settings.get("cursor_monitor_enabled", False)))
+        self.cursor_monitor_chk.toggled.connect(self._sync_cursor_monitor_fields)
+        cursor_row.addWidget(self.cursor_monitor_chk)
+        cursor_row.addStretch()
+        advisor_outer.addLayout(cursor_row)
+
+        self.cursor_monitor_fields = QWidget()
+        cursor_fields_lay = QVBoxLayout(self.cursor_monitor_fields)
+        cursor_fields_lay.setContentsMargins(0, 0, 0, 0)
+        cursor_fields_lay.setSpacing(ui_px(6))
+        tok_row = QHBoxLayout()
+        tok_row.addWidget(QLabel("Read token:"))
+        self.cursor_monitor_token_edit = QLineEdit()
+        self.cursor_monitor_token_edit.setReadOnly(True)
+        self.cursor_monitor_token_edit.setText(str(self.settings.get("cursor_monitor_token") or ""))
+        tok_row.addWidget(self.cursor_monitor_token_edit, 1)
+        self.cursor_monitor_regen_btn = QPushButton("New token")
+        self.cursor_monitor_regen_btn.clicked.connect(self._regenerate_cursor_monitor_token)
+        tok_row.addWidget(self.cursor_monitor_regen_btn)
+        cursor_fields_lay.addLayout(tok_row)
+        cursor_btn_row = QHBoxLayout()
+        self.cursor_mcp_copy_btn = QPushButton("Copy MCP setup JSON")
+        self.cursor_mcp_copy_btn.clicked.connect(self._copy_cursor_mcp_config)
+        self.cursor_integrations_btn = QPushButton("Cursor API keys…")
+        self.cursor_integrations_btn.clicked.connect(
+            lambda: webbrowser.open("https://cursor.com/dashboard/integrations")
+        )
+        cursor_btn_row.addWidget(self.cursor_mcp_copy_btn)
+        cursor_btn_row.addWidget(self.cursor_integrations_btn)
+        cursor_btn_row.addStretch()
+        cursor_fields_lay.addLayout(cursor_btn_row)
+        snag_row = QHBoxLayout()
+        self.desk_snag_discord_chk = QCheckBox(
+            "Discord alert on new desk snags (warn/critical, ~90s throttle)"
+        )
+        self.desk_snag_discord_chk.setChecked(
+            bool(self.settings.get("desk_snag_discord_alerts", True))
+        )
+        snag_row.addWidget(self.desk_snag_discord_chk)
+        snag_row.addStretch()
+        cursor_fields_lay.addLayout(snag_row)
+        advisor_outer.addWidget(self.cursor_monitor_fields)
+        self._sync_cursor_monitor_fields()
+        self._sync_advisor_ai_fields()
+
+        ai_auto_row = QHBoxLayout()
+        self.advisor_ai_auto_reject_chk = QCheckBox(
+            "Auto-reject when AI says skip (never auto-buys)"
+        )
+        self.advisor_ai_auto_reject_chk.setChecked(
+            bool(self.settings.get("advisor_ai_auto_reject_skip", True))
+        )
+        ai_auto_row.addWidget(self.advisor_ai_auto_reject_chk)
+        ai_auto_row.addStretch()
+        advisor_outer.addLayout(ai_auto_row)
+
         remote_row = QHBoxLayout()
         self.monitor_controls_main_chk = QCheckBox(
             "Companion Controls — phone: approve/reject Advisor, arm/disarm, halt, EOD"
@@ -7176,8 +7863,8 @@ class MarketAdvisorGUI(QMainWindow):
         advisor_outer.addLayout(remote_row)
 
         api_hint = QLabel(
-            "Remote API (monitor ON + auth + controls ON): "
-            "/api/advisor/approve · /api/halt · /api/eod/run"
+            "Remote API: /api/status · /api/agent/snags · /api/agent/digest · "
+            "/api/advisor/approve · /api/halt"
         )
         api_hint.setObjectName("settingsHint")
         api_hint.setWordWrap(True)
@@ -8682,6 +9369,8 @@ class MarketAdvisorGUI(QMainWindow):
 
     def run_startup_sequence(self):
         """Show UI immediately; connect brokers off the main thread (avoids freeze on open)."""
+        if getattr(self, "_boot_splash", None):
+            self._splash_boot_message("Connecting brokers…")
         self.log_event("Connecting brokers in background...")
         self._set_broker_status("Robinhood", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
         self._set_broker_status("Coinbase", "🟡 Connecting…", "color: #FFD54F; font-weight: bold;")
@@ -8836,6 +9525,9 @@ class MarketAdvisorGUI(QMainWindow):
             self._startup_connect_finished = True
             self.set_working_state(False)
             # Balances + holdings; Discord launch ping is already armed from _post_show_init
+            if getattr(self, "_boot_splash", None):
+                self._boot_splash_waiting_holdings = True
+                self._splash_boot_message("Loading holdings…")
             self.refresh_account_balances()
             self.manual_portfolio_reload(and_score=False, force=True)
             QTimer.singleShot(800, self._startup_score_portfolio_if_ready)
@@ -9262,11 +9954,21 @@ class MarketAdvisorGUI(QMainWindow):
             return
         lines = []
         for p in pending:
-            lines.append(
+            base = (
                 f"• {p.get('broker')} BUY {p.get('ticker')} "
                 f"~${float(p.get('dollars') or 0):.2f} "
                 f"({float(p.get('score') or 0):.0f} {p.get('engine') or ''})"
             )
+            ai_brief = str(p.get("ai_brief") or "").strip()
+            ai_verdict = str(p.get("ai_verdict") or "").strip()
+            if ai_brief:
+                tag = f"[{ai_verdict.upper()}] " if ai_verdict else ""
+                base += f"\n  AI: {tag}{ai_brief}"
+            elif bool(self.settings.get("advisor_ai_enabled", True)) and str(
+                self.settings.get("advisor_ai_source") or "local"
+            ) != "local":
+                base += "\n  AI: analyzing…"
+            lines.append(base)
         self.home_advisor_lbl.setText("\n".join(lines))
 
     def _coach_tip(self, reason_key, message, *, cooldown_sec=0):
@@ -9517,9 +10219,44 @@ class MarketAdvisorGUI(QMainWindow):
         )
         self.log_event("[Discord] Test webhook sent.")
 
+    def _sync_equity_posture_snapshot(self):
+        """Push live equity into scoring + log when auto-scale tier changes."""
+        try:
+            from scoring import describe_posture_for_broker, set_broker_equity_snapshot
+
+            totals = getattr(self, "_last_balance_totals", {}) or {}
+            by_eq = {
+                name: float((totals.get(name) or {}).get("p_val") or 0)
+                for name in BROKER_NAMES
+            }
+            set_broker_equity_snapshot(by_eq)
+            prev = getattr(self, "_last_effective_posture", {}) or {}
+            new = {}
+            for name in BROKER_NAMES:
+                eq = by_eq.get(name) or 0.0
+                if eq <= 0:
+                    continue
+                desc = describe_posture_for_broker(name, self.settings, equity=eq)
+                eff = str(desc.get("effective") or "")
+                new[name] = eff
+                old = prev.get(name)
+                if old and old != eff:
+                    tier = desc.get("equity_tier") or ""
+                    self.log_event(
+                        f"[AUTO] {name} posture → {eff} "
+                        f"(equity ~{format_currency(eq)}"
+                        f"{'; ' + tier if tier else ''})"
+                    )
+            self._last_effective_posture = new
+        except Exception:
+            pass
+
     def _maybe_coach_growth_posture(self):
         """One-time tip when book is small and posture is not already Growth."""
         if getattr(self, "_growth_posture_coached", False):
+            return
+        if bool(self.settings.get("auto_scale_growth", True)):
+            self._growth_posture_coached = True
             return
         try:
             from scoring import normalize_risk_posture, SMALL_BOOK_EQUITY
@@ -9765,6 +10502,13 @@ class MarketAdvisorGUI(QMainWindow):
             snap, rows, money_fn=format_money, currency_fn=format_currency,
         )
         self.home_heat_lbl.setText(heat_txt)
+        if hasattr(self, "home_trader_lbl"):
+            try:
+                ctx_map = self._build_trader_context_map()
+                self._last_trader_context = ctx_map
+                self.home_trader_lbl.setText(self._format_trader_context_home(ctx_map))
+            except Exception:
+                pass
         if c.get("dd_paused"):
             why = c.get("dd_reason") or "drawdown"
             mins = int(c.get("dd_mins_left") or 0)
@@ -10664,6 +11408,7 @@ class MarketAdvisorGUI(QMainWindow):
                 self._stall_alerted = False
 
         self._maybe_send_heartbeat(now)
+        self._maybe_desk_snag_discord()
 
         # Equity RTH boundary wake-ups before interval scheduling (sets last_* so no double-queue)
         self._maybe_session_boundary_wakeup(now)
@@ -10728,7 +11473,14 @@ class MarketAdvisorGUI(QMainWindow):
                         self.last_penny_time[broker_name] = now
 
                     if now - self.last_core_time[broker_name] >= self.settings.get("interval_core", 300):
-                        if idle_why:
+                        if self._small_book_skip_core(broker_name):
+                            self._throttled_log(
+                                f"{broker_name}:core_skip_small_book",
+                                f"[{broker_name}] CORE parked for small book — Breakouts + Crypto "
+                                f"target names your BP can actually fund.",
+                                cooldown_sec=3600,
+                            )
+                        elif idle_why:
                             self._throttled_log(
                                 f"{broker_name}:buy_engines_idle",
                                 f"[{broker_name}] {idle_why}",
@@ -11102,6 +11854,10 @@ class MarketAdvisorGUI(QMainWindow):
                     self.manual_score_portfolio()
                 else:
                     self.set_working_state(False)
+            if getattr(self, "_boot_splash_waiting_holdings", False):
+                self._boot_splash_waiting_holdings = False
+                self._boot_splash_holdings_ok = True
+                self._check_boot_splash_ready()
 
         self.run_thread(_bg, _done)
 
@@ -13061,6 +13817,7 @@ class MarketAdvisorGUI(QMainWindow):
                             f"[Advisor] Proposed BUY {ticker} ~${row_dollars:.2f} "
                             f"({engine or 'scan'}) — approve on Home or companion"
                         )
+                        self._schedule_advisor_ai_analysis(prop.get("id"), broker_name)
                         proposals_made += 1
                         self._log_decision(
                             broker=broker_name, ticker=ticker, action="PROPOSE",
@@ -14069,6 +14826,16 @@ class MarketAdvisorGUI(QMainWindow):
             self.set_working_state(False)
             self.cycle_finished()
 
+    def _small_book_skip_core(self, broker_name=None) -> bool:
+        """CORE scans mega-caps/ETFs — skip on small BP; use Breakouts instead."""
+        try:
+            from scoring import small_book_prefers_breakouts
+            b = broker_name or self.cycle_broker_name
+            equity, _, _ = self.get_effective_balances(b)
+            return small_book_prefers_breakouts(equity, self.settings)
+        except Exception:
+            return False
+
     def run_penny_cycle(self):
         broker = self.cycle_broker_name
         if self._is_broker_auto_trading(broker):
@@ -14106,6 +14873,16 @@ class MarketAdvisorGUI(QMainWindow):
 
     def run_core_cycle(self):
         broker = self.cycle_broker_name
+        if self._small_book_skip_core(broker):
+            self._throttled_log(
+                f"{broker}:core_skip_small_book",
+                f"[{broker}] CORE skipped — small book uses Breakouts (<$5 names) "
+                f"so BP isn't wasted on MSFT/VOO-sized tickets.",
+                cooldown_sec=3600,
+            )
+            self.set_working_state(False)
+            self.cycle_finished()
+            return
         if self._is_broker_auto_trading(broker):
             self._set_engine_banner(f"[{broker}] CORE — scan + score...", UI_ACCENT)
         self.set_working_state(True, "Core scan+score...")
@@ -14300,8 +15077,21 @@ class MarketAdvisorGUI(QMainWindow):
             return
         advisor_on = bool(self.settings.get("advisor_ask_before_apply", True))
         remote_on = bool(self.settings.get("monitor_controls_enabled", False))
+        try:
+            import desk_advisor_ai as dai
+
+            ai_src = dai.resolve_ai_source(self.settings)
+            ai_on = ai_src != "local"
+            ai_ready = dai.ai_configured(self.settings)
+            cursor_on = bool(self.settings.get("cursor_monitor_enabled", False))
+        except Exception:
+            ai_src = str(self.settings.get("advisor_ai_source") or "local")
+            ai_on = ai_src != "local"
+            ai_ready = bool(str(self.settings.get("advisor_ai_api_key") or "").strip())
+            cursor_on = bool(self.settings.get("cursor_monitor_enabled", False))
         lbl.setText(_auto_cycle.format_advisor_settings_summary(
             advisor_on=advisor_on, remote_on=remote_on,
+            ai_on=ai_on, ai_ready=ai_ready, ai_source=ai_src, cursor_on=cursor_on,
         ))
 
     def _try_execute_scan_buys(self, table, buy_candidates, *, engine_label, banner_text, banner_color):
@@ -14491,6 +15281,8 @@ class MarketAdvisorGUI(QMainWindow):
         if hasattr(self, "risk_posture_combo"):
             key = self.risk_posture_combo.currentData()
             self.settings["risk_posture"] = str(key or "balanced").lower()
+        if hasattr(self, "auto_scale_growth_chk"):
+            self.settings["auto_scale_growth"] = bool(self.auto_scale_growth_chk.isChecked())
         if hasattr(self, "_broker_posture_combos"):
             by_b = {}
             for bname, combo in (self._broker_posture_combos or {}).items():
@@ -14500,6 +15292,22 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["risk_posture_by_broker"] = by_b
         if hasattr(self, "advisor_ask_chk"):
             self.settings["advisor_ask_before_apply"] = bool(self.advisor_ask_chk.isChecked())
+        self._pull_advisor_settings_from_widgets()
+        if self.settings.get("cursor_monitor_enabled") and not str(
+            self.settings.get("cursor_monitor_token") or ""
+        ).strip():
+            import cursor_monitor as cm
+            self.settings["cursor_monitor_token"] = cm.ensure_token(self.settings)
+            if hasattr(self, "cursor_monitor_token_edit"):
+                self.cursor_monitor_token_edit.setText(self.settings["cursor_monitor_token"])
+        if hasattr(self, "desk_snag_discord_chk"):
+            self.settings["desk_snag_discord_alerts"] = bool(
+                self.desk_snag_discord_chk.isChecked()
+            )
+        if hasattr(self, "advisor_ai_auto_reject_chk"):
+            self.settings["advisor_ai_auto_reject_skip"] = bool(
+                self.advisor_ai_auto_reject_chk.isChecked()
+            )
         if hasattr(self, "monitor_controls_main_chk"):
             self.settings["monitor_controls_enabled"] = bool(
                 self.monitor_controls_main_chk.isChecked()
@@ -15011,6 +15819,8 @@ class MarketAdvisorGUI(QMainWindow):
             view.setPalette(pal)
             view.setAutoFillBackground(True)
             combo.setPalette(pal)
+
+        self._apply_signal_panel_theme()
 
 
 if __name__ == "__main__":

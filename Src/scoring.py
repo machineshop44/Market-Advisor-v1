@@ -150,6 +150,7 @@ MAX_CRYPTO_BOOK_FRAC = 0.30       # max crypto share on multi-asset brokers (RH)
 RTH_EQUITY_RANK_BOOST = 12.0
 RTH_CRYPTO_RANK_PENALTY = 10.0
 SMALL_BOOK_EQUITY = 500.0         # below this, crypto soft penalties start earlier
+AUTO_SCALE_BALANCED_CEILING = 2500.0  # above this, honor saved posture (safer/balanced/aggressive)
 SMALL_BOOK_CRYPTO_MIN_DOLLARS = 6.0  # aim ≥ this on small books — fits 3-slot sizing on ~$50 BP
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
 MAX_SINGLE_NAME_EQUITY_FRAC = 0.15  # soft cap: one name ≤ ~15% of equity
@@ -287,9 +288,11 @@ RISK_POSTURE_PROFILES = {
         "hint": (
             "Small-book mode (~$50–$500): 3 focus slots, 2 buys/cycle, faster green takes, "
             "wider DD pause (22% peak) so one rough patch doesn't freeze entries. "
-            "No BTC regime gate; still hard-stopped. Best for RH/CB micro accounts."
+            "Skips SPY/BTC regime gates on new entries; still hard-stopped. "
+            "Auto-applies when auto-scale is on and equity is under $500."
         ),
         "require_crypto_regime": False,
+        "require_equity_regime": False,
         "target_bp_utilization_pct": 92.0,
         "sizing_focus_slots": 3,
         "max_open_positions": 4,
@@ -327,6 +330,27 @@ def is_small_book(equity) -> bool:
         return float(equity or 0.0) > 0 and float(equity) < SMALL_BOOK_EQUITY
     except (TypeError, ValueError):
         return False
+
+
+def small_book_prefers_breakouts(equity=None, settings=None) -> bool:
+    """Small books (~<$500) should lean on Breakouts/crypto, not mega-cap CORE."""
+    if is_small_book(equity):
+        return True
+    s = settings or {}
+    return normalize_risk_posture(s.get("risk_posture")) == "growth"
+
+
+def max_affordable_share_price(buying_power, *, utilization=0.88) -> float:
+    """Upper share price where one whole share fits deployable BP."""
+    try:
+        bp = float(buying_power or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    util = float(utilization or 0.88)
+    if util > 1.0:
+        util = util / 100.0
+    util = min(0.99, max(0.50, util))
+    return max(0.0, bp * util)
 
 
 def crypto_min_score_for_entry(equity=None, *, is_mover=False) -> float:
@@ -396,11 +420,38 @@ def _broker_display_name(broker_name_or_id):
     return _BROKER_ID_TO_DISPLAY.get(raw.upper().replace("*", ""), raw)
 
 
-def posture_for_broker(broker_name_or_id, settings=None):
-    """
-    Resolve risk posture for a broker: per-broker map overrides global risk_posture.
-    Accepts display names (Robinhood) or broker_id (ROBINHOOD).
-    """
+_EQUITY_BY_BROKER_DISPLAY: dict[str, float] = {}
+
+
+def set_broker_equity_snapshot(by_broker: dict | None) -> None:
+    """GUI balance refresh — feeds auto-scale without threading equity into every call."""
+    global _EQUITY_BY_BROKER_DISPLAY
+    out: dict[str, float] = {}
+    for k, v in (by_broker or {}).items():
+        try:
+            out[str(k)] = float(v or 0)
+        except (TypeError, ValueError):
+            out[str(k)] = 0.0
+    _EQUITY_BY_BROKER_DISPLAY = out
+
+
+def _resolve_broker_equity(broker_name_or_id, equity=None) -> float | None:
+    if equity is not None:
+        try:
+            v = float(equity)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            pass
+    display = _broker_display_name(broker_name_or_id)
+    for key in (display, str(broker_name_or_id or "").strip()):
+        if key in _EQUITY_BY_BROKER_DISPLAY:
+            v = float(_EQUITY_BY_BROKER_DISPLAY[key])
+            return v if v > 0 else None
+    return None
+
+
+def manual_posture_for_broker(broker_name_or_id, settings=None) -> str:
+    """Saved posture from settings — no equity auto-scale."""
     settings = settings or {}
     raw_name = str(broker_name_or_id or "").strip()
     by_broker = settings.get("risk_posture_by_broker") or {}
@@ -409,6 +460,72 @@ def posture_for_broker(broker_name_or_id, settings=None):
     display = _broker_display_name(raw_name)
     chosen = by_broker.get(display) or by_broker.get(raw_name) or settings.get("risk_posture", "balanced")
     return normalize_risk_posture(chosen)
+
+
+def equity_auto_posture(equity, *, settings=None, manual_posture="balanced") -> str:
+    """
+    Map book size → effective posture when auto_scale_growth is on.
+    Micro (<$500) → Growth; growing ($500–$2.5k) → Balanced (or Safer if saved);
+    established (>$2.5k) → user's saved posture.
+    """
+    settings = settings or {}
+    manual = normalize_risk_posture(manual_posture)
+    if not bool(settings.get("auto_scale_growth", True)):
+        return manual
+    try:
+        eq = float(equity or 0)
+    except (TypeError, ValueError):
+        eq = 0.0
+    if eq <= 0:
+        return manual
+    if eq < SMALL_BOOK_EQUITY:
+        return "growth"
+    if eq < AUTO_SCALE_BALANCED_CEILING:
+        return "safer" if manual == "safer" else "balanced"
+    return manual
+
+
+def describe_posture_for_broker(broker_name_or_id, settings=None, *, equity=None) -> dict:
+    """Effective vs saved posture — for UI, monitor, Advisor AI."""
+    settings = settings or {}
+    manual = manual_posture_for_broker(broker_name_or_id, settings)
+    eq = _resolve_broker_equity(broker_name_or_id, equity)
+    effective = (
+        equity_auto_posture(eq, settings=settings, manual_posture=manual)
+        if eq is not None
+        else manual
+    )
+    auto_scaled = bool(settings.get("auto_scale_growth", True)) and eq is not None and effective != manual
+    tier = ""
+    if eq is not None and bool(settings.get("auto_scale_growth", True)):
+        if eq < SMALL_BOOK_EQUITY:
+            tier = "micro"
+        elif eq < AUTO_SCALE_BALANCED_CEILING:
+            tier = "growing"
+        else:
+            tier = "established"
+    return {
+        "manual": manual,
+        "effective": effective,
+        "auto_scaled": auto_scaled,
+        "equity_tier": tier,
+        "equity": eq,
+        "label": f"{effective} (auto)" if auto_scaled else effective,
+    }
+
+
+def posture_for_broker(broker_name_or_id, settings=None, *, equity=None):
+    """
+    Resolve risk posture for a broker: per-broker map overrides global risk_posture.
+    When auto_scale_growth is on and equity is known, micro books use Growth automatically.
+    Accepts display names (Robinhood) or broker_id (ROBINHOOD).
+    """
+    settings = settings or {}
+    manual = manual_posture_for_broker(broker_name_or_id, settings)
+    eq = _resolve_broker_equity(broker_name_or_id, equity)
+    if eq is None:
+        return manual
+    return equity_auto_posture(eq, settings=settings, manual_posture=manual)
 
 
 def broker_has_posture_override(broker_name_or_id, settings=None):
@@ -423,16 +540,25 @@ def broker_has_posture_override(broker_name_or_id, settings=None):
     return bool(str(val or "").strip())
 
 
-def posture_knobs_for_broker(broker_name_or_id, settings=None):
+def posture_knobs_for_broker(broker_name_or_id, settings=None, *, equity=None):
     """
     Knobs that should actually drive this broker: profile if a per-broker override
     is set, otherwise Advanced/settings overlay on the global posture profile.
+    When auto-scaled to a different tier, uses the tier profile (not stale preset values).
     """
     settings = settings or {}
-    key = posture_for_broker(broker_name_or_id, settings)
-    prof = get_risk_posture_profile(key)
+    manual = manual_posture_for_broker(broker_name_or_id, settings)
+    effective = posture_for_broker(broker_name_or_id, settings, equity=equity)
+    prof = get_risk_posture_profile(effective)
     if broker_has_posture_override(broker_name_or_id, settings):
         return prof
+    auto_scaled = (
+        bool(settings.get("auto_scale_growth", True))
+        and _resolve_broker_equity(broker_name_or_id, equity) is not None
+        and effective != manual
+    )
+    if auto_scaled:
+        return dict(prof)
     out = dict(prof)
     for k in _POSTURE_KNOB_KEYS:
         if k in settings and settings[k] is not None:
@@ -492,6 +618,11 @@ def uses_btc_regime(ticker=None, is_crypto=False):
     return clean in BTC_PROXY_EQUITIES
 
 
+def equity_regime_required(posture=None):
+    """Growth skips SPY 1H gate for small-book equities; others keep broad market filter."""
+    return bool(get_risk_posture_profile(posture).get("require_equity_regime", True))
+
+
 def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False, ticker=None):
     """
     Hard gate for NEW entries (scan + execute). Matches evaluate_* posture rules:
@@ -511,6 +642,8 @@ def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False, 
             return False, tw
         if not crypto_regime_required(posture):
             return True, ""
+    elif not equity_regime_required(posture):
+        return True, ""
     return market_regime_ok(is_crypto=bool(use_btc))
 
 

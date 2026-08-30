@@ -59,6 +59,8 @@ _status = {
 _auth_user = ""
 _auth_pass = ""
 _auth_required = False
+_cursor_agent_enabled = False
+_cursor_agent_token = ""
 _controls_enabled = False
 _control_handler = None
 _halt_handler = None
@@ -149,6 +151,14 @@ def configure_controls(enabled: bool):
         _status["controls_enabled"] = _controls_enabled
 
 
+def configure_cursor_agent(enabled: bool, token: str = ""):
+    """Read-only Bearer token for /api/agent/* (Cursor MCP bridge)."""
+    global _cursor_agent_enabled, _cursor_agent_token
+    tok = str(token or "").strip()
+    _cursor_agent_token = tok
+    _cursor_agent_enabled = bool(enabled) and bool(tok)
+
+
 def _client_ip(handler) -> str:
     try:
         return handler.client_address[0] if handler.client_address else "unknown"
@@ -235,6 +245,37 @@ def _credentials_ok(handler) -> bool:
         return user == _auth_user and pwd == _auth_pass
     except Exception:
         return False
+
+
+def _bearer_token_ok(handler) -> bool:
+    if not _cursor_agent_enabled or not _cursor_agent_token:
+        return False
+    header = handler.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    return header[7:].strip() == _cursor_agent_token
+
+
+def _check_agent_auth(handler) -> bool:
+    """Read-only agent routes: Bearer read token OR monitor Basic auth."""
+    ip = _client_ip(handler)
+    if _auth_is_locked(ip):
+        return False
+    if _bearer_token_ok(handler):
+        _auth_register_success(ip)
+        return True
+    if _auth_user and _credentials_ok(handler):
+        _auth_register_success(ip)
+        return True
+    if _cursor_agent_enabled and _cursor_agent_token:
+        if _auth_user or _auth_required:
+            _auth_register_failure(ip)
+        return False
+    if not _auth_user and not _auth_required:
+        return True
+    if _auth_user or _auth_required:
+        _auth_register_failure(ip)
+    return False
 
 
 def _check_auth(handler) -> bool:
@@ -662,6 +703,61 @@ class _Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path.startswith("/api/agent/digest"):
+            if not _check_agent_auth(self):
+                self._unauthorized(locked=_auth_is_locked(_client_ip(self)))
+                return
+            try:
+                import cursor_monitor as cm
+                payload = cm.build_agent_digest(get_status())
+            except Exception as e:
+                payload = {"ok": False, "error": str(e)}
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.startswith("/api/agent/log"):
+            if not _check_agent_auth(self):
+                self._unauthorized(locked=_auth_is_locked(_client_ip(self)))
+                return
+            try:
+                from urllib.parse import parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                limit = int((qs.get("limit") or ["25"])[0])
+            except Exception:
+                limit = 25
+            limit = max(1, min(limit, 80))
+            lines = list(get_status().get("recent_log") or [])[-limit:]
+            body = json.dumps({"ok": True, "lines": lines}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path.startswith("/api/agent/snags"):
+            if not _check_agent_auth(self):
+                self._unauthorized(locked=_auth_is_locked(_client_ip(self)))
+                return
+            try:
+                import desk_watchdog as dw
+                payload = dw.scan_snags(get_status())
+            except Exception as e:
+                payload = {"ok": False, "error": str(e), "snags": []}
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         ip = _client_ip(self)
         if _auth_is_locked(ip):
             self._unauthorized(locked=True)
@@ -883,9 +979,12 @@ def start_monitor(
     password="",
     controls_enabled=False,
     use_tls=False,
+    cursor_agent_enabled=False,
+    cursor_agent_token="",
 ):
     """Start the monitor HTTP(S) server in a daemon thread. Returns (ok, message)."""
     global _server, _thread, _auth_user, _auth_pass, _controls_enabled
+    configure_cursor_agent(cursor_agent_enabled, cursor_agent_token)
     global _auth_required, _tls_enabled, _cert_fingerprint
     if _server is not None:
         scheme = "https" if _tls_enabled else "http"

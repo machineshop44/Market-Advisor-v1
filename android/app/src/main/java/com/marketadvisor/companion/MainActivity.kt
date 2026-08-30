@@ -518,7 +518,9 @@ class MainActivity : AppCompatActivity() {
                 val adv = status.advisor
                 val advPending = adv.pending.firstOrNull()
                 binding.advisorLine.text = if (adv.count > 0 && advPending != null) {
-                    String.format(
+                    val ai = advPending.aiBrief.trim()
+                    val aiTag = advPending.aiVerdict.trim().uppercase(Locale.US)
+                    val base = String.format(
                         Locale.US,
                         "Advisor: %d pending · top %s %s ~$%.0f (score %.0f)",
                         adv.count,
@@ -527,6 +529,12 @@ class MainActivity : AppCompatActivity() {
                         advPending.dollars,
                         advPending.score,
                     )
+                    if (ai.isNotEmpty()) {
+                        val prefix = if (aiTag.isNotEmpty()) "[$aiTag] " else ""
+                        "$base\nAI: $prefix$ai"
+                    } else {
+                        "$base\nAI: analyzing…"
+                    }
                 } else {
                     "Advisor: no pending proposals"
                 }

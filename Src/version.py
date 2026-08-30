@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.38.3"
+__version__ = "1.39.8"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Hi-DPI desktop icon; E*TRADE small-BP buy fix; Growth posture; session/EOD/crypto"
+    "Gemini auto-picks working model from your API key; AQ auth keys supported"
 )
 
 

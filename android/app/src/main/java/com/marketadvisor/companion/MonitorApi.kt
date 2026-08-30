@@ -143,6 +143,8 @@ object MonitorApi {
         val dollars: Double = 0.0,
         val score: Double = 0.0,
         val engine: String = "",
+        val aiVerdict: String = "",
+        val aiBrief: String = "",
     )
 
     data class AdvisorInfo(
@@ -573,6 +575,8 @@ object MonitorApi {
                         dollars = o.optDouble("dollars", 0.0),
                         score = o.optDouble("score", 0.0),
                         engine = o.optString("engine", ""),
+                        aiVerdict = o.optString("ai_verdict", ""),
+                        aiBrief = o.optString("ai_brief", ""),
                     )
                 }
             }

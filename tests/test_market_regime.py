@@ -130,6 +130,22 @@ class TestBtcProxyRegime(unittest.TestCase):
         mreg.assert_called_once_with(is_crypto=False)
         self.assertEqual(why, "spy ok")
 
+    def test_entry_regime_growth_skips_spy_gate(self):
+        import scoring
+        with patch("scoring.market_regime_ok", return_value=(False, "DO NOT BUY (Regime: SPY 1H Downtrend)")) as mreg:
+            ok, why = scoring.entry_regime_ok(
+                is_crypto=False, posture="growth", ticker="AAPL",
+            )
+        self.assertTrue(ok)
+        mreg.assert_not_called()
+        self.assertEqual(why, "")
+
+    def test_small_book_prefers_breakouts(self):
+        import scoring
+        self.assertTrue(scoring.small_book_prefers_breakouts(120.0, {}))
+        self.assertTrue(scoring.small_book_prefers_breakouts(800.0, {"risk_posture": "growth"}))
+        self.assertFalse(scoring.small_book_prefers_breakouts(800.0, {"risk_posture": "balanced"}))
+
 
 if __name__ == "__main__":
     unittest.main()
