@@ -757,6 +757,30 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path.startswith("/api/agent/crash_log"):
+            if not _check_agent_auth(self):
+                self._unauthorized(locked=_auth_is_locked(_client_ip(self)))
+                return
+            try:
+                from urllib.parse import parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                max_chars = int((qs.get("chars") or qs.get("max_chars") or ["12000"])[0])
+                max_lines = int((qs.get("lines") or qs.get("max_lines") or ["120"])[0])
+            except Exception:
+                max_chars, max_lines = 12000, 120
+            try:
+                import crash_log as cl
+                payload = cl.read_tail(max_chars=max_chars, max_lines=max_lines)
+            except Exception as e:
+                payload = {"ok": False, "error": str(e), "text": ""}
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         ip = _client_ip(self)
         if _auth_is_locked(ip):

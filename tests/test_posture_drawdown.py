@@ -20,6 +20,7 @@ class PostureDrawdownTests(unittest.TestCase):
             "peak": 0.0,
             "pause_until": 0.0,
             "pause_reason": "",
+            "peak_dd_streak": 0,
         }
 
     def test_scale_in_bands_above_hard_stop(self):
@@ -46,7 +47,8 @@ class PostureDrawdownTests(unittest.TestCase):
 
     def test_safer_tighter_day_dd(self):
         scoring._equity_dd["ROBINHOOD"] = {
-            "day": "", "day_open": 0.0, "peak": 0.0, "pause_until": 0.0, "pause_reason": ""
+            "day": "", "day_open": 0.0, "peak": 0.0,
+            "pause_until": 0.0, "pause_reason": "", "peak_dd_streak": 0,
         }
         scoring.update_equity_drawdown("ROBINHOOD", 10000.0, posture="safer")
         paused, _ = scoring.update_equity_drawdown("ROBINHOOD", 9650.0, posture="safer")  # -3.5%

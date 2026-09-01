@@ -2,7 +2,10 @@
 AI Desk Advisor — plain-English trade briefs + health digests for small-book traders.
 
 Uses your API key (Gemini or OpenAI) from settings.json on the trading PC.
-Falls back to local rules when AI is off or the call fails. Never auto-buys.
+Falls back to local rules when AI is off or the call fails.
+
+When ask-before-apply is on, the desk auto-applies approve/skip under hard rails
+(DD pause, halt, min ticket) so beginners do not babysit every ticket.
 """
 from __future__ import annotations
 
@@ -113,8 +116,6 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
         reasons_skip.append(f"${price:.2f}/share above affordable max ~${max_sh:.0f} on {broker}")
     if price > 0 and bp > 0 and price > bp * 0.95 and "crypto" not in str(proposal.get("asset_type") or "").lower():
         reasons_skip.append(f"1 share ~${price:.0f} eats almost all ${bp:.0f} BP on {broker}")
-    if dollars > 0 and deploy > 0 and dollars > deploy * 0.92:
-        reasons_skip.append(f"ticket ${dollars:.0f} is nearly all deployable BP (~${deploy:.0f})")
     if score < 50:
         reasons_skip.append(f"score {score:.0f} is weak for this book")
     elif score >= 70:
@@ -140,7 +141,7 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
     brief_parts = [f"{broker} {engine or 'scan'} wants ~${dollars:.0f} of {tick}"]
     if reasons_ok:
         brief_parts.append(reasons_ok[0])
-    brief_parts.append(f"Posture {posture}. Tap Approve if you want the bot to place it.")
+    brief_parts.append(f"Posture {posture}. Desk will auto-apply if safety rails OK.")
     return {
         "verdict": VERDICT_APPROVE if score >= 55 else VERDICT_WAIT,
         "brief": " ".join(brief_parts)[:420],
@@ -192,12 +193,14 @@ def _proposal_prompt(proposal: dict, context: dict | None) -> str:
             "summary": ctx.get("summary"),
         },
         "trader_note": (
-            "Beginner trader, small account (~$50–$175). Explain simply. "
-            "Never promise profits. Prefer skip when sizing/regime is wrong."
+            "Beginner auto-pilot desk. Small account. Explain simply. "
+            "Your verdict may auto-execute under hard rails (DD/halt/min ticket). "
+            "Be conservative: prefer skip/wait when unsure. Never override DD or halt. "
+            "Prefer fundable ticket sizes for the book."
         ),
     }
     return (
-        "You are Desk Advisor for a small retail auto-trader. "
+        "You are Desk Advisor for a beginner retail auto-trader (auto-pilot). "
         "Reply with ONLY JSON: "
         '{"verdict":"approve|skip|wait","brief":"<=2 sentences plain English",'
         '"detail":"one line why"}'

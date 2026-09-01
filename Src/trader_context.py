@@ -109,10 +109,19 @@ def build_trader_context(
     if idle_reason:
         blockers.append({"code": "idle", "message": idle_reason})
     if deploy + 1e-9 < min_ticket:
-        blockers.append({
-            "code": "low_bp",
-            "message": f"Deployable ${deploy:.2f} below min ticket ${min_ticket:.2f}",
-        })
+        if int(open_positions or 0) > 0:
+            blockers.append({
+                "code": "fully_deployed",
+                "message": (
+                    f"Fully deployed — ${deploy:.2f} left under min ticket "
+                    f"${min_ticket:.0f} (waiting on exits or a deposit)"
+                ),
+            })
+        else:
+            blockers.append({
+                "code": "low_bp",
+                "message": f"Deployable ${deploy:.2f} below min ticket ${min_ticket:.2f}",
+            })
     if supports_equities and regime_equity_ok is False and regime_equity_reason:
         blockers.append({
             "code": "regime_equity",
@@ -136,7 +145,8 @@ def build_trader_context(
         })
 
     hard_block = any(
-        b["code"] in ("halt", "offline", "reauth", "dd_pause", "low_bp") for b in blockers
+        b["code"] in ("halt", "offline", "reauth", "dd_pause", "low_bp", "fully_deployed")
+        for b in blockers
     )
     can_buy = (
         connected
@@ -239,11 +249,59 @@ def build_from_monitor_status(status: dict | None, broker_name: str) -> dict[str
     )
 
 
-def format_trader_digest(by_broker: dict[str, dict]) -> str:
+def fully_deployed_idle_reason(
+    *,
+    buying_power: float,
+    open_positions: int,
+    min_ticket: float = 5.0,
+    utilization: float = 0.88,
+) -> str | None:
+    """
+    Cache-friendly fully-deployed message for buy-engine parking.
+    Callers must pass cached BP / position counts — never live broker APIs.
+    """
+    try:
+        bp = float(buying_power or 0.0)
+    except (TypeError, ValueError):
+        bp = 0.0
+    try:
+        util = float(utilization or 0.88)
+        if util > 1.0:
+            util = util / 100.0
+    except (TypeError, ValueError):
+        util = 0.88
+    util = min(0.99, max(0.50, util))
+    try:
+        min_d = float(min_ticket or 5.0)
+    except (TypeError, ValueError):
+        min_d = 5.0
+    deploy = max(0.0, bp * util)
+    if deploy + 1e-9 >= min_d:
+        return None
+    if int(open_positions or 0) <= 0:
+        return None
+    return (
+        f"Fully deployed — ${deploy:.2f} left under min ticket ${min_d:.0f} "
+        f"(waiting on exits or a deposit)"
+    )
+
+
+def format_trader_digest(by_broker: dict[str, dict], *, day_pnl: float | None = None) -> str:
     lines = ["Trader desk context:"]
+    if day_pnl is not None:
+        try:
+            d = float(day_pnl)
+            lines.append(f"  Day P&L {d:+.2f}")
+        except (TypeError, ValueError):
+            pass
     for name, ctx in (by_broker or {}).items():
         if not isinstance(ctx, dict):
             continue
-        flag = "CAN BUY" if ctx.get("can_place_new_buy") else "BLOCKED"
+        if any(b.get("code") == "fully_deployed" for b in (ctx.get("blockers") or [])):
+            flag = "DEPLOYED"
+        elif ctx.get("can_place_new_buy"):
+            flag = "CAN BUY"
+        else:
+            flag = "BLOCKED"
         lines.append(f"  [{flag}] {ctx.get('summary') or name}")
     return "\n".join(lines)

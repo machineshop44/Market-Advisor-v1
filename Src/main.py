@@ -10,6 +10,14 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Crash log as early as possible (before heavy imports / QApplication)
+try:
+    import crash_log as _crash_log
+
+    _CRASH_LOG_PATH = _crash_log.install_crash_logging()
+except Exception:
+    _CRASH_LOG_PATH = ""
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMessageBox, QSplashScreen, QMenu, QAction

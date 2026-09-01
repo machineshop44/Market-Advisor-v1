@@ -135,10 +135,12 @@ def merge_breakout_universe(
     rh_movers: list[str] | None = None,
     yahoo_gainers: list[str] | None = None,
     *,
+    extended_micro: list[str] | None = None,
     max_total: int = 16,
 ) -> list[dict]:
     """
     Multi-source Breakouts list with source tags (deduped, first source wins).
+  extended_micro: afford-filtered tickers for extended-hours micro books (1.40).
     """
     seen: set[str] = set()
     out: list[dict] = []
@@ -162,4 +164,6 @@ def merge_breakout_universe(
         _add(s, "RH Top Mover")
     for s in yahoo_gainers or []:
         _add(s, "Yahoo Gainer")
+    for s in extended_micro or []:
+        _add(s, "Extended Micro")
     return out

@@ -220,6 +220,22 @@ def load_settings():
         "advisor_ai_api_key": "",
         "advisor_ai_model": "",
         "advisor_ai_auto_reject_skip": True,
+        "advisor_ai_auto_apply_approve": True,
+        "desk_focus_mode": "auto",
+        "desk_focus_broker": "",
+        "focus_broker_scan_mult": 2.0,
+        "stuck_capital_warn_hours": 4.0,
+        "stuck_capital_urgent_hours": 12.0,
+        "peak_dd_cash_recovery_pct": 0.90,
+        "advisor_focus_auto_apply": True,
+        "profit_guard_enabled": True,
+        "profit_guard_fee_drag_pct": 2.5,
+        "profit_guard_min_closed": 3,
+        "profit_guard_ack_until": 0.0,
+        "profit_guard_ack_hours": 24.0,
+        "daily_scoreboard_enabled": True,
+        "single_stack_banner_enabled": True,
+        "otc_skip_portfolio_scoring": True,
         "cursor_monitor_enabled": False,
         "cursor_monitor_token": "",
         "desk_snag_discord_alerts": True,
@@ -1452,6 +1468,10 @@ class MarketAdvisorGUI(QMainWindow):
         self._scan_idle_since = {}  # f"{broker}:{engine}" -> ts of last raw BUY signal
         self._buy_skip_throttle = {}  # (broker, kind) -> last log ts (BP/rotate spam)
         self._scan_drop_throttle = {}  # (broker, engine, ticker) -> last log ts
+        self._zero_signal_streak = {}  # f"{broker}:{engine}" -> count
+        self._desk_focus_broker_cache = None
+        self._holdings_snapshot_by_broker = _blank_broker_map(dict)
+        self._last_daily_scoreboard_day = ""
         self._cost_unknown_logged = set()  # "Broker:TICKER" cost-basis unknown once
         self._cost_seeded_logged = set()  # "Broker:TICKER:source" seeded-once log
         self._sell_fail_backoff = {}  # (broker, ticker) -> {reason, ts} hopeless sell defer
@@ -1537,6 +1557,17 @@ class MarketAdvisorGUI(QMainWindow):
         self.update_market_status()
         self.log_event("Application initialized. Verifying connections...")
         self.log_event(f"Version {APP_VERSION}" + (f" — {VERSION_NOTE}" if VERSION_NOTE else ""))
+        try:
+            import crash_log as cl
+
+            self.log_event(f"Crash log: {cl.crash_log_path()}")
+            prior = cl.last_crash_snippet(800)
+            if prior and ("EXCEPTION" in prior or "CRASH" in prior or "Fatal" in prior):
+                self.log_event(
+                    "[CRASH] Prior fault on file — open Src/crash_log.txt if the app died unexpectedly."
+                )
+        except Exception:
+            pass
         self._setup_system_tray()  # tray visible immediately
 
         # Warm heavy libs early so first score/scan (and load_state) don't hitch
@@ -1776,6 +1807,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.journal_tabs.setObjectName("journalTabs")
             self.journal_tabs.addTab(self.build_activity_log_screen(), "Activity")
             self.journal_tabs.addTab(self.build_execution_screen(), "Execution")
+            self.journal_tabs.addTab(self.build_advisor_journal_screen(), "Advisor")
             self.journal_tabs.addTab(self.build_reports_screen(), "Reports")
             self.tabs.addTab(self.journal_tabs, "Journal")
 
@@ -2661,6 +2693,11 @@ class MarketAdvisorGUI(QMainWindow):
             entry["rotate_for"] = rotate_for
         if rotate_from:
             entry["rotate_from"] = rotate_from
+        jk = self._journal_kwargs()
+        if jk.get("engine"):
+            entry["engine"] = jk["engine"]
+        if jk.get("reason") and not entry.get("reason"):
+            entry["reason"] = jk["reason"]
         try:
             journal.log_trade(entry)
         except Exception as e:
@@ -2801,6 +2838,10 @@ class MarketAdvisorGUI(QMainWindow):
             out["rotate_for"] = meta["rotate_for"]
         if meta.get("rotate_from"):
             out["rotate_from"] = meta["rotate_from"]
+        if meta.get("engine"):
+            out["engine"] = meta["engine"]
+        elif getattr(self, "_cycle_task", None):
+            out["engine"] = self._cycle_task
         return out
 
     def execute_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
@@ -3135,6 +3176,262 @@ class MarketAdvisorGUI(QMainWindow):
 
         self.send_discord_alert(f"Heartbeat {clock}", embed=embed, prefix="[HEARTBEAT]")
         self.log_event(f"Discord heartbeat sent ({mode})")
+
+    def _weekly_digest_is_due(self, now_ts) -> bool:
+        """Sunday 18:00 local — once per ISO week."""
+        now_dt = datetime.fromtimestamp(now_ts)
+        if now_dt.weekday() != 6:  # Sunday
+            return False
+        if now_dt.hour < 18:
+            return False
+        week_key = now_dt.strftime("%G-W%V")
+        if getattr(self, "_last_weekly_digest_week", "") == week_key:
+            return False
+        return True
+
+    def _maybe_send_weekly_digest(self, now_ts):
+        if not any(self.auto_trade_enabled.values()):
+            return
+        if not self._weekly_digest_is_due(now_ts):
+            return
+        webhook_url = self.settings.get("discord_webhook", "").strip()
+        if not webhook_url or self.settings.get("discord_alert_level", "") == "Disabled Completely":
+            return
+        try:
+            import analytics
+            import journal as journal_mod
+            rows = journal_mod.read_since_days(days=7, limit=4000)
+            summary = analytics.summarize_fills(rows)
+            net = float(summary.get("net_after_fees") or 0.0)
+            drag = float(summary.get("fee_drag_pct") or 0.0)
+            nwr = summary.get("net_win_rate")
+            closed = int(summary.get("net_wins") or 0) + int(summary.get("net_losses") or 0)
+            wr_txt = f"{float(nwr)*100:.0f}%" if nwr is not None and closed > 0 else "—"
+            eng_line = analytics.format_engine_pnl_line(
+                summary.get("by_engine"), money_fmt=format_currency,
+            )
+            cpl = f"+{format_money(net)}" if net >= 0 else format_money(net)
+            body = (
+                f"**7d scoreboard** — Net **{cpl}** · Net WR **{wr_txt}** · "
+                f"Fee drag **{drag:.1f}%** · Trades **{int(summary.get('sells') or 0)}** closes"
+            )
+            if eng_line:
+                body += f"\n{eng_line}"
+            embed = {
+                "title": "📈 Weekly P&L digest",
+                "description": body,
+                "color": 0x2ECC71 if net >= 0 else 0xE74C3C,
+                "footer": {"text": f"{display_name()} · Journal Reports math"},
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+            self._last_weekly_digest_week = datetime.fromtimestamp(now_ts).strftime("%G-W%V")
+            self.send_discord_alert("Weekly digest", embed=embed, prefix="[REPORTS]")
+            self.log_event("Discord weekly P&L digest sent")
+        except Exception:
+            pass
+
+    def _daily_scoreboard_is_due(self, now_ts) -> bool:
+        """Weekdays 16:00–16:06 ET — once per session day."""
+        if not bool(self.settings.get("daily_scoreboard_enabled", True)):
+            return False
+        now_et = self._now_et()
+        if now_et.weekday() >= 5:
+            return False
+        sod = now_et.hour * 3600 + now_et.minute * 60 + now_et.second
+        close_s = 16 * 3600
+        if not (close_s <= sod < close_s + 360):
+            return False
+        day_key = now_et.date().isoformat()
+        if getattr(self, "_last_daily_scoreboard_day", "") == day_key:
+            return False
+        return True
+
+    def _maybe_send_daily_scoreboard(self, now_ts):
+        if not any(self.auto_trade_enabled.values()):
+            return
+        if not self._daily_scoreboard_is_due(now_ts):
+            return
+        webhook_url = self.settings.get("discord_webhook", "").strip()
+        if not webhook_url or self.settings.get("discord_alert_level", "") == "Disabled Completely":
+            return
+        try:
+            import analytics
+            import desk_orchestration as do
+            import journal as journal_mod
+            rows = journal_mod.read_since_days(days=7, limit=4000)
+            summary = analytics.summarize_fills(rows)
+            net = float(summary.get("net_after_fees") or 0.0)
+            drag = float(summary.get("fee_drag_pct") or 0.0)
+            nwr = summary.get("net_win_rate")
+            closed = int(summary.get("net_wins") or 0) + int(summary.get("net_losses") or 0)
+            wr_txt = f"{float(nwr)*100:.0f}%" if nwr is not None and closed > 0 else "—"
+            ctx_map = getattr(self, "_last_trader_context", None) or self._build_trader_context_map()
+            focus = do.resolve_focus_broker(ctx_map or {}, self.settings)
+            action = do.next_desk_action(ctx_map or {}, focus_broker=focus)
+            day_pl = 0.0
+            for name in BROKER_NAMES:
+                base = float((self.session_starts or {}).get(name) or 0.0)
+                cur = float(
+                    ((getattr(self, "_last_balance_totals", {}) or {}).get(name) or {}).get("p_val", 0.0)
+                    or 0.0
+                )
+                if base > 0:
+                    day_pl += cur - base
+            cpl = f"+{format_money(net)}" if net >= 0 else format_money(net)
+            dpl = f"+{format_money(day_pl)}" if day_pl >= 0 else format_money(day_pl)
+            focus_txt = f" · Focus **{focus}**" if focus else ""
+            body = (
+                f"**Daily scoreboard** — Day **{dpl}** · 7d net **{cpl}** · "
+                f"WR **{wr_txt}** · Fee **{drag:.1f}%**{focus_txt}\n"
+                f"Next: {action}"
+            )
+            guard_on, guard_why = do.profit_guard_tripped(summary, self.settings, now_ts=now_ts)
+            if guard_on:
+                body += f"\n⚠️ Profit guard: {guard_why}"
+            embed = {
+                "title": "📊 End-of-day desk scoreboard",
+                "description": body,
+                "color": 0x2ECC71 if net >= 0 else 0xE74C3C,
+                "footer": {"text": f"{display_name()} · 4pm ET"},
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+            self._last_daily_scoreboard_day = self._now_et().date().isoformat()
+            self.send_discord_alert("Daily scoreboard", embed=embed, prefix="[REPORTS]")
+            self.log_event("Discord daily scoreboard sent")
+        except Exception:
+            pass
+
+    def _maybe_fully_deployed_nudge(self, now_ts):
+        """Throttled Discord when cash is stuck under min ticket but book is deployed."""
+        if not any(self.auto_trade_enabled.values()):
+            return
+        webhook_url = self.settings.get("discord_webhook", "").strip()
+        if not webhook_url or self.settings.get("discord_alert_level", "") == "Disabled Completely":
+            return
+        for broker_name in BROKER_NAMES:
+            if not self.auto_trade_enabled.get(broker_name):
+                continue
+            idle = self._fully_deployed_idle_reason(broker_name)
+            if not idle:
+                continue
+            snap = (getattr(self, "_last_balance_totals", {}) or {}).get(broker_name) or {}
+            bp = float(snap.get("bp") or 0.0)
+            logged = self._throttled_log(
+                f"{broker_name}:fully_deployed_nudge",
+                f"[{broker_name}] {idle}",
+                cooldown_sec=14400,
+            )
+            if logged:
+                self.send_discord_alert(
+                    f"**[{broker_name}]** Fully deployed — cash **{format_money(bp)}** "
+                    f"under min ticket. Buy engines parked; **PORTFOLIO** still recycles winners.",
+                    prefix="[DESK]",
+                )
+
+    def _maybe_stuck_capital_nudge(self, now_ts):
+        """Discord/Home when deployed capital sits without TTP arm too long."""
+        if not any(self.auto_trade_enabled.values()):
+            return
+        import desk_orchestration as do
+        from scoring import _portfolio_memory, _normalize_broker_id
+        try:
+            warn_h = float(self.settings.get("stuck_capital_warn_hours") or 4.0)
+            urg_h = float(self.settings.get("stuck_capital_urgent_hours") or 12.0)
+        except (TypeError, ValueError):
+            warn_h, urg_h = 4.0, 12.0
+        webhook = self.settings.get("discord_webhook", "").strip()
+        alerts_on = webhook and self.settings.get("discord_alert_level", "") != "Disabled Completely"
+        for broker_name in BROKER_NAMES:
+            if not self.auto_trade_enabled.get(broker_name):
+                continue
+            if not self._fully_deployed_idle_reason(broker_name):
+                continue
+            bid = {
+                "Robinhood": "ROBINHOOD", "Coinbase": "COINBASE", "E*TRADE": "ETRADE",
+            }.get(broker_name, broker_name)
+            bid = _normalize_broker_id(bid)
+            mem_broker = _portfolio_memory.get(bid) or {}
+            heat = (getattr(self, "_heat_holdings_by_broker", {}) or {}).get(broker_name) or []
+            worst_h = 0.0
+            worst_tick = ""
+            for h in heat:
+                if not isinstance(h, dict):
+                    continue
+                tick = str(h.get("ticker") or "").upper()
+                if not tick:
+                    continue
+                locked, _ = _auto_cycle.classify_locked_holding(h, broker_name=broker_name)
+                if locked:
+                    continue
+                slot = mem_broker.get(tick) or {}
+                buy_ts = float(slot.get("buy_time") or 0.0)
+                if buy_ts <= 0:
+                    continue
+                held_h = (now_ts - buy_ts) / 3600.0
+                if held_h > worst_h:
+                    worst_h = held_h
+                    worst_tick = tick
+            tier = do.stuck_capital_tier(worst_h, warn_hours=warn_h, urgent_hours=urg_h)
+            if not tier:
+                continue
+            msg = (
+                f"[{broker_name}] Stuck capital — {worst_tick or 'position'} held "
+                f"{worst_h:.1f}h while fully deployed. PORTFOLIO + partial TTP recycle; "
+                f"or exit manually to free autosizing room."
+            )
+            cd = 7200 if tier == "warn" else 14400
+            logged = self._throttled_log(f"{broker_name}:stuck_capital_{tier}", msg, cooldown_sec=cd)
+            if logged and alerts_on and tier == "urgent":
+                self.send_discord_alert(f"**{msg}**", prefix="[DESK]", urgent=True)
+
+    def _record_zero_signal(self, broker_name: str, engine: str, buy_n: int):
+        """Track consecutive empty scans for focus-broker coach."""
+        key = f"{broker_name}:{engine}"
+        if buy_n > 0:
+            self._zero_signal_streak[key] = 0
+            return
+        self._zero_signal_streak[key] = int(self._zero_signal_streak.get(key) or 0) + 1
+        import desk_orchestration as do
+        focus = self._desk_focus_broker()
+        if not focus or str(broker_name) != str(focus):
+            return
+        streak = int(self._zero_signal_streak.get(key) or 0)
+        if streak < 3:
+            return
+        try:
+            equity, bp, _ = self.get_effective_balances(broker_name)
+            from scoring import max_affordable_share_price
+            max_sh = float(max_affordable_share_price(bp) or 0.0)
+        except Exception:
+            max_sh = 0.0
+        sess = self.get_equity_session_info().get("label", "?")
+        msg = do.zero_signal_coach_message(
+            broker=broker_name, engine=engine, session_label=sess,
+            max_afford_share=max_sh, cycles=streak,
+        )
+        if self._throttled_log(f"{key}:zero_signal_coach", msg, cooldown_sec=1800):
+            self.log_event(f"[COACH] {msg}")
+
+    def _reorder_task_queue_buy_focus(self):
+        """When only some brokers can still buy, run focus broker cycles first."""
+        if not self.task_queue:
+            return
+        import desk_orchestration as do
+        buy_tasks = {"CRYPTO", "PENNY", "CORE"}
+        focus = self._desk_focus_broker()
+
+        def sort_key(item):
+            broker, task = item
+            if focus and str(broker) == str(focus):
+                broker_prio = 0
+            elif not self._buy_engines_should_rest(broker)[0]:
+                broker_prio = 1
+            else:
+                broker_prio = 2
+            task_prio = 0 if task in buy_tasks else 1
+            return (broker_prio, task_prio)
+
+        self.task_queue.sort(key=sort_key)
 
     def _send_discord_launch_checkin(self, force=False):
         """Phone home once after startup. Uses a plain thread so Qt QThread quirks cannot drop it."""
@@ -3656,17 +3953,33 @@ class MarketAdvisorGUI(QMainWindow):
             # Profit/loss limits only on trusted balance reads (never on a glitch $0)
             if self.auto_trade_enabled.get(broker_name) and trusted.get(broker_name):
                 try:
-                    from scoring import update_equity_drawdown, posture_for_broker, posture_knobs_for_broker
+                    from scoring import (
+                        update_equity_drawdown,
+                        posture_for_broker,
+                        posture_knobs_for_broker,
+                        maybe_recover_peak_for_cash_heavy_book,
+                    )
                     bid = {
                         "Robinhood": "ROBINHOOD",
                         "Coinbase": "COINBASE",
                         "E*TRADE": "ETRADE",
                     }.get(broker_name, broker_name)
-                    posture_b = posture_for_broker(broker_name, self.settings)
-                    knobs_b = posture_knobs_for_broker(broker_name, self.settings)
+                    eff_eq, eff_bp, _ = self.get_effective_balances(broker_name)
+                    pos_val = max(0.0, float(eff_eq or p_val) - float(eff_bp or bp))
+                    recovered, rec_msg = maybe_recover_peak_for_cash_heavy_book(
+                        bid, eff_eq or p_val, eff_bp or bp, pos_val, settings=self.settings,
+                    )
+                    if recovered and rec_msg:
+                        self.log_event(f"[DD] [{broker_name}] {rec_msg}")
+                    posture_b = posture_for_broker(
+                        broker_name, self.settings, equity=eff_eq or p_val,
+                    )
+                    knobs_b = posture_knobs_for_broker(
+                        broker_name, self.settings, equity=eff_eq or p_val,
+                    )
                     triggered, dd_msg = update_equity_drawdown(
                         bid,
-                        p_val,
+                        float(eff_eq or p_val),
                         posture=posture_b,
                         settings=self.settings,
                     )
@@ -4206,7 +4519,21 @@ class MarketAdvisorGUI(QMainWindow):
                 pass
             idle = ""
             try:
-                idle = str(self._buy_engines_idle_reason(name) or "")
+                # ET sandbox/$0 only — fully_deployed is a first-class blocker below
+                et = self.brokers.get("E*TRADE")
+                env = str(
+                    getattr(et, "environment", None)
+                    or self.settings.get("etrade_environment", "sandbox")
+                ).lower() if et else "sandbox"
+                et_bp = float((totals.get("E*TRADE") or {}).get("bp") or 0.0)
+                idle = str(_decision_log.buy_engines_idle_reason_for(
+                    name,
+                    paper_mode=bool(self.paper_mode),
+                    etrade_connected=bool(et and getattr(et, "is_connected", False)),
+                    etrade_environment=env,
+                    etrade_buying_power=et_bp,
+                    min_trade_dollars=float(self.settings.get("min_trade_dollars", 5.0) or 5.0),
+                ) or "")
             except Exception:
                 pass
             out[name] = tc.build_trader_context(
@@ -4234,26 +4561,48 @@ class MarketAdvisorGUI(QMainWindow):
         return out
 
     def _format_trader_context_home(self, ctx_map: dict | None = None) -> str:
-        """One-line Home summary from trader context."""
-        rows = []
+        """One-line Home summary: day P&L + can-buy / deployed / blockers."""
+        bals = getattr(self, "_last_balance_totals", {}) or {}
+        day_pnl = 0.0
+        try:
+            for name in BROKER_NAMES:
+                p_val = float((bals.get(name) or {}).get("p_val") or 0.0)
+                start = (getattr(self, "session_starts", {}) or {}).get(name)
+                if start is not None and float(start) > 0:
+                    day_pnl += p_val - float(start)
+        except (TypeError, ValueError, AttributeError):
+            day_pnl = 0.0
+        pnl_s = f"{day_pnl:+.2f}" if abs(day_pnl) >= 0.005 else "0.00"
+        rows = [f"Day {pnl_s}"]
         for name in BROKER_NAMES:
             ctx = (ctx_map or {}).get(name) or {}
             if not ctx:
                 continue
-            flag = "✓" if ctx.get("auto_ready") else ("⏸" if ctx.get("can_place_new_buy") else "✗")
+            if ctx.get("auto_ready"):
+                flag = "can buy"
+            elif any(b.get("code") == "fully_deployed" for b in (ctx.get("blockers") or [])):
+                flag = "deployed"
+            elif ctx.get("can_place_new_buy"):
+                flag = "paused"
+            else:
+                flag = "blocked"
             bp = float(ctx.get("buying_power") or 0)
             max_sh = float(ctx.get("max_affordable_share_price") or 0)
             posture = str(ctx.get("posture_label") or ctx.get("posture") or "?")
             blockers = ctx.get("blockers") or []
             tail = ""
             if blockers:
-                tail = f" — {blockers[0].get('message', '')[:48]}"
+                code = blockers[0].get("code") or ""
+                if code == "fully_deployed":
+                    tail = " — fully deployed (exits/deposit)"
+                else:
+                    tail = f" — {blockers[0].get('message', '')[:44]}"
             elif ctx.get("small_book"):
                 tail = " — breakouts first"
             rows.append(
                 f"{flag} {name}: ${bp:.0f} BP · ≤${max_sh:.0f}/sh · {posture}{tail}"
             )
-        return "  |  ".join(rows) if rows else "Desk context — no broker data yet"
+        return "  |  ".join(rows) if len(rows) > 1 else "Desk context — no broker data yet"
 
     def _advisor_ai_context(self, broker_name: str) -> dict:
         """Book + session context for AI / local advisor briefs."""
@@ -4265,6 +4614,40 @@ class MarketAdvisorGUI(QMainWindow):
         if not ctx:
             ctx = self._build_trader_context_map().get(broker_name) or {}
         return ctx
+
+    def _advisor_auto_apply_rails_ok(self, broker_name: str, proposal: dict | None = None) -> tuple[bool, str]:
+        """Hard rails AI/local cannot override before auto-buy."""
+        prop = proposal or {}
+        if bool(getattr(self, "_panic_halted", False)):
+            return False, "panic halt is on"
+        broker = self.brokers.get(broker_name)
+        if not broker:
+            return False, f"broker {broker_name} missing"
+        connected = bool(getattr(broker, "is_connected", False)) or bool(
+            getattr(self, "paper_mode", False)
+        )
+        if not connected:
+            return False, f"{broker_name} disconnected"
+        if getattr(broker, "reauth_needed", False):
+            return False, f"{broker_name} needs reauth"
+        try:
+            from scoring import _drawdown_block
+            bid = getattr(broker, "broker_id", None) or str(broker_name).upper()
+            ok, why = _drawdown_block(bid)
+            if not ok:
+                return False, why or "drawdown pause"
+        except Exception:
+            pass
+        try:
+            dollars = float(prop.get("dollars") or 0)
+        except (TypeError, ValueError):
+            dollars = 0.0
+        if dollars + 1e-9 < 1.0:
+            return False, "ticket size too small"
+        armed = bool((getattr(self, "auto_trade_enabled", {}) or {}).get(broker_name))
+        if not armed:
+            return False, f"{broker_name} auto-trader not armed"
+        return True, ""
 
     def _schedule_advisor_ai_analysis(self, proposal_id: str, broker_name: str):
         """Background AI/local brief for a pending proposal."""
@@ -4290,23 +4673,143 @@ class MarketAdvisorGUI(QMainWindow):
             result = (payload or {}).get("result") or {}
             prop = (payload or {}).get("proposal") or {}
             tick = prop.get("ticker") or "?"
-            verdict = str(result.get("verdict") or "")
+            verdict = str(result.get("verdict") or "").strip().lower()
             brief = str(result.get("brief") or "")
             src = str(result.get("source") or "local")
             if brief:
                 self.log_event(f"[Advisor AI] {tick} → {verdict or '—'} ({src}): {brief}")
+            auto_reject = bool(self.settings.get("advisor_ai_auto_reject_skip", True))
+            auto_apply = bool(self.settings.get("advisor_ai_auto_apply_approve", True))
             if (
                 verdict == "skip"
-                and bool(self.settings.get("advisor_ai_auto_reject_skip", True))
+                and auto_reject
                 and prop.get("id")
             ):
-                import advisor_queue as aq
-
                 rejected = aq.reject(prop["id"])
                 if rejected:
                     self.log_event(f"[Advisor AI] Auto-rejected {tick} (AI skip).")
+                    try:
+                        aq.record_decision(
+                            proposal_id=prop.get("id") or "",
+                            broker=broker_name,
+                            ticker=tick,
+                            verdict=verdict,
+                            action="auto_reject",
+                            source=src,
+                            brief=brief,
+                            detail=str(result.get("detail") or ""),
+                            dollars=float(prop.get("dollars") or 0),
+                            score=float(prop.get("score") or 0),
+                            engine=str(prop.get("engine") or ""),
+                            status="rejected",
+                        )
+                    except Exception:
+                        pass
+            elif (
+                verdict == "approve"
+                and auto_apply
+                and prop.get("id")
+                and str(prop.get("status") or "") == "pending"
+            ):
+                ok_rails, why = self._advisor_auto_apply_rails_ok(broker_name, prop)
+                if not ok_rails:
+                    self.log_event(
+                        f"[Advisor AI] Hold {tick} — rails blocked auto-apply ({why})."
+                    )
+                    try:
+                        aq.record_decision(
+                            proposal_id=prop.get("id") or "",
+                            broker=broker_name,
+                            ticker=tick,
+                            verdict=verdict,
+                            action="hold_rails",
+                            source=src,
+                            brief=brief,
+                            detail=why,
+                            dollars=float(prop.get("dollars") or 0),
+                            score=float(prop.get("score") or 0),
+                            engine=str(prop.get("engine") or ""),
+                            status="pending",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    res = self._advisor_apply_proposal(prop["id"])
+                    if res.get("ok"):
+                        self.log_event(
+                            f"[Advisor AI] Auto-applied BUY {tick} on {broker_name} "
+                            f"(desk auto · {src} approve)"
+                        )
+                        try:
+                            aq.record_decision(
+                                proposal_id=prop.get("id") or "",
+                                broker=broker_name,
+                                ticker=tick,
+                                verdict=verdict,
+                                action="auto_apply",
+                                source=src,
+                                brief=brief,
+                                detail=str(result.get("detail") or ""),
+                                dollars=float(prop.get("dollars") or 0),
+                                score=float(prop.get("score") or 0),
+                                engine=str(prop.get("engine") or ""),
+                                status="executing",
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        self.log_event(
+                            f"[Advisor AI] Auto-apply failed {tick}: "
+                            f"{res.get('error') or 'unknown'}"
+                        )
+                        try:
+                            aq.record_decision(
+                                proposal_id=prop.get("id") or "",
+                                broker=broker_name,
+                                ticker=tick,
+                                verdict=verdict,
+                                action="auto_apply_fail",
+                                source=src,
+                                brief=brief,
+                                detail=str(res.get("error") or ""),
+                                dollars=float(prop.get("dollars") or 0),
+                                score=float(prop.get("score") or 0),
+                                engine=str(prop.get("engine") or ""),
+                                status="pending",
+                            )
+                        except Exception:
+                            pass
+            else:
+                # Verdict recorded but no auto action (wait / manual mode)
+                if verdict == "wait" and prop.get("id"):
+                    # Short TTL already set in patch_ai; surface clearly in Activity
+                    self.log_event(
+                        f"[Advisor AI] {tick} WAIT — will auto-clear in ~12m if still pending."
+                    )
+                try:
+                    aq.record_decision(
+                        proposal_id=prop.get("id") or "",
+                        broker=broker_name,
+                        ticker=tick,
+                        verdict=verdict,
+                        action="verdict",
+                        source=src,
+                        brief=brief,
+                        detail=str(result.get("detail") or ""),
+                        dollars=float(prop.get("dollars") or 0),
+                        score=float(prop.get("score") or 0),
+                        engine=str(prop.get("engine") or ""),
+                        status=str(prop.get("status") or "pending"),
+                    )
+                except Exception:
+                    pass
             self._refresh_advisor_card()
             self.publish_monitor_status()
+            if hasattr(self, "refresh_advisor_journal"):
+                try:
+                    self.refresh_advisor_journal()
+                except Exception:
+                    pass
             if brief:
                 self.send_discord_alert(
                     f"**Advisor AI** {tick}: {verdict.upper()} — {brief}",
@@ -4413,6 +4916,43 @@ class MarketAdvisorGUI(QMainWindow):
                 or self.settings.get("cursor_monitor_token")
                 or ""
             )
+        if hasattr(self, "desk_focus_mode_combo"):
+            self.settings["desk_focus_mode"] = str(
+                self.desk_focus_mode_combo.currentData() or "auto"
+            )
+        if hasattr(self, "desk_focus_broker_combo"):
+            self.settings["desk_focus_broker"] = str(
+                self.desk_focus_broker_combo.currentData() or ""
+            )
+        if hasattr(self, "advisor_focus_auto_chk"):
+            self.settings["advisor_focus_auto_apply"] = bool(
+                self.advisor_focus_auto_chk.isChecked()
+            )
+        if hasattr(self, "profit_guard_chk"):
+            self.settings["profit_guard_enabled"] = bool(self.profit_guard_chk.isChecked())
+        if hasattr(self, "profit_guard_drag_spin"):
+            self.settings["profit_guard_fee_drag_pct"] = float(
+                self.profit_guard_drag_spin.value()
+            )
+
+    def _acknowledge_profit_guard(self):
+        """Allow new buys for profit_guard_ack_hours even when guard would trip."""
+        try:
+            hours = float(self.settings.get("profit_guard_ack_hours") or 24.0)
+        except (TypeError, ValueError):
+            hours = 24.0
+        until = time.time() + max(1.0, hours) * 3600.0
+        self.settings["profit_guard_ack_until"] = until
+        save_settings(self.settings)
+        self.log_event(
+            f"Profit guard acknowledged — new buys allowed for {hours:.0f}h "
+            f"(portfolio/sells unchanged)."
+        )
+        QMessageBox.information(
+            self,
+            "Profit guard",
+            f"New buys allowed for ~{hours:.0f} hours. Portfolio exits still run.",
+        )
 
     def _maybe_desk_snag_discord(self):
         """Discord when watchdog finds new warn/critical snags (throttled)."""
@@ -5034,10 +5574,13 @@ class MarketAdvisorGUI(QMainWindow):
                     cooldown_sec=780,
                 )
                 tasks = ("PORTFOLIO",)
-            elif kind == "pre_close":
-                tasks = ("PORTFOLIO",)
             else:
-                tasks = ("PORTFOLIO", "CORE", "PENNY")
+                import desk_orchestration as do
+                focus = self._desk_focus_broker()
+                focus_on = do.focus_mode(self.settings) != "off"
+                tasks = do.session_boundary_tasks(
+                    kind, broker, focus_broker=focus, focus_mode_on=focus_on,
+                )
             for task_name in tasks:
                 item = (broker, task_name)
                 if item in self.task_queue:
@@ -5185,6 +5728,16 @@ class MarketAdvisorGUI(QMainWindow):
             for line in err_text.splitlines()[1:12]:
                 if line.strip():
                     self.log_event(f"  {line}")
+            try:
+                import crash_log as cl
+
+                cl.record_crash(
+                    f"BackgroundTask {fname}: {summary}",
+                    detail=err_text[:2000],
+                    where="run_thread",
+                )
+            except Exception:
+                pass
             self.set_working_state(False)
             if unlock_queue_on_error:
                 if _is_manual_auth_failure(summary):
@@ -5997,12 +6550,13 @@ class MarketAdvisorGUI(QMainWindow):
         self.home_overnight_chip = QLabel("Overnight: —")
         self.home_shadow_chip = QLabel("Shadow: —")
         self.home_fill_chip = QLabel("Fill: —")
+        self.home_pnl_chip = QLabel("Scoreboard: —")
         self.home_frac_chip = QLabel("Frac: —")
         self.home_locked_chip = QLabel("Locked: —")
         for chip in (
             self.home_dd_chip, self.home_loss_chip, self.home_stops_chip,
             self.home_overnight_chip, self.home_shadow_chip, self.home_fill_chip,
-            self.home_frac_chip, self.home_locked_chip,
+            self.home_pnl_chip, self.home_frac_chip, self.home_locked_chip,
         ):
             chip.setStyleSheet(
                 f"font-size: {ui_px(11)}px; font-weight: 600; padding: {ui_px(2)}px {ui_px(8)}px;"
@@ -6036,6 +6590,24 @@ class MarketAdvisorGUI(QMainWindow):
             "regime, engines, and blockers — same snapshot as Advisor AI and remote monitor."
         )
         heat_lay.addWidget(self.home_trader_lbl)
+        self.home_profit_cmd_lbl = QLabel("Command center: —")
+        self.home_profit_cmd_lbl.setWordWrap(True)
+        self.home_profit_cmd_lbl.setStyleSheet(f"font-size: {ui_px(12)}px; font-weight: 600;")
+        self.home_profit_cmd_lbl.setToolTip(
+            "7d net · win rate · fee drag · focus broker · next desk action. "
+            "Sizing unchanged — still autosized from live equity and BP."
+        )
+        heat_lay.addWidget(self.home_profit_cmd_lbl)
+        self.home_stack_lbl = QLabel("")
+        self.home_stack_lbl.setWordWrap(True)
+        self.home_stack_lbl.setStyleSheet(
+            f"font-size: {ui_px(11)}px; font-weight: 600; color: #1565C0;"
+        )
+        self.home_stack_lbl.setToolTip(
+            "When cash is split across brokers, consolidating to the focus stack "
+            "raises deployable BP for autosized tickets (manual transfer — no auto-move)."
+        )
+        heat_lay.addWidget(self.home_stack_lbl)
         self.home_radar_card = QGroupBox("Desk radar")
         radar_lay = QVBoxLayout()
         radar_lay.setContentsMargins(ui_px(10), ui_px(6), ui_px(10), ui_px(6))
@@ -6956,6 +7528,112 @@ class MarketAdvisorGUI(QMainWindow):
         QTimer.singleShot(800, self.refresh_execution_quality)
         return tab
 
+    def build_advisor_journal_screen(self):
+        """Quick lookup of Advisor AI/local decisions (approve / skip / hold / apply)."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(ui_px(8))
+        tc = theme_colors(self.dark_mode)
+
+        hdr = QLabel("Advisor decisions")
+        hdr.setObjectName("sectionHeader")
+        hdr.setStyleSheet(section_header_style())
+        layout.addWidget(hdr)
+
+        hint = QLabel(
+            "Every AI/local verdict and what the desk did next (auto-apply, auto-reject, "
+            "rails hold, or wait). Newest first — same trail as Activity, easier to scan."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {tc['muted']}; font-size: {ui_px(11)}px;")
+        layout.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_advisor_journal)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.advisor_journal_summary_lbl = QLabel("—")
+        self.advisor_journal_summary_lbl.setWordWrap(True)
+        self.advisor_journal_summary_lbl.setStyleSheet(
+            f"color: {tc['muted']}; font-size: {ui_px(12)}px;"
+        )
+        layout.addWidget(self.advisor_journal_summary_lbl)
+
+        self.advisor_journal_table = QTableWidget(0, 8)
+        self.advisor_journal_table.setHorizontalHeaderLabels([
+            "Time", "Broker", "Ticker", "Verdict", "Action", "Source", "$", "Brief",
+        ])
+        self.advisor_journal_table.horizontalHeader().setStretchLastSection(True)
+        self.advisor_journal_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.advisor_journal_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        polish_table(self.advisor_journal_table)
+        layout.addWidget(self.advisor_journal_table, 1)
+
+        QTimer.singleShot(900, self.refresh_advisor_journal)
+        return tab
+
+    def refresh_advisor_journal(self):
+        if not hasattr(self, "advisor_journal_table"):
+            return
+        try:
+            import advisor_queue as aq
+            from datetime import datetime
+
+            rows = aq.list_decisions(limit=150)
+            self.advisor_journal_table.setRowCount(len(rows))
+            approve_n = skip_n = hold_n = apply_n = 0
+            for i, r in enumerate(rows):
+                ts = float(r.get("at") or 0)
+                try:
+                    when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S") if ts else "—"
+                except Exception:
+                    when = "—"
+                verdict = str(r.get("verdict") or "—")
+                action = str(r.get("action") or "—")
+                if verdict == "approve":
+                    approve_n += 1
+                if verdict == "skip":
+                    skip_n += 1
+                if action == "hold_rails":
+                    hold_n += 1
+                if action in ("auto_apply", "approved"):
+                    apply_n += 1
+                vals = [
+                    when,
+                    str(r.get("broker") or ""),
+                    str(r.get("ticker") or ""),
+                    verdict.upper() if verdict and verdict != "—" else "—",
+                    action,
+                    str(r.get("source") or ""),
+                    f"{float(r.get('dollars') or 0):.2f}",
+                    str(r.get("brief") or r.get("detail") or "")[:160],
+                ]
+                for col, text in enumerate(vals):
+                    item = QTableWidgetItem(text)
+                    if col == 3:
+                        v = verdict.lower()
+                        if v == "approve":
+                            item.setForeground(QColor("#00E676" if self.dark_mode else "#2E7D32"))
+                        elif v == "skip":
+                            item.setForeground(QColor("#FF8A80" if self.dark_mode else "#C62828"))
+                        elif v == "wait":
+                            item.setForeground(QColor("#FFD54F" if self.dark_mode else "#F57F17"))
+                    if col == 4 and action == "hold_rails":
+                        item.setForeground(QColor("#FFD54F" if self.dark_mode else "#F57F17"))
+                    self.advisor_journal_table.setItem(i, col, item)
+            if hasattr(self, "advisor_journal_summary_lbl"):
+                self.advisor_journal_summary_lbl.setText(
+                    f"{len(rows)} recent · approve {approve_n} · skip {skip_n} · "
+                    f"auto-applied {apply_n} · rails-hold {hold_n}"
+                )
+        except Exception as e:
+            if hasattr(self, "advisor_journal_summary_lbl"):
+                self.advisor_journal_summary_lbl.setText(f"Advisor journal error: {e}")
+
     def refresh_execution_quality(self):
         if not hasattr(self, "exec_summary_lbl"):
             return
@@ -7117,6 +7795,15 @@ class MarketAdvisorGUI(QMainWindow):
         polish_table(self.reports_broker_table)
         layout.addWidget(self.reports_broker_table, 1)
 
+        eng_hdr = QLabel("By engine (net P&L)")
+        eng_hdr.setStyleSheet(f"font-size: {ui_px(12)}px; font-weight: 600; color: {tc['muted']};")
+        layout.addWidget(eng_hdr)
+        self.reports_engine_lbl = QLabel("—")
+        self.reports_engine_lbl.setWordWrap(True)
+        self.reports_engine_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.reports_engine_lbl.setStyleSheet(f"font-size: {ui_px(12)}px; color: {tc['text']};")
+        layout.addWidget(self.reports_engine_lbl)
+
         adv_hdr = QLabel("Advanced analytics")
         adv_hdr.setObjectName("sectionHeader")
         adv_hdr.setStyleSheet(
@@ -7193,6 +7880,19 @@ class MarketAdvisorGUI(QMainWindow):
             # days < 0 → All time (no date cutoff) via journal readers
             rows = journal_mod.read_since_days(days=days, limit=8000)
             summary = analytics.summarize_fills(rows)
+            # Home Scoreboard chip always mirrors 7d (stable compare), even if Reports window differs
+            if days == 7:
+                self._last_reports_summary = summary
+            else:
+                try:
+                    rows7 = journal_mod.read_since_days(days=7, limit=4000)
+                    self._last_reports_summary = analytics.summarize_fills(rows7)
+                except Exception:
+                    self._last_reports_summary = summary
+            try:
+                self._refresh_pnl_scoreboard_chip()
+            except Exception:
+                pass
             win_map = {1: "Today", 7: "7d", 30: "30d", -1: "All time"}
             win_lbl = win_map.get(days, "")
             self.reports_summary_lbl.setText(
@@ -7243,6 +7943,27 @@ class MarketAdvisorGUI(QMainWindow):
                 ]
                 for c, text in enumerate(vals):
                     self.reports_broker_table.setItem(i, c, QTableWidgetItem(text))
+
+            if hasattr(self, "reports_engine_lbl"):
+                try:
+                    by_eng = summary.get("by_engine") or {}
+                    eng_lines = []
+                    for name, b in sorted(by_eng.items()):
+                        net = float(b.get("net_after_fees") or 0.0)
+                        sells = int(b.get("sells") or 0)
+                        if sells <= 0 and abs(net) < 0.01:
+                            continue
+                        nwr = b.get("net_win_rate")
+                        wr_t = f"{float(nwr)*100:.0f}%" if nwr is not None else "—"
+                        eng_lines.append(
+                            f"{name}: net {format_currency(net)} · "
+                            f"{sells} sells · net WR {wr_t}"
+                        )
+                    self.reports_engine_lbl.setText(
+                        "\n".join(eng_lines) if eng_lines else "No engine-tagged closes in window."
+                    )
+                except Exception:
+                    self.reports_engine_lbl.setText("—")
 
             drows = journal_mod.read_decisions_since_days(days=days, limit=8000)
             dsum = analytics.summarize_decisions(drows)
@@ -7718,6 +8439,69 @@ class MarketAdvisorGUI(QMainWindow):
         advisor_row.addStretch()
         advisor_outer.addLayout(advisor_row)
 
+        focus_row = QHBoxLayout()
+        focus_row.addWidget(QLabel("Desk focus:"))
+        self.desk_focus_mode_combo = QComboBox()
+        self.desk_focus_mode_combo.addItem("Auto (deployable BP)", "auto")
+        self.desk_focus_mode_combo.addItem("Off (all brokers scan)", "off")
+        self.desk_focus_mode_combo.addItem("Manual broker", "manual")
+        saved_focus = str(self.settings.get("desk_focus_mode") or "auto")
+        fi = self.desk_focus_mode_combo.findData(saved_focus)
+        self.desk_focus_mode_combo.setCurrentIndex(max(0, fi))
+        self.desk_focus_mode_combo.setToolTip(
+            "Auto parks buy engines on non-focus brokers when only one can fund min ticket. "
+            "Scan cadence 2× on focus broker. Sizing still autosized from live BP."
+        )
+        focus_row.addWidget(self.desk_focus_mode_combo)
+        focus_row.addWidget(QLabel("Broker:"))
+        self.desk_focus_broker_combo = QComboBox()
+        for b in BROKER_NAMES:
+            self.desk_focus_broker_combo.addItem(b, b)
+        manual_b = str(self.settings.get("desk_focus_broker") or "E*TRADE")
+        bi = self.desk_focus_broker_combo.findData(manual_b)
+        if bi >= 0:
+            self.desk_focus_broker_combo.setCurrentIndex(bi)
+        focus_row.addWidget(self.desk_focus_broker_combo)
+        advisor_outer.addLayout(focus_row)
+
+        self.advisor_focus_auto_chk = QCheckBox(
+            "Fast-path buys on focus broker (skip Advisor gate when autosized ticket ready)"
+        )
+        self.advisor_focus_auto_chk.setChecked(bool(self.settings.get("advisor_focus_auto_apply", True)))
+        self.advisor_focus_auto_chk.setToolTip(
+            "Focus broker only: auto buys when every signal clears the fee gate "
+            "(edge ≥ fees). Sizing still uses risk_sizing_breakdown / live BP."
+        )
+        advisor_outer.addWidget(self.advisor_focus_auto_chk)
+
+        self.profit_guard_chk = QCheckBox(
+            "Profit guard — pause new buys when 7d net is negative and fee drag is high"
+        )
+        self.profit_guard_chk.setChecked(bool(self.settings.get("profit_guard_enabled", True)))
+        self.profit_guard_chk.setToolTip(
+            "Portfolio sells and exits still run. Acknowledge on Home to resume buys for 24h."
+        )
+        advisor_outer.addWidget(self.profit_guard_chk)
+
+        pg_row = QHBoxLayout()
+        pg_row.addWidget(QLabel("Guard fee drag ≥"))
+        self.profit_guard_drag_spin = QDoubleSpinBox()
+        self.profit_guard_drag_spin.setRange(0.5, 15.0)
+        self.profit_guard_drag_spin.setSingleStep(0.5)
+        self.profit_guard_drag_spin.setSuffix("%")
+        self.profit_guard_drag_spin.setValue(
+            float(self.settings.get("profit_guard_fee_drag_pct") or 2.5)
+        )
+        pg_row.addWidget(self.profit_guard_drag_spin)
+        self.profit_guard_ack_btn = QPushButton("Acknowledge profit guard (24h)")
+        self.profit_guard_ack_btn.setToolTip(
+            "Temporarily allow new buys even when profit guard would trip."
+        )
+        self.profit_guard_ack_btn.clicked.connect(self._acknowledge_profit_guard)
+        pg_row.addWidget(self.profit_guard_ack_btn)
+        pg_row.addStretch()
+        advisor_outer.addLayout(pg_row)
+
         ai_row = QHBoxLayout()
         ai_row.addWidget(QLabel("Trade briefs:"))
         self.advisor_ai_source_combo = QComboBox()
@@ -7842,12 +8626,23 @@ class MarketAdvisorGUI(QMainWindow):
 
         ai_auto_row = QHBoxLayout()
         self.advisor_ai_auto_reject_chk = QCheckBox(
-            "Auto-reject when AI says skip (never auto-buys)"
+            "Auto-reject when AI/local says skip"
         )
         self.advisor_ai_auto_reject_chk.setChecked(
             bool(self.settings.get("advisor_ai_auto_reject_skip", True))
         )
         ai_auto_row.addWidget(self.advisor_ai_auto_reject_chk)
+        self.advisor_ai_auto_apply_chk = QCheckBox(
+            "Auto-apply when AI/local says approve (beginner default)"
+        )
+        self.advisor_ai_auto_apply_chk.setChecked(
+            bool(self.settings.get("advisor_ai_auto_apply_approve", True))
+        )
+        self.advisor_ai_auto_apply_chk.setToolTip(
+            "Hard rails still block DD pause, halt, disconnect, and tiny tickets. "
+            "Turn off only if you want to Approve every buy yourself."
+        )
+        ai_auto_row.addWidget(self.advisor_ai_auto_apply_chk)
         ai_auto_row.addStretch()
         advisor_outer.addLayout(ai_auto_row)
 
@@ -9876,7 +10671,7 @@ class MarketAdvisorGUI(QMainWindow):
                 lambda payload: self._on_advisor_buy_done(payload, proposal_id),
                 [candidate],
                 False,
-                advisor_gate=False,
+                False,  # advisor_gate off — already approved
             )
         except Exception as e:
             aq.complete(proposal_id, False)
@@ -9946,13 +10741,24 @@ class MarketAdvisorGUI(QMainWindow):
             self.home_advisor_approve_btn.setEnabled(False)
             self.home_advisor_reject_btn.setEnabled(False)
             return
+        auto_pilot = bool(self.settings.get("advisor_ai_auto_apply_approve", True))
         pending = aq.list_pending(limit=6)
         self.home_advisor_approve_btn.setEnabled(bool(pending))
         self.home_advisor_reject_btn.setEnabled(bool(pending))
         if not pending:
-            self.home_advisor_lbl.setText("No pending proposals — scanner will propose before live buys.")
+            if auto_pilot:
+                self.home_advisor_lbl.setText(
+                    "Desk handling buys automatically — AI/local decides; "
+                    "hard rails (DD / halt / min ticket) still protect you."
+                )
+            else:
+                self.home_advisor_lbl.setText(
+                    "No pending proposals — scanner will propose before live buys."
+                )
             return
         lines = []
+        if auto_pilot:
+            lines.append("Desk auto-pilot on — approving/skipping for you when safe:")
         for p in pending:
             base = (
                 f"• {p.get('broker')} BUY {p.get('ticker')} "
@@ -10083,13 +10889,129 @@ class MarketAdvisorGUI(QMainWindow):
             except (TypeError, ValueError):
                 pass
         min_d = float(self.settings.get("min_trade_dollars", 5.0) or 5.0)
-        return _decision_log.buy_engines_idle_reason_for(
+        idle = _decision_log.buy_engines_idle_reason_for(
             broker_name,
             paper_mode=bool(self.paper_mode),
             etrade_connected=bool(et and getattr(et, "is_connected", False)),
             etrade_environment=env,
             etrade_buying_power=bp,
             min_trade_dollars=min_d,
+        )
+        if idle:
+            return idle
+        return self._fully_deployed_idle_reason(broker_name)
+
+    def _dd_paused_for_broker(self, broker_name) -> bool:
+        """Local drawdown state only — safe on the 1s director tick."""
+        try:
+            from scoring import get_drawdown_status
+            bid = {
+                "Robinhood": "ROBINHOOD",
+                "Coinbase": "COINBASE",
+                "E*TRADE": "ETRADE",
+            }.get(broker_name, str(broker_name or "").upper())
+            return bool(get_drawdown_status(bid).get("paused"))
+        except Exception:
+            return False
+
+    def _desk_focus_broker(self) -> str | None:
+        """Cache-friendly focus broker for orchestration (no broker API)."""
+        import desk_orchestration as do
+        try:
+            ctx_map = getattr(self, "_last_trader_context", None) or self._build_trader_context_map()
+        except Exception:
+            return None
+        focus = do.resolve_focus_broker(ctx_map or {}, self.settings)
+        self._desk_focus_broker_cache = focus
+        return focus
+
+    def _buy_engines_should_rest(self, broker_name) -> tuple[bool, str]:
+        """
+        True when CRYPTO/PENNY/CORE should not enqueue (PORTFOLIO still runs).
+        Cheap: cached BP/holdings + local DD flag — no live broker APIs.
+        """
+        import desk_orchestration as do
+        focus = self._desk_focus_broker()
+        if do.focus_parks_buys(broker_name, focus, self.settings):
+            return True, f"Desk focus on {focus} — buy engines parked here (autosizing unchanged)"
+        if bool(self.settings.get("profit_guard_enabled", True)):
+            try:
+                import analytics
+                import journal as journal_mod
+                rows = journal_mod.read_since_days(days=7, limit=4000)
+                summary = analytics.summarize_fills(rows)
+                tripped, why = do.profit_guard_tripped(summary, self.settings)
+                if tripped:
+                    return True, (
+                        f"Profit guard — {why} (new buys paused; portfolio/sells still run)"
+                    )
+            except Exception:
+                pass
+        if self._dd_paused_for_broker(broker_name):
+            return True, "DD pause — buy engines resting (portfolio sells still run)"
+        idle = self._buy_engines_idle_reason(broker_name)
+        if idle:
+            return True, idle
+        return False, ""
+
+    def _interval_with_focus(self, broker_name: str, base_key: str, default: float) -> float:
+        import desk_orchestration as do
+        base = float(self.settings.get(base_key, default) or default)
+        focus = self._desk_focus_broker()
+        return do.interval_scale_for_focus(base, broker_name, focus, self.settings)
+
+    def _portfolio_interval_sec(self, broker_name) -> int:
+        """Shorter portfolio cadence when buys are parked — recycle capital sooner."""
+        base = int(self.settings.get("interval_portfolio", 45) or 45)
+        base = max(30, base)
+        resting, _ = self._buy_engines_should_rest(broker_name)
+        if resting:
+            return max(20, base // 2)
+        return base
+
+    def _equity_for_exit_eval(self, broker_name):
+        try:
+            equity, _, _ = self.get_effective_balances(broker_name)
+            return float(equity or 0.0)
+        except Exception:
+            return 0.0
+
+    def _fully_deployed_idle_reason(self, broker_name):
+        """
+        When cash is under min ticket but positions are open — park buy engines.
+        Cache-only (no live broker API). Per-second director ticks must stay cheap.
+        """
+        import trader_context as tc
+
+        snap = (getattr(self, "_last_balance_totals", {}) or {}).get(broker_name) or {}
+        try:
+            bp = float(snap.get("bp") or 0.0)
+        except (TypeError, ValueError):
+            bp = 0.0
+        open_n = int(
+            (getattr(self, "_holdings_count_cache", {}) or {}).get(broker_name, 0) or 0
+        )
+        if open_n <= 0:
+            heat = (getattr(self, "_heat_holdings_by_broker", {}) or {}).get(broker_name) or []
+            import desk_orchestration as do
+            open_n = do.deployable_open_count(
+                heat, broker_name=broker_name,
+                classify_locked=_auto_cycle.classify_locked_holding,
+            )
+            if open_n <= 0:
+                open_n = sum(
+                    1 for h in heat
+                    if isinstance(h, dict) and float(h.get("shares") or h.get("qty") or 0) > 0
+                )
+        try:
+            util = float(self.settings.get("target_bp_utilization_pct", 88.0) or 88.0)
+        except (TypeError, ValueError):
+            util = 88.0
+        return tc.fully_deployed_idle_reason(
+            buying_power=bp,
+            open_positions=open_n,
+            min_ticket=float(self.settings.get("min_trade_dollars", 5.0) or 5.0),
+            utilization=util,
         )
 
     def _throttle_scan_drops(self, broker, engine, dropped, *, cooldown_sec=780):
@@ -10305,14 +11227,14 @@ class MarketAdvisorGUI(QMainWindow):
         if hasattr(self, "day_dd_spin"):
             self.day_dd_spin.setValue(float(prof.get("day_dd_pause_pct", 0.10)) * 100.0)
         if hasattr(self, "peak_dd_spin"):
-            self.peak_dd_spin.setValue(float(prof.get("peak_dd_pause_pct", 0.22)) * 100.0)
+            self.peak_dd_spin.setValue(float(prof.get("peak_dd_pause_pct", 0.14)) * 100.0)
         if hasattr(self, "dd_pause_spin"):
             self.dd_pause_spin.setValue(int(prof.get("dd_pause_minutes", 20)))
         if hasattr(self, "allow_scale_in_chk"):
             self.allow_scale_in_chk.setChecked(bool(prof.get("allow_scale_in", True)))
         self.settings["advanced_scale_in_override"] = False
         self.log_event(
-            "[COACH] Applied Growth preset (3 slots, 2 buys/cycle, peak DD 22%, faster green takes)."
+            "[COACH] Applied Growth preset (3 slots, 1 buy/cycle, peak DD 14%, faster green takes)."
         )
         QMessageBox.information(
             self,
@@ -10477,6 +11399,10 @@ class MarketAdvisorGUI(QMainWindow):
         assets = getattr(self, "_last_assets_snapshot", None)
         holdings_by = _auto_cycle.holdings_by_broker_from_assets(assets, BROKER_NAMES)
         self._heat_holdings_by_broker = holdings_by
+        try:
+            self._detect_external_sells(holdings_by)
+        except Exception:
+            pass
 
         rows = _auto_cycle.build_portfolio_heat_rows(
             totals,
@@ -10738,11 +11664,232 @@ class MarketAdvisorGUI(QMainWindow):
                 )
             self._refresh_basis_chips()
             self._refresh_fill_chip()
+            self._refresh_pnl_scoreboard_chip()
+            try:
+                self._refresh_profit_command_center()
+            except Exception:
+                pass
         except Exception:
             pass
 
         self._refresh_advisor_card()
         self._update_reauth_banner()
+
+    def _refresh_pnl_scoreboard_chip(self):
+        """
+        Home strip from existing Reports analytics (not a second scoreboard).
+        Shows 7d net after fees · win rate · fee drag when journal has closes.
+        """
+        if not hasattr(self, "home_pnl_chip"):
+            return
+        summary = getattr(self, "_last_reports_summary", None)
+        if not isinstance(summary, dict) or not summary:
+            # Lazy light refresh at most every 5 minutes from Home heat path
+            now = time.time()
+            last = float(getattr(self, "_pnl_chip_refresh_at", 0.0) or 0.0)
+            if now - last < 300.0:
+                return
+            self._pnl_chip_refresh_at = now
+            try:
+                import analytics
+                import journal as journal_mod
+                rows = journal_mod.read_since_days(days=7, limit=4000)
+                summary = analytics.summarize_fills(rows)
+                self._last_reports_summary = summary
+            except Exception:
+                self.home_pnl_chip.setText("Scoreboard: —")
+                self.home_pnl_chip.setToolTip(
+                    "Reports → Journal analytics (7d). Opens after first Reports refresh."
+                )
+                return
+        try:
+            net = float(summary.get("net_after_fees") or 0.0)
+            drag = float(summary.get("fee_drag_pct") or 0.0)
+            nwr = summary.get("net_win_rate")
+            closed = int(summary.get("net_wins") or 0) + int(summary.get("net_losses") or 0)
+            wr_t = f"{float(nwr)*100:.0f}%" if nwr is not None and closed > 0 else "—"
+            self.home_pnl_chip.setText(
+                f"Scoreboard: net {format_currency(net)} · WR {wr_t} · fee {drag:.1f}%"
+            )
+            tip = (
+                "Same math as Journal → Reports (7d): net ≈ realized − fees, "
+                "net win rate on closed lots, fee drag vs turnover. "
+                "Open Reports for by-broker detail."
+            )
+            eng_line = ""
+            try:
+                import analytics
+                eng_line = analytics.format_engine_pnl_line(
+                    summary.get("by_engine"), money_fmt=format_currency,
+                )
+            except Exception:
+                pass
+            if eng_line:
+                tip += f"\n{eng_line}"
+            self.home_pnl_chip.setToolTip(tip)
+            if net > 0.05:
+                color = "#2E7D32"
+            elif net < -0.05:
+                color = "#C62828"
+            else:
+                color = None
+            if color:
+                self.home_pnl_chip.setStyleSheet(
+                    f"font-size: {ui_px(11)}px; font-weight: 600; color: {color}; "
+                    f"padding: {ui_px(2)}px {ui_px(8)}px;"
+                )
+            else:
+                self.home_pnl_chip.setStyleSheet(
+                    f"font-size: {ui_px(11)}px; font-weight: 600; "
+                    f"padding: {ui_px(2)}px {ui_px(8)}px;"
+                )
+        except Exception:
+            self.home_pnl_chip.setText("Scoreboard: —")
+
+    def _refresh_profit_command_center(self):
+        """Home command center — 7d P&L, focus broker, next action (sizing unchanged)."""
+        if not hasattr(self, "home_profit_cmd_lbl"):
+            return
+        try:
+            import analytics
+            import desk_orchestration as do
+            import journal as journal_mod
+            ctx_map = getattr(self, "_last_trader_context", None) or {}
+            if not ctx_map:
+                ctx_map = self._build_trader_context_map()
+            focus = do.resolve_focus_broker(ctx_map, self.settings)
+            rows = journal_mod.read_since_days(days=7, limit=4000)
+            summary = analytics.summarize_fills(rows)
+            eng = analytics.format_engine_pnl_line(
+                summary.get("by_engine"), money_fmt=format_currency, limit=3,
+            )
+            txt = do.format_profit_command_center(
+                summary, ctx_map, focus_broker=focus,
+                money_fmt=format_currency, engine_line=eng,
+            )
+            self.home_profit_cmd_lbl.setText(txt)
+            playbook = do.format_consolidation_playbook(ctx_map)
+            self.home_profit_cmd_lbl.setToolTip(
+                txt + "\n\n" + playbook + "\n\nTicket sizes still from live equity/BP autosizing."
+            )
+            net = float(summary.get("net_after_fees") or 0.0)
+            if net > 0.05:
+                col = "#2E7D32"
+            elif net < -0.05:
+                col = "#C62828"
+            else:
+                col = None
+            if col:
+                self.home_profit_cmd_lbl.setStyleSheet(
+                    f"font-size: {ui_px(12)}px; font-weight: 600; color: {col};"
+                )
+            tripped, guard_why = do.profit_guard_tripped(summary, self.settings)
+            if tripped:
+                self.home_profit_cmd_lbl.setText(
+                    txt + f" · ⚠ Profit guard: {guard_why}"
+                )
+            self._refresh_stack_banner(ctx_map, focus)
+        except Exception:
+            self.home_profit_cmd_lbl.setText("Command center: —")
+
+    def _refresh_stack_banner(self, ctx_map=None, focus=None):
+        if not hasattr(self, "home_stack_lbl"):
+            return
+        if not bool(self.settings.get("single_stack_banner_enabled", True)):
+            self.home_stack_lbl.setText("")
+            return
+        try:
+            import desk_orchestration as do
+            ctx_map = ctx_map or getattr(self, "_last_trader_context", None) or {}
+            focus = focus or do.resolve_focus_broker(ctx_map, self.settings)
+            preview = do.consolidated_deployable_preview(
+                ctx_map, focus_broker=focus, settings=self.settings,
+            )
+            banner = do.format_single_stack_banner(preview, money_fmt=format_currency)
+            self.home_stack_lbl.setText(banner or "")
+        except Exception:
+            self.home_stack_lbl.setText("")
+
+    def _had_ma_sell_recent(self, broker_name, ticker, *, within_sec=3600) -> bool:
+        """True if journal shows an MA sell for this name recently."""
+        try:
+            tick = str(ticker or "").upper()
+            cutoff = time.time() - float(within_sec)
+            for row in journal.read_recent(80):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("broker") or "") != str(broker_name):
+                    continue
+                if str(row.get("ticker") or "").upper() != tick:
+                    continue
+                if str(row.get("side") or "").upper() != "SELL":
+                    continue
+                if str(row.get("status") or "").lower() == "external":
+                    continue
+                ts = str(row.get("timestamp") or "")
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", ""))
+                    if dt.timestamp() >= cutoff:
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _detect_external_sells(self, holdings_by):
+        """Journal sells closed outside Market Advisor (e.g. Coinbase app)."""
+        if not isinstance(holdings_by, dict):
+            return
+        snap_store = getattr(self, "_holdings_snapshot_by_broker", None)
+        if snap_store is None:
+            self._holdings_snapshot_by_broker = _blank_broker_map(dict)
+            snap_store = self._holdings_snapshot_by_broker
+        for broker in BROKER_NAMES:
+            current: dict[str, float] = {}
+            for h in holdings_by.get(broker) or []:
+                if not isinstance(h, dict):
+                    continue
+                tick = str(h.get("ticker") or "").upper()
+                if not tick:
+                    continue
+                try:
+                    sh = float(h.get("shares") or h.get("qty") or 0.0)
+                except (TypeError, ValueError):
+                    sh = 0.0
+                if sh > 0:
+                    current[tick] = sh
+            prev = dict(snap_store.get(broker) or {})
+            if not prev:
+                snap_store[broker] = current
+                continue
+            for tick, prev_sh in prev.items():
+                cur_sh = float(current.get(tick) or 0.0)
+                if cur_sh >= prev_sh * 0.05:
+                    continue
+                if self._had_ma_sell_recent(broker, tick):
+                    continue
+                try:
+                    journal.log_trade({
+                        "broker": broker,
+                        "side": "SELL",
+                        "ticker": tick,
+                        "qty": prev_sh,
+                        "status": "External",
+                        "reason": (
+                            "Position closed outside Market Advisor "
+                            "(broker app / manual — not partial TTP)"
+                        ),
+                        "paper": bool(self.paper_mode),
+                        "engine": "EXTERNAL",
+                    })
+                    self.log_event(
+                        f"[{broker}] External sell logged — {tick} "
+                        f"(was {prev_sh:.4g} sh, not in MA journal)"
+                    )
+                except Exception:
+                    pass
+            snap_store[broker] = current
 
     def _refresh_fill_chip(self):
         """Home fill-slip / fee feedback chip (execution quality visibility)."""
@@ -11408,7 +12555,11 @@ class MarketAdvisorGUI(QMainWindow):
                 self._stall_alerted = False
 
         self._maybe_send_heartbeat(now)
+        self._maybe_send_weekly_digest(now)
+        self._maybe_send_daily_scoreboard(now)
         self._maybe_desk_snag_discord()
+        self._maybe_fully_deployed_nudge(now)
+        self._maybe_stuck_capital_nudge(now)
 
         # Equity RTH boundary wake-ups before interval scheduling (sets last_* so no double-queue)
         self._maybe_session_boundary_wakeup(now)
@@ -11429,12 +12580,14 @@ class MarketAdvisorGUI(QMainWindow):
                 ):
                     continue
 
-            if now - self.last_crypto_time[broker_name] >= self.settings.get("interval_crypto", 45):
-                idle_why = self._buy_engines_idle_reason(broker_name)
-                if idle_why:
+            if now - self.last_crypto_time[broker_name] >= self._interval_with_focus(
+                broker_name, "interval_crypto", 45
+            ):
+                rest, rest_why = self._buy_engines_should_rest(broker_name)
+                if rest:
                     self._throttled_log(
                         f"{broker_name}:buy_engines_idle",
-                        f"[{broker_name}] {idle_why}",
+                        f"[{broker_name}] {rest_why}",
                         cooldown_sec=780,
                     )
                 elif self._broker_supports(broker_name, "supports_crypto"):
@@ -11442,8 +12595,9 @@ class MarketAdvisorGUI(QMainWindow):
                     if task not in self.task_queue: self.task_queue.append(task)
                 self.last_crypto_time[broker_name] = now
 
-            # Portfolio / sell checks: all armed brokers, 24/7
-            if now - self.last_port_time[broker_name] >= self.settings.get("interval_portfolio", 45):
+            # Portfolio / sell checks: all armed brokers, 24/7 (faster when buys rest)
+            port_iv = self._portfolio_interval_sec(broker_name)
+            if now - self.last_port_time[broker_name] >= port_iv:
                 task = (broker_name, "PORTFOLIO")
                 if task not in self.task_queue: self.task_queue.append(task)
                 self.last_port_time[broker_name] = now
@@ -11459,12 +12613,22 @@ class MarketAdvisorGUI(QMainWindow):
                         cooldown_sec=1800,
                     )
                 else:
-                    idle_why = self._buy_engines_idle_reason(broker_name)
-                    if now - self.last_penny_time[broker_name] >= self.settings.get("interval_penny", 60):
-                        if idle_why:
+                    need_penny = (
+                        now - self.last_penny_time[broker_name]
+                        >= self._interval_with_focus(broker_name, "interval_penny", 60)
+                    )
+                    need_core = (
+                        now - self.last_core_time[broker_name]
+                        >= self._interval_with_focus(broker_name, "interval_core", 300)
+                    )
+                    rest, rest_why = (False, "")
+                    if need_penny or need_core:
+                        rest, rest_why = self._buy_engines_should_rest(broker_name)
+                    if need_penny:
+                        if rest:
                             self._throttled_log(
                                 f"{broker_name}:buy_engines_idle",
-                                f"[{broker_name}] {idle_why}",
+                                f"[{broker_name}] {rest_why}",
                                 cooldown_sec=780,
                             )
                         else:
@@ -11472,7 +12636,7 @@ class MarketAdvisorGUI(QMainWindow):
                             if task not in self.task_queue: self.task_queue.append(task)
                         self.last_penny_time[broker_name] = now
 
-                    if now - self.last_core_time[broker_name] >= self.settings.get("interval_core", 300):
+                    if need_core:
                         if self._small_book_skip_core(broker_name):
                             self._throttled_log(
                                 f"{broker_name}:core_skip_small_book",
@@ -11480,10 +12644,10 @@ class MarketAdvisorGUI(QMainWindow):
                                 f"target names your BP can actually fund.",
                                 cooldown_sec=3600,
                             )
-                        elif idle_why:
+                        elif rest:
                             self._throttled_log(
                                 f"{broker_name}:buy_engines_idle",
-                                f"[{broker_name}] {idle_why}",
+                                f"[{broker_name}] {rest_why}",
                                 cooldown_sec=780,
                             )
                         else:
@@ -11491,6 +12655,7 @@ class MarketAdvisorGUI(QMainWindow):
                             if task not in self.task_queue: self.task_queue.append(task)
                         self.last_core_time[broker_name] = now
 
+        self._reorder_task_queue_buy_focus()
         self.process_queue()
 
         # Quiet auto-repair of missing protective stops while any engine is armed
@@ -11800,6 +12965,39 @@ class MarketAdvisorGUI(QMainWindow):
         elif self.view_mode in BROKER_NAMES:
             self._holdings_count_cache[self.view_mode] = len(assets)
         return assets
+
+    def _schedule_portfolio_refresh_after_fill(self, broker_name: str = "", *, reason: str = "fill"):
+        """
+        Force portfolio UI refresh now and again after short delays.
+        Coinbase (and sometimes RH crypto) can lag the holdings API right after a fill,
+        so an immediate-only reload often still looks empty until the user hits Refresh.
+        """
+        b = str(broker_name or "").strip()
+
+        def _kick(pass_name: str):
+            try:
+                self.refresh_account_balances()
+            except Exception:
+                pass
+            try:
+                self.manual_portfolio_reload(and_score=False, force=True)
+            except Exception:
+                pass
+            if pass_name != "now" and b:
+                try:
+                    self._throttled_log(
+                        f"portfolio_refresh:{b}:{pass_name}",
+                        f"[Portfolio] Refresh after {b} {reason} ({pass_name})",
+                        cooldown_sec=30,
+                    )
+                except Exception:
+                    pass
+
+        _kick("now")
+        # Immediate + delayed passes (CB settlement lag is the common case)
+        delays_ms = [2500, 8000, 20000] if b == "Coinbase" else [2500, 8000]
+        for ms in delays_ms:
+            QTimer.singleShot(ms, lambda p=f"{ms}ms": _kick(p))
 
     def manual_portfolio_reload(self, and_score=False, force=False):
         """
@@ -12954,13 +14152,55 @@ class MarketAdvisorGUI(QMainWindow):
         runner = self.run_cycle_thread if auto_mode else self.run_thread
         rank = bool(buy_candidates is None and auto_mode)
         advisor_gate = auto_mode and bool(self.settings.get("advisor_ask_before_apply", True))
-        runner(
-            self._bg_buy_batch_safe,
-            lambda payload: self._on_buy_batch_done(payload, auto_mode=auto_mode, table=table),
-            filtered,
-            rank,
-            advisor_gate=advisor_gate,
-        )
+        if advisor_gate and auto_mode:
+            focus = self._desk_focus_broker()
+            if (
+                focus
+                and str(self.cycle_broker_name) == str(focus)
+                and bool(self.settings.get("advisor_focus_auto_apply", True))
+            ):
+                import desk_orchestration as do
+                from scoring import new_entry_clears_fees_ok
+                pool = filtered or []
+                if do.focus_advisor_auto_clear(
+                    pool,
+                    self.cycle_broker_name,
+                    fee_clear_fn=new_entry_clears_fees_ok,
+                    known_cryptos=KNOWN_CRYPTOS,
+                ):
+                    advisor_gate = False
+        # Pass advisor_gate positionally — run_thread only accepts unlock_queue_on_error=
+        # as a keyword; advisor_gate=... raised TypeError on the UI thread and killed the app.
+        try:
+            runner(
+                self._bg_buy_batch_safe,
+                lambda payload: self._on_buy_batch_done(
+                    payload, auto_mode=auto_mode, table=table
+                ),
+                filtered,
+                rank,
+                advisor_gate,
+            )
+        except Exception as e:
+            import traceback
+            self.log_event(f"[{self.cycle_broker_name}] Buy handoff error: {e}")
+            for line in traceback.format_exc().splitlines()[-8:]:
+                if line.strip():
+                    self.log_event(f"  {line}")
+            try:
+                import crash_log as cl
+
+                cl.record_crash(
+                    f"Buy handoff: {e}",
+                    detail=traceback.format_exc()[:2000],
+                    where="execute_scanner_trades",
+                )
+            except Exception:
+                pass
+            self.set_working_state(False)
+            if auto_mode:
+                self.cycle_finished()
+            return
 
     def _bg_buy_batch(self, candidates, rank=False, advisor_gate=False):
         """Place buys on a worker thread (confirm_order sleeps stay off the UI)."""
@@ -12971,7 +14211,7 @@ class MarketAdvisorGUI(QMainWindow):
             last_rotation_reject_reason, record_rotation,
             entry_regime_ok, broker_min_notional, RH_CRYPTO_MIN_NOTIONAL,
             crypto_new_entry_ok, posture_for_broker, posture_knobs_for_broker,
-            broker_has_posture_override, _drawdown_block,
+            broker_has_posture_override, _drawdown_block, new_entry_clears_fees_ok,
         )
         broker_name = self.cycle_broker_name
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
@@ -12994,6 +14234,7 @@ class MarketAdvisorGUI(QMainWindow):
         rotated_once = False
         orig_n = len(ranked)
         proposals_made = 0
+        advisor_proposals = []
 
         # Defense in depth: sandbox/$0 should skip before scoring noise, but also here
         idle_why = self._buy_engines_idle_reason(broker_name)
@@ -13023,6 +14264,15 @@ class MarketAdvisorGUI(QMainWindow):
             }
 
         equity, bp, _locked = self.get_effective_balances(broker_name)
+        posture = posture_for_broker(broker_name, self.settings, equity=equity)
+        knobs = posture_knobs_for_broker(broker_name, self.settings, equity=equity)
+        max_positions = int(knobs.get("max_open_positions", 8) or 8)
+        max_buys = int(knobs.get("max_buys_per_cycle", 1) or 1)
+        si_overlay = None if broker_has_posture_override(broker_name, self.settings) else self.settings
+        si_params = get_scale_in_params(posture=posture, settings=si_overlay)
+        exit_roi_scale = float(knobs.get("exit_roi_scale") or 1.0)
+        exit_time_scale = float(knobs.get("exit_time_scale") or 1.0)
+        ttp_arm_scale = float(knobs.get("ttp_arm_scale") or 1.0)
         holdings = self.get_broker_holdings(broker_name) or []
         held = {
             (a.get("ticker") or "").upper()
@@ -13123,6 +14373,7 @@ class MarketAdvisorGUI(QMainWindow):
                                     scale_in_candidate=True,
                                     crypto_only_broker=crypto_only_broker,
                                     prefer_equity_rth=prefer_equity_rth,
+                                    price=live_px, buying_power=bp,
                                 ))
                                 notes.append(
                                     f"[{broker_name}] "
@@ -13143,6 +14394,7 @@ class MarketAdvisorGUI(QMainWindow):
                                 holdings_meta=holdings_meta, portfolio_value=equity,
                                 crypto_only_broker=crypto_only_broker,
                                 prefer_equity_rth=prefer_equity_rth,
+                                price=c.get("price"), buying_power=bp,
                             ))
                     except Exception:
                         c["score"] = float(c.get("score") or 0.0)
@@ -13170,6 +14422,18 @@ class MarketAdvisorGUI(QMainWindow):
                     cooldown_sec=780,
                 )
             ranked = affordable
+            fundable, demotions = _auto_cycle.prefer_fundable_buy_candidates(
+                ranked,
+                buying_power=bp,
+                equity=equity,
+                broker_id=broker_id,
+                broker_name=broker_name,
+                settings=self.settings,
+            )
+            if demotions:
+                sample = "; ".join(demotions[:3])
+                notes.append(f"[{broker_name}] {sample}")
+            ranked = fundable
             # Drop names that cannot improve the book (already held without scale-in / cluster full)
             actionable = _auto_cycle.filter_actionable_ranked(ranked)
             # Always log Ranked (incl. single-signal BREAKOUT) so the trail is visible
@@ -13209,6 +14473,18 @@ class MarketAdvisorGUI(QMainWindow):
                     cooldown_sec=780,
                 )
             ranked = affordable
+            fundable, demotions = _auto_cycle.prefer_fundable_buy_candidates(
+                ranked,
+                buying_power=bp,
+                equity=equity,
+                broker_id=broker_id,
+                broker_name=broker_name,
+                settings=self.settings,
+            )
+            if demotions:
+                sample = "; ".join(demotions[:3])
+                notes.append(f"[{broker_name}] {sample}")
+            ranked = fundable
             ranked = _auto_cycle.filter_actionable_ranked(ranked)
 
         fills = []
@@ -13526,6 +14802,23 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                     continue
 
+            # Equity (and any non-crypto new name): must clear RT fees + edge buffer
+            if (not is_crypto) and tu not in held:
+                ok_fe, why_fe = new_entry_clears_fees_ok(
+                    broker_id, ticker, cand_score,
+                    is_crypto=False, asset_type=asset_type or "stock",
+                )
+                if not ok_fe:
+                    notes.append(f"[{broker_name}] Fee gate skip [{ticker}]: {why_fe}")
+                    execute_skips.append(f"{ticker}: fee gate")
+                    self._log_decision(
+                        broker=broker_name, ticker=ticker, action="SKIP",
+                        score=cand_score, reason=f"fee_gate:{why_fe}",
+                        posture=posture, open_count=open_count, max_open=max_positions,
+                        is_crypto=False, regime_ok=True,
+                    )
+                    continue
+
             bought = False
             for _attempt in range(2):
                 is_held = tu in held
@@ -13813,11 +15106,42 @@ class MarketAdvisorGUI(QMainWindow):
                         reason="scale_in" if scale_in else "entry",
                     )
                     if prop:
-                        notes.append(
-                            f"[Advisor] Proposed BUY {ticker} ~${row_dollars:.2f} "
-                            f"({engine or 'scan'}) — approve on Home or companion"
-                        )
-                        self._schedule_advisor_ai_analysis(prop.get("id"), broker_name)
+                        try:
+                            import advisor_queue as _aq_rec
+                            _aq_rec.record_decision(
+                                proposal_id=str(prop.get("id") or ""),
+                                broker=broker_name,
+                                ticker=ticker,
+                                verdict="",
+                                action="propose",
+                                source="desk",
+                                brief=f"Proposed ~${float(row_dollars or 0):.2f}",
+                                dollars=float(row_dollars or 0),
+                                score=float(cand_score or 0),
+                                engine=engine,
+                                status="pending",
+                            )
+                        except Exception:
+                            pass
+                        if bool(self.settings.get("advisor_ai_auto_apply_approve", True)):
+                            notes.append(
+                                f"[Advisor] Proposed BUY {ticker} ~${row_dollars:.2f} "
+                                f"({engine or 'scan'}) — desk auto will decide"
+                            )
+                        else:
+                            notes.append(
+                                f"[Advisor] Proposed BUY {ticker} ~${row_dollars:.2f} "
+                                f"({engine or 'scan'}) — approve on Home or companion"
+                            )
+                        # Defer AI thread start to main thread (_on_buy_batch_done).
+                        # Creating QThread from this worker caused hard process exits.
+                        pid = str(prop.get("id") or "").strip()
+                        if pid:
+                            advisor_proposals.append({
+                                "id": pid,
+                                "broker": broker_name,
+                                "ticker": ticker,
+                            })
                         proposals_made += 1
                         self._log_decision(
                             broker=broker_name, ticker=ticker, action="PROPOSE",
@@ -13914,13 +15238,27 @@ class MarketAdvisorGUI(QMainWindow):
                 buys_done=buys_done, orig_n=orig_n, ranked_n=len(ranked),
                 broker_name=broker_name,
             )
-        return {"fills": fills, "notes": notes, "buys_done": buys_done, "broker": broker_name}
+        return {
+            "fills": fills,
+            "notes": notes,
+            "buys_done": buys_done,
+            "broker": broker_name,
+            "advisor_proposals": advisor_proposals,
+        }
 
     def _on_buy_batch_done(self, payload, auto_mode=False, table=None):
         payload = payload or {}
         broker = payload.get("broker") or self.cycle_broker_name
         for note in payload.get("notes") or []:
             self.log_event(note)
+        # Main-thread only: start Advisor AI briefs (never from buy-batch worker)
+        for ap in payload.get("advisor_proposals") or []:
+            try:
+                self._schedule_advisor_ai_analysis(
+                    ap.get("id"), ap.get("broker") or broker,
+                )
+            except Exception as e:
+                self.log_event(f"[Advisor AI] schedule failed: {e}")
         for fill in payload.get("fills") or []:
             ticker = fill.get("ticker")
             status = fill.get("status") or ""
@@ -13951,6 +15289,9 @@ class MarketAdvisorGUI(QMainWindow):
         rotate_ok = any(
             f.get("rotate_sell") and f.get("ok") for f in (payload.get("fills") or [])
         )
+        fill_ok = any(
+            f.get("ok") and not f.get("rotate_sell") for f in (payload.get("fills") or [])
+        )
         self.refresh_recent_trades()
         notes = payload.get("notes") or []
         if any("[Advisor] Proposed" in str(n) for n in notes):
@@ -13964,17 +15305,22 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 pass
         if auto_mode:
-            self.refresh_account_balances()
-            if buys_done > 0 or rotate_ok:
-                self.manual_portfolio_reload(and_score=False, force=True)
+            if buys_done > 0 or rotate_ok or fill_ok:
+                self._schedule_portfolio_refresh_after_fill(
+                    broker, reason="auto buy" if (buys_done or fill_ok) else "rotate"
+                )
             else:
+                self.refresh_account_balances()
                 self.set_working_state(False)
             self.cycle_finished()
         else:
             self.set_working_state(False)
-            if buys_done > 0 or rotate_ok:
-                self.manual_portfolio_reload(and_score=False, force=True)
-            self.refresh_account_balances()
+            if buys_done > 0 or rotate_ok or fill_ok:
+                self._schedule_portfolio_refresh_after_fill(
+                    broker, reason="advisor/manual buy" if (buys_done or fill_ok) else "rotate"
+                )
+            else:
+                self.refresh_account_balances()
 
     def _bg_execute_sell_batch(self, sell_list):
         """Place sells on a worker thread."""
@@ -14256,6 +15602,8 @@ class MarketAdvisorGUI(QMainWindow):
                     exit_time_scale=float(knobs.get("exit_time_scale", 1.0) or 1.0),
                     ttp_arm_scale=float(knobs.get("ttp_arm_scale", 1.0) or 1.0),
                     allow_flat_time_banks=allow_flat_banks,
+                    equity=self._equity_for_exit_eval(broker_name),
+                    quantity=shares,
                 )
                 results.append((row, price, action, asset_type, None))
         flush_state()
@@ -14442,6 +15790,7 @@ class MarketAdvisorGUI(QMainWindow):
                             scale_in_candidate=True,
                             crypto_only_broker=crypto_only_broker,
                             prefer_equity_rth=prefer_equity_rth,
+                            price=live_px, buying_power=bp,
                         ))
                         buy_candidates.append({
                             "ticker": ticker,
@@ -14458,6 +15807,7 @@ class MarketAdvisorGUI(QMainWindow):
                         holdings_meta=holdings_meta, portfolio_value=equity,
                         crypto_only_broker=crypto_only_broker,
                         prefer_equity_rth=prefer_equity_rth,
+                        price=live_px, buying_power=bp,
                     ))
                 except Exception:
                     score = 0.0
@@ -14516,6 +15866,29 @@ class MarketAdvisorGUI(QMainWindow):
         self._holdings_count_cache[broker_name] = len(assets)
         if not assets:
             return [], []
+        if bool(self.settings.get("otc_skip_portfolio_scoring", True)):
+            kept = []
+            otc_skipped = []
+            for a in assets:
+                tick = str(a.get("ticker") or "").upper()
+                locked, _ = _auto_cycle.classify_locked_holding(
+                    {"ticker": tick, "type": a.get("type", "")},
+                    broker_name=broker_name,
+                )
+                if locked and tick.endswith("Q"):
+                    otc_skipped.append(tick)
+                    continue
+                kept.append(a)
+            if otc_skipped:
+                self._throttled_log(
+                    f"{broker_name}:otc_portfolio_skip",
+                    f"[{broker_name}] Skipping OTC portfolio scoring: "
+                    f"{', '.join(sorted(set(otc_skipped)))}",
+                    cooldown_sec=7200,
+                )
+            assets = kept
+        if not assets:
+            return [], []
         items = [
             (i, a.get('ticker'), a.get('shares', 0.0), a.get('cost', 0.0), a.get('type', ''), broker_name)
             for i, a in enumerate(assets)
@@ -14559,6 +15932,25 @@ class MarketAdvisorGUI(QMainWindow):
         broker = self.cycle_broker_name
         assets, results = payload if payload else ([], [])
         if not assets:
+            # Sync UI when broker API is flat but Portfolio tab still shows old rows
+            stale = 0
+            pt = getattr(self, "portfolio_table", None)
+            if pt is not None:
+                for row in range(pt.rowCount()):
+                    b_item = pt.item(row, 0)
+                    if b_item and str(b_item.text() or "") == str(broker):
+                        stale += 1
+            if stale > 0:
+                self._throttled_log(
+                    f"{broker}:portfolio_stale_clear",
+                    f"[{broker}] Broker reports no holdings but Portfolio shows {stale} "
+                    f"row(s) — refreshing table (no MA sell ran).",
+                    cooldown_sec=120,
+                )
+                try:
+                    self.manual_portfolio_reload(and_score=False, force=True)
+                except Exception:
+                    pass
             self.log_event(f"[AUTO] [{broker}] Portfolio empty — no sells this cycle")
             self.set_working_state(False)
             self.cycle_finished()
@@ -14736,6 +16128,10 @@ class MarketAdvisorGUI(QMainWindow):
                 pass
             else:
                 self._coach_tip_for_scan_drops(broker, engine, dropped or [])
+        try:
+            self._record_zero_signal(broker, engine, actionable)
+        except Exception:
+            pass
 
     def _upsert_desk_radar(self, engine, buy_candidates):
         try:
@@ -14975,26 +16371,52 @@ class MarketAdvisorGUI(QMainWindow):
                         finviz_syms.append(str(t).upper().strip())
             except Exception:
                 pass
+        # Micro-book afford ceiling — skip mega-cap RH movers when BP can't buy 1 share
+        max_sh = 0.0
+        try:
+            from scoring import is_small_book, max_affordable_share_price
+            equity, bp, _ = self.get_effective_balances(self.cycle_broker_name)
+            if is_small_book(equity):
+                max_sh = float(max_affordable_share_price(bp) or 0.0)
+        except Exception:
+            max_sh = 0.0
         if self.brokers["Robinhood"].is_connected:
             try:
                 import robin_stocks.robinhood as rh
                 for item in rh.markets.get_top_100()[:12]:
                     sym = item.get('symbol') or item.get('ticker')
-                    if sym:
-                        rh_syms.append(str(sym).upper().strip())
+                    if not sym:
+                        continue
+                    sym_u = str(sym).upper().strip()
+                    if max_sh > 0:
+                        try:
+                            px = float(
+                                item.get("last_trade_price")
+                                or item.get("price")
+                                or item.get("last_price")
+                                or 0
+                            )
+                        except (TypeError, ValueError):
+                            px = 0.0
+                        if px > 0 and px > max_sh * 1.15:
+                            continue
+                    rh_syms.append(sym_u)
             except Exception:
                 pass
-        # Yahoo day gainers (equities) — soft third source
+        # Yahoo day gainers (equities) — soft third source; prefer names under afford ceiling
         try:
             import yfinance as yf
             # curated high-beta names as gainers proxy when screener APIs fail
-            probe = ["SOUN", "PLUG", "RKLB", "SMCI", "IONQ", "OKLO", "ACHR", "JOBY"]
+            probe = ["SOUN", "PLUG", "RKLB", "SMCI", "IONQ", "OKLO", "ACHR", "JOBY", "SNDL", "NIO"]
             for sym in probe:
                 try:
                     h = yf.Ticker(sym).history(period="5d", interval="1d")
                     if h is None or h.empty or len(h) < 2:
                         continue
-                    chg = float(h["Close"].iloc[-1]) / float(h["Close"].iloc[-2]) - 1.0
+                    last = float(h["Close"].iloc[-1])
+                    chg = last / float(h["Close"].iloc[-2]) - 1.0
+                    if max_sh > 0 and last > max_sh * 1.15:
+                        continue
                     if chg >= 0.03:
                         yahoo_syms.append(sym)
                 except Exception:
@@ -15002,11 +16424,24 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             pass
         import desk_radar
+        import desk_orchestration as do
+        extended_micro: list[str] = []
+        sess_lbl = str(self.get_equity_session_info().get("label") or "")
+        if max_sh > 0 and "EXTENDED" in sess_lbl.upper():
+            extended_micro = do.filter_extended_micro_symbols(
+                list(do.EXTENDED_MICRO_BREAKOUTS),
+                max_share_price=max_sh,
+            )
         discovered = desk_radar.merge_breakout_universe(
-            finviz_syms, rh_syms, yahoo_syms, max_total=16,
+            finviz_syms, rh_syms, yahoo_syms,
+            extended_micro=extended_micro,
+            max_total=20,
         )
         if not discovered:
-            for s in ["SNDL", "SOUN", "PLUG", "TSLA", "AMD"]:
+            fallback = ["SNDL", "SOUN", "PLUG", "NIO", "ACHR"] if max_sh > 0 else [
+                "SNDL", "SOUN", "PLUG", "TSLA", "AMD",
+            ]
+            for s in fallback:
                 discovered.append({'symbol': s, 'type': 'Penny Stock'})
         return discovered
 
@@ -15116,15 +16551,51 @@ class MarketAdvisorGUI(QMainWindow):
                 return
         except Exception:
             pass
-        self._set_engine_banner(banner_text, banner_color)
-        self.execute_scanner_trades(table, auto_mode=True, buy_candidates=buy_candidates)
-
-    def _bg_buy_batch_safe(self, candidates, rank=False, advisor_gate=False):
         try:
-            return self._bg_buy_batch(candidates, rank=rank, advisor_gate=advisor_gate)
+            self._set_engine_banner(banner_text, banner_color)
+            self.execute_scanner_trades(table, auto_mode=True, buy_candidates=buy_candidates)
         except Exception as e:
             import traceback
-            broker = getattr(self, "cycle_broker_name", "?")
+            self.log_event(f"[{broker}] Execute scan buys failed ({engine_label}): {e}")
+            for line in traceback.format_exc().splitlines()[-8:]:
+                if line.strip():
+                    self.log_event(f"  {line}")
+            try:
+                import crash_log as cl
+
+                cl.record_crash(
+                    f"Execute scan buys ({engine_label}): {e}",
+                    detail=traceback.format_exc()[:2000],
+                    where="_try_execute_scan_buys",
+                )
+            except Exception:
+                pass
+            self.set_working_state(False)
+            self.cycle_finished()
+
+    def _bg_buy_batch_safe(self, candidates, rank=False, advisor_gate=False):
+        broker = getattr(self, "cycle_broker_name", "?")
+        n = len(candidates or [])
+        try:
+            self.log_event(
+                f"[{broker}] Buy batch start — {n} candidate(s)"
+                f"{' · advisor gate' if advisor_gate else ''}"
+            )
+        except Exception:
+            pass
+        try:
+            out = self._bg_buy_batch(candidates, rank=rank, advisor_gate=advisor_gate)
+            try:
+                props = len((out or {}).get("advisor_proposals") or [])
+                buys = int((out or {}).get("buys_done") or 0)
+                self.log_event(
+                    f"[{broker}] Buy batch done — buys={buys} proposals={props}"
+                )
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            import traceback
             tb = traceback.format_exc()
             return {
                 "fills": [],
@@ -15134,6 +16605,7 @@ class MarketAdvisorGUI(QMainWindow):
                 ],
                 "buys_done": 0,
                 "broker": broker,
+                "advisor_proposals": [],
             }
 
     def _on_risk_posture_changed(self, _index=None):
@@ -15307,6 +16779,10 @@ class MarketAdvisorGUI(QMainWindow):
         if hasattr(self, "advisor_ai_auto_reject_chk"):
             self.settings["advisor_ai_auto_reject_skip"] = bool(
                 self.advisor_ai_auto_reject_chk.isChecked()
+            )
+        if hasattr(self, "advisor_ai_auto_apply_chk"):
+            self.settings["advisor_ai_auto_apply_approve"] = bool(
+                self.advisor_ai_auto_apply_chk.isChecked()
             )
         if hasattr(self, "monitor_controls_main_chk"):
             self.settings["monitor_controls_enabled"] = bool(

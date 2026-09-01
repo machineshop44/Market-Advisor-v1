@@ -4,6 +4,10 @@ Src/settings.json
 Src/trade_journal.jsonl
 Src/scoring_state.json
 Src/activity_log.txt
+Src/advisor_queue.json
+Src/advisor_decisions.jsonl
+Src/crash_log.txt
+Src/crash_log.txt.prev
 Src/_combo_arrow_*.png
 Src/_spin_arrow_*.png
 Src/monitor_tls/

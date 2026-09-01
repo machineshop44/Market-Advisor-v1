@@ -739,6 +739,109 @@ def filter_affordable_buy_candidates(
     return affordable, dropped
 
 
+def prefer_fundable_buy_candidates(
+    candidates,
+    *,
+    buying_power,
+    equity,
+    broker_id,
+    broker_name="",
+    settings=None,
+) -> tuple[list, list[str]]:
+    """
+    Reorder affordable candidates so names that size to a real ticket come first.
+    Demotes high scorers that still fail micro sizing (Activity demotion lines).
+    """
+    rows = [c for c in (candidates or []) if isinstance(c, dict)]
+    if not rows:
+        return [], []
+    try:
+        from scoring import (
+            risk_sizing_breakdown,
+            get_stop_distance_pct,
+            posture_knobs_for_broker,
+            effective_min_dollars,
+            SMALL_BOOK_EQUITY,
+        )
+    except Exception:
+        return rows, []
+
+    try:
+        eq = float(equity or 0.0)
+    except (TypeError, ValueError):
+        eq = 0.0
+    if eq <= 0 or eq >= SMALL_BOOK_EQUITY:
+        return rows, []
+
+    knobs = posture_knobs_for_broker(broker_name or broker_id, settings, equity=eq)
+    util = float(knobs.get("target_bp_utilization_pct", 88.0) or 88.0)
+    if util > 1.0:
+        util = util / 100.0
+    demotions: list[str] = []
+    fundable: list = []
+    weak: list = []
+    for c in rows:
+        ticker = str(c.get("ticker") or "?")
+        asset_type = str(c.get("asset_type") or "")
+        is_crypto = (
+            "crypto" in asset_type.lower()
+            or ticker.upper() in DEFAULT_CRYPTO_TICKERS
+        )
+        min_d = effective_min_dollars(
+            broker_id, eq, is_crypto, (settings or {}).get("min_trade_dollars", 5.0)
+        )
+        alloc_key = "allocation_pct_crypto" if is_crypto else "allocation_pct_stock"
+        alloc = float((settings or {}).get(alloc_key, (settings or {}).get("allocation_pct", 8.0))) / 100.0
+        stop_d = get_stop_distance_pct(broker_id, ticker=ticker, for_sizing=True)
+        detail = risk_sizing_breakdown(
+            eq,
+            float(buying_power or 0),
+            stop_d,
+            alloc,
+            min_dollars=min_d,
+            conviction_score=float(c.get("score") or 0),
+            target_bp_utilization=util,
+            sizing_focus_slots=int(knobs.get("sizing_focus_slots", 6) or 6),
+            soft_name_equity_frac=float(knobs.get("max_single_name_equity_pct", 15.0) or 15.0) / 100.0,
+            risk_pct_per_trade=float(knobs.get("risk_pct_per_trade", 0.75) or 0.75),
+            max_open_risk_pct=float(knobs.get("max_open_risk_pct", 6.0) or 6.0),
+        )
+        trade = float(detail.get("trade") or 0)
+        if trade + 1e-9 >= min_d and not detail.get("skip_reason"):
+            c = dict(c)
+            c["_sized_dollars"] = trade
+            fundable.append(c)
+        else:
+            why = detail.get("skip_reason") or "size too small"
+            demotions.append(f"{ticker} demoted — micro deploy prefers fundable size ({why})")
+            weak.append(c)
+    # Keep demoted names after fundable so rank trail still shows them if needed
+    return fundable + weak, demotions
+
+
+def filter_otc_portfolio_items(
+    items: list,
+    *,
+    broker_name: str = "",
+    skip_otc: bool = True,
+) -> tuple[list, list[str]]:
+    """Drop OTC *Q rows from portfolio scoring when skip_otc — stops hopeless re-score spam."""
+    if not skip_otc or not items:
+        return list(items or []), []
+    kept: list = []
+    skipped: list[str] = []
+    for item in items or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            kept.append(item)
+            continue
+        ticker = str(item[1] or "").upper()
+        if ticker.endswith("Q") and len(ticker) >= 4:
+            skipped.append(ticker)
+            continue
+        kept.append(item)
+    return kept, skipped
+
+
 def classify_locked_holding(holding: dict, *, broker_name: str = "") -> tuple[bool, str]:
     """
     Heuristic OTC/dust/untradeable capital — not deployable for rotates/sizing.
@@ -1109,6 +1212,8 @@ def portfolio_sells_from_scored(
     broker: str,
 ) -> list[dict]:
     """Build sell_list entries from _bg_score_portfolio (row, price, action, ...) tuples."""
+    from scoring import sell_fraction_from_action
+
     sells: list[dict] = []
     asset_list = list(assets or [])
     for row, price, action, asset_type, _err in results or []:
@@ -1120,17 +1225,25 @@ def portfolio_sells_from_scored(
         ticker = a.get("ticker") or ""
         if not ticker:
             continue
-        if "SELL" not in str(action or "").upper():
+        action_s = str(action or "")
+        if "SELL" not in action_s.upper():
             continue
+        partial, frac = sell_fraction_from_action(action_s)
+        shares_total = float(a.get("shares") or 0)
+        if partial and shares_total > 0:
+            sell_shares = max(shares_total * frac, shares_total * 0.05)
+            sell_shares = min(sell_shares, shares_total)
+        else:
+            sell_shares = shares_total
         sells.append({
             "broker": broker,
             "ticker": ticker,
-            "shares": float(a.get("shares") or 0),
+            "shares": sell_shares,
             "price": float(price or 0),
             "avg_cost": float(a.get("cost") or 0),
             "type": a.get("type") or asset_type or "",
-            "sell_all": True,
-            "action": str(action or ""),
+            "sell_all": not partial,
+            "action": action_s,
         })
     return sells
 

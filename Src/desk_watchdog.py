@@ -17,7 +17,7 @@ _LOG_PATTERNS: list[tuple[str, str, str, str]] = [
     (r"thread error", SEV_CRITICAL, "thread_error", "Background task failed — check activity log"),
     (r"buy batch error|buy execution error", SEV_CRITICAL, "buy_batch_error", "Buy batch crashed or rejected badly"),
     (r"cycle stall", SEV_WARN, "cycle_stall", "Trading cycle hung and was force-unlocked"),
-    (r"ranked \d+ buys", SEV_WARN, "ranked_then_stop", "Buys ranked — watch for silent stop after this line"),
+    # ranked_then_stop handled specially in scan_log_snags (needs Buy batch done check)
     (r"0 actionable", SEV_INFO, "zero_actionable", "Signals found but none affordable for book size"),
     (r"unaffordable", SEV_INFO, "unaffordable", "Ticker unaffordable at current buying power"),
     (r"pausing new buys", SEV_WARN, "dd_pause_log", "Drawdown guard paused new buys"),
@@ -44,12 +44,55 @@ def _snag(
     }
 
 
+def _ranked_then_stop_still_open(log_lines: list[str], ranked_line: str) -> bool:
+    """True only if Ranked appears without a later Buy batch done/start for that broker."""
+    try:
+        idx = log_lines.index(ranked_line)
+    except ValueError:
+        return True
+    broker = ""
+    for b in ("Robinhood", "Coinbase", "E*TRADE"):
+        if f"[{b}]" in ranked_line:
+            broker = b
+            break
+    after = log_lines[idx + 1 :]
+    for ln in after:
+        low = ln.lower()
+        if broker and f"[{broker}]" not in ln and broker.lower() not in low:
+            # other brokers' lines don't clear this ranked snag
+            if "buy batch" in low:
+                continue
+        if "buy batch done" in low or "buy batch start" in low:
+            if not broker or f"[{broker}]" in ln:
+                return False
+        if "buy batch error" in low and (not broker or f"[{broker}]" in ln):
+            return True
+    return True
+
+
 def scan_log_snags(log_lines: list | None, *, seen_codes: set | None = None) -> list[dict]:
     seen = seen_codes or set()
     out: list[dict] = []
     lines = [str(x) for x in (log_lines or []) if x][-40:]
     for ln in reversed(lines):
         low = ln.lower()
+        if "ranked_then_stop" not in seen and re.search(r"ranked \d+ buys", low):
+            if _ranked_then_stop_still_open(lines, ln):
+                broker = ""
+                for b in ("Robinhood", "Coinbase", "E*TRADE"):
+                    if f"[{b}]" in ln:
+                        broker = b
+                        break
+                out.append(_snag(
+                    "ranked_then_stop",
+                    SEV_WARN,
+                    "Buys ranked — watch for silent stop after this line",
+                    broker=broker,
+                    hint=ln[-180:],
+                ))
+                seen.add("ranked_then_stop")
+            else:
+                seen.add("ranked_then_stop")
         for pattern, sev, code, msg in _LOG_PATTERNS:
             if code in seen:
                 continue

@@ -38,6 +38,11 @@ MIN_ENTRY_EDGE_OVER_FEES_PCT = 0.01  # 100 bps beyond RT before spraying tickets
 # Flat time banks must clear TTP arm by this multiple so they cannot fire before trail arms.
 FLAT_TIME_BANK_ARM_MULT = 1.25
 
+# Small-book crypto: scale out ~45% at first TTP arm; trail the rest.
+TTP_PARTIAL_SCALE_PCT = 0.45
+# Peak DD pause needs agreeing balance reads (like balance_guard day-loss trip).
+PEAK_DD_CONFIRM_READS = 3
+
 FEE_PROFILES = {
     # Desk posture: ride uptrends — primary green exit is TTP trail-from-peak (turn-based).
     # Hierarchy: hard stop → TTP arm+trail → rare flat time banks (Aggressive only, after turn) → stale.
@@ -150,6 +155,7 @@ MAX_CRYPTO_BOOK_FRAC = 0.30       # max crypto share on multi-asset brokers (RH)
 RTH_EQUITY_RANK_BOOST = 12.0
 RTH_CRYPTO_RANK_PENALTY = 10.0
 SMALL_BOOK_EQUITY = 500.0         # below this, crypto soft penalties start earlier
+MICRO_FULL_DEPLOY_EQUITY = 200.0  # below this: 1-slot near-full BP deploy (beginner auto)
 AUTO_SCALE_BALANCED_CEILING = 2500.0  # above this, honor saved posture (safer/balanced/aggressive)
 SMALL_BOOK_CRYPTO_MIN_DOLLARS = 6.0  # aim ≥ this on small books — fits 3-slot sizing on ~$50 BP
 MAX_CLUSTER_POSITIONS = 2         # max open names in one correlation cluster
@@ -286,9 +292,9 @@ RISK_POSTURE_PROFILES = {
     "growth": {
         "label": "Growth",
         "hint": (
-            "Small-book mode (~$50–$500): 3 focus slots, 2 buys/cycle, faster green takes, "
-            "wider DD pause (22% peak) so one rough patch doesn't freeze entries. "
-            "Skips SPY/BTC regime gates on new entries; still hard-stopped. "
+            "Small-book mode (~$50–$500): micro full-deploy sizing, faster green takes, "
+            "1 buy/cycle, tighter DD pause (~14% peak) so rough patches freeze entries sooner. "
+            "Skips SPY/BTC regime gates on new entries; still hard-stopped + fee-clear gate. "
             "Auto-applies when auto-scale is on and equity is under $500."
         ),
         "require_crypto_regime": False,
@@ -296,7 +302,7 @@ RISK_POSTURE_PROFILES = {
         "target_bp_utilization_pct": 92.0,
         "sizing_focus_slots": 3,
         "max_open_positions": 4,
-        "max_buys_per_cycle": 2,
+        "max_buys_per_cycle": 1,
         "risk_pct_per_trade": 0.90,
         "max_open_risk_pct": 8.0,
         "max_single_name_equity_pct": 25.0,
@@ -312,10 +318,10 @@ RISK_POSTURE_PROFILES = {
         "scale_in_roi_max": -0.008,
         "scale_in_near_pct": 0.015,
         "scale_in_min_score": 45.0,
-        "day_dd_pause_pct": 0.10,
-        "peak_dd_pause_pct": 0.22,
-        "dd_pause_minutes": 20,
-        "daily_loss_limit_equity_pct": 0.10,
+        "day_dd_pause_pct": 0.06,
+        "peak_dd_pause_pct": 0.14,
+        "dd_pause_minutes": 30,
+        "daily_loss_limit_equity_pct": 0.08,
     },
 }
 
@@ -540,29 +546,67 @@ def broker_has_posture_override(broker_name_or_id, settings=None):
     return bool(str(val or "").strip())
 
 
+def micro_full_deploy_overrides(equity) -> dict:
+    """
+    Invisible beginner sizing: concentrate small books so cash is usable.
+    No Settings UI — applied automatically from equity.
+    """
+    try:
+        eq = float(equity or 0.0)
+    except (TypeError, ValueError):
+        eq = 0.0
+    if eq <= 0:
+        return {}
+    if eq < MICRO_FULL_DEPLOY_EQUITY:
+        return {
+            "sizing_focus_slots": 1,
+            "target_bp_utilization_pct": 98.0,
+            "max_single_name_equity_pct": 90.0,
+            "max_buys_per_cycle": 1,
+            "micro_full_deploy": True,
+            "micro_full_deploy_label": "micro full-deploy",
+        }
+    if eq < SMALL_BOOK_EQUITY:
+        return {
+            "sizing_focus_slots": 2,
+            "target_bp_utilization_pct": 95.0,
+            "max_single_name_equity_pct": 40.0,
+            "micro_full_deploy": True,
+            "micro_full_deploy_label": "small-book deploy",
+        }
+    return {}
+
+
 def posture_knobs_for_broker(broker_name_or_id, settings=None, *, equity=None):
     """
     Knobs that should actually drive this broker: profile if a per-broker override
     is set, otherwise Advanced/settings overlay on the global posture profile.
     When auto-scaled to a different tier, uses the tier profile (not stale preset values).
+    Small books get invisible micro full-deploy overrides (1–2 slots, high util).
     """
     settings = settings or {}
     manual = manual_posture_for_broker(broker_name_or_id, settings)
     effective = posture_for_broker(broker_name_or_id, settings, equity=equity)
     prof = get_risk_posture_profile(effective)
+    eq = _resolve_broker_equity(broker_name_or_id, equity)
     if broker_has_posture_override(broker_name_or_id, settings):
-        return prof
-    auto_scaled = (
-        bool(settings.get("auto_scale_growth", True))
-        and _resolve_broker_equity(broker_name_or_id, equity) is not None
-        and effective != manual
-    )
-    if auto_scaled:
-        return dict(prof)
-    out = dict(prof)
-    for k in _POSTURE_KNOB_KEYS:
-        if k in settings and settings[k] is not None:
-            out[k] = settings[k]
+        out = dict(prof)
+    else:
+        auto_scaled = (
+            bool(settings.get("auto_scale_growth", True))
+            and eq is not None
+            and effective != manual
+        )
+        if auto_scaled:
+            out = dict(prof)
+        else:
+            out = dict(prof)
+            for k in _POSTURE_KNOB_KEYS:
+                if k in settings and settings[k] is not None:
+                    out[k] = settings[k]
+    # Beginner full-deploy always wins on small books (even with per-broker override)
+    if bool(settings.get("auto_scale_growth", True)):
+        out.update(micro_full_deploy_overrides(eq if eq is not None else 0.0))
     return out
 
 
@@ -687,6 +731,30 @@ def estimated_signal_edge_pct(score, *, is_crypto=False):
     return max(0.0, (sc - base) * per_pt)
 
 
+def new_entry_clears_fees_ok(
+    broker_id,
+    ticker,
+    score=0.0,
+    *,
+    is_crypto=False,
+    asset_type="",
+):
+    """
+    Block NEW discretionary buys whose estimated signal edge cannot clear
+    round-trip fees + MIN_ENTRY_EDGE_OVER_FEES_PCT. Scale-in / rotates have
+    their own gates.
+    """
+    atype = asset_type or ("cryptocurrency" if is_crypto else "stock")
+    need = min_entry_edge_pct(broker_id, ticker, atype)
+    edge = estimated_signal_edge_pct(score, is_crypto=bool(is_crypto))
+    if edge + 1e-12 < need:
+        return False, (
+            f"DO NOT BUY (Fee gate: est edge {edge*100:.2f}% < "
+            f"need {need*100:.2f}% RT+edge)"
+        )
+    return True, ""
+
+
 def crypto_new_entry_ok(
     broker_id, ticker, score=0.0, notional=None, *, skip_turbulence=False, equity=None,
 ):
@@ -709,6 +777,11 @@ def crypto_new_entry_ok(
             f"DO NOT BUY (Hold bias: score {sc:.0f} < "
             f"{min_score:.0f})"
         )
+    ok_fee, why_fee = new_entry_clears_fees_ok(
+        broker_id, ticker, sc, is_crypto=True, asset_type="cryptocurrency",
+    )
+    if not ok_fee:
+        return False, why_fee
     need = min_entry_edge_pct(broker_id, ticker, "cryptocurrency")
     edge = estimated_signal_edge_pct(sc, is_crypto=True)
     floor = broker_min_notional(broker_id, is_crypto=True)
@@ -949,8 +1022,11 @@ def resolve_exit_fees(
     exit_roi_scale=1.0,
     exit_time_scale=1.0,
     ttp_arm_scale=1.0,
+    *,
+    equity=None,
+    holding_value=None,
 ):
-    """Fee profile → ATR exit adapt → posture scales → fee floor → time banks above arm."""
+    """Fee profile → ATR exit adapt → posture scales → small-ticket nudge → fee floor → time banks."""
     fees = atr_adapt_exit_fees(
         _resolve_fee_profile(broker_id, ticker, asset_type),
         ticker,
@@ -961,8 +1037,99 @@ def resolve_exit_fees(
         exit_time_scale=exit_time_scale,
         ttp_arm_scale=ttp_arm_scale,
     )
+    fees = apply_small_ticket_exit_nudge(
+        fees, broker_id, ticker=ticker, asset_type=asset_type,
+        equity=equity, holding_value=holding_value,
+    )
     fees = enforce_min_profit_over_fees(fees, broker_id, ticker, asset_type)
     return ensure_flat_banks_above_ttp_arm(fees)
+
+
+def apply_small_ticket_exit_nudge(
+    fees,
+    broker_id,
+    *,
+    ticker=None,
+    asset_type="",
+    equity=None,
+    holding_value=None,
+):
+    """
+    On small books, tiny crypto tickets get slightly earlier TTP arm / time exits
+    so fees don't dominate a slow drift. Hard stop unchanged; fee floor still applies after.
+    """
+    out = dict(fees or {})
+    try:
+        eq = float(equity) if equity is not None else 0.0
+    except (TypeError, ValueError):
+        eq = 0.0
+    try:
+        hv = float(holding_value) if holding_value is not None else 0.0
+    except (TypeError, ValueError):
+        hv = 0.0
+    is_crypto = (
+        "crypto" in str(asset_type or "").lower()
+        or str(ticker or "").upper().replace("-USD", "") in CRYPTO_TICKERS
+    )
+    if not is_crypto:
+        return out
+    small = is_small_book(eq) if eq > 0 else (0 < hv < 40.0)
+    if not small:
+        return out
+    # Tiny position (under ~$40) or micro book: arm trail sooner (~12% tighter)
+    scale = 0.88 if hv <= 0 or hv >= 15.0 else 0.82
+    for key in ("ttp_arm", "time_profit_roi", "time_profit_min", "time_stop_roi"):
+        if key in out and out[key] is not None:
+            try:
+                val = float(out[key])
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                out[key] = val * scale
+    out["small_ticket_exit_nudge"] = scale
+    return out
+
+
+def ttp_partial_scale_eligible(
+    broker_id,
+    ticker,
+    asset_type="",
+    *,
+    equity=None,
+    holding_value=None,
+) -> bool:
+    """
+    Small-book crypto: partial scale-out at TTP arm before trailing the rest.
+    """
+    broker_id = _normalize_broker_id(broker_id)
+    is_crypto = (
+        "crypto" in str(asset_type or "").lower()
+        or str(ticker or "").upper().replace("-USD", "") in CRYPTO_TICKERS
+    )
+    if not is_crypto:
+        return False
+    try:
+        hv = float(holding_value) if holding_value is not None else 0.0
+    except (TypeError, ValueError):
+        hv = 0.0
+    try:
+        eq = float(equity) if equity is not None else 0.0
+    except (TypeError, ValueError):
+        eq = 0.0
+    small_book = is_small_book(eq) if eq > 0 else False
+    tiny_pos = 0 < hv < 45.0
+    return small_book or tiny_pos
+
+
+def sell_fraction_from_action(action: str) -> tuple[bool, float]:
+    """
+    Parse portfolio sell action. Returns (is_partial, fraction_of_position).
+    SELL_PARTIAL actions use TTP_PARTIAL_SCALE_PCT; full SELL uses 1.0.
+    """
+    text = str(action or "").upper()
+    if "SELL_PARTIAL" not in text:
+        return False, 1.0
+    return True, float(TTP_PARTIAL_SCALE_PCT)
 
 
 # Practical concentration heuristics (maintainable, no quant library)
@@ -1026,7 +1193,10 @@ _scale_in_last_ts = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> last scale-i
 _loss_streak = {b: {"events": [], "pause_until": 0.0} for b in _KNOWN_BROKER_IDS}
 # Per-broker equity high-water + day open for drawdown pauses
 _equity_dd = {
-    b: {"day": "", "day_open": 0.0, "peak": 0.0, "pause_until": 0.0, "pause_reason": ""}
+    b: {
+        "day": "", "day_open": 0.0, "peak": 0.0,
+        "pause_until": 0.0, "pause_reason": "", "peak_dd_streak": 0,
+    }
     for b in _KNOWN_BROKER_IDS
 }
 _trend_cache = {}
@@ -1169,7 +1339,7 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
         return False, ""
 
     if settings is not None:
-        knobs = posture_knobs_for_broker(broker_id, settings)
+        knobs = posture_knobs_for_broker(broker_id, settings, equity=eq)
     else:
         knobs = get_risk_posture_profile(posture)
     day_pct = float(knobs.get("day_dd_pause_pct", 0.05) or 0.05)
@@ -1181,7 +1351,8 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
 
     if broker_id not in _equity_dd:
         _equity_dd[broker_id] = {
-            "day": "", "day_open": 0.0, "peak": 0.0, "pause_until": 0.0, "pause_reason": ""
+            "day": "", "day_open": 0.0, "peak": 0.0,
+            "pause_until": 0.0, "pause_reason": "", "peak_dd_streak": 0,
         }
     st = _equity_dd[broker_id]
     today = _local_day_key()
@@ -1189,6 +1360,7 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
         st["day"] = today
         st["day_open"] = eq
         st["peak"] = max(eq, float(st.get("peak") or 0.0))
+        st["peak_dd_streak"] = 0
         # New day clears prior pause unless still in the future from yesterday
         if float(st.get("pause_until") or 0) < time.time():
             st["pause_reason"] = ""
@@ -1203,9 +1375,19 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
     now = time.time()
     triggered = None
     if day_dd <= -day_pct:
+        st["peak_dd_streak"] = 0
         triggered = f"Day drawdown {day_dd*100:.1f}% ≤ −{day_pct*100:.0f}%"
     elif peak_dd <= -peak_pct:
-        triggered = f"Peak drawdown {peak_dd*100:.1f}% ≤ −{peak_pct*100:.0f}%"
+        streak = int(st.get("peak_dd_streak") or 0) + 1
+        st["peak_dd_streak"] = streak
+        needed = max(2, int(PEAK_DD_CONFIRM_READS))
+        if streak >= needed:
+            triggered = f"Peak drawdown {peak_dd*100:.1f}% ≤ −{peak_pct*100:.0f}%"
+        else:
+            save_state(force=False)
+            return False, ""
+    else:
+        st["peak_dd_streak"] = 0
 
     if triggered and float(st.get("pause_until") or 0) < now:
         st["pause_until"] = now + pause_min * 60
@@ -1215,6 +1397,57 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
 
     save_state(force=False)
     return False, ""
+
+
+def maybe_recover_peak_for_cash_heavy_book(
+    broker_id,
+    equity,
+    cash,
+    position_value,
+    *,
+    settings=None,
+) -> tuple[bool, str]:
+    """
+    When the book is mostly cash with little open risk, reset a stale peak watermark
+    so peak-DD pause does not block new buys on recovered cash-heavy books.
+    Does not change sizing knobs — only DD state.
+    """
+    broker_id = _normalize_broker_id(broker_id)
+    try:
+        eq = float(equity or 0.0)
+        cash_f = float(cash or 0.0)
+        pos_v = max(0.0, float(position_value or 0.0))
+    except (TypeError, ValueError):
+        return False, ""
+    if eq < 20.0:
+        return False, ""
+    s = settings or {}
+    try:
+        cash_pct = float(s.get("peak_dd_cash_recovery_pct") or 0.90)
+    except (TypeError, ValueError):
+        cash_pct = 0.90
+    cash_pct = max(0.75, min(0.98, cash_pct))
+    if cash_f / eq < cash_pct:
+        return False, ""
+    if pos_v / eq > 0.15:
+        return False, ""
+    st = _equity_dd.get(broker_id)
+    if not st:
+        return False, ""
+    peak = float(st.get("peak") or 0.0)
+    if peak <= eq * 1.02:
+        return False, ""
+    st["peak"] = eq
+    st["peak_dd_streak"] = 0
+    reason = str(st.get("pause_reason") or "")
+    if "Peak drawdown" in reason and float(st.get("pause_until") or 0) > time.time():
+        st["pause_until"] = 0.0
+        st["pause_reason"] = ""
+    save_state(force=True)
+    return True, (
+        f"Peak watermark reset at ${eq:.2f} "
+        f"(cash {cash_f/eq*100:.0f}% of equity; open risk ${pos_v:.2f})"
+    )
 
 
 def _drawdown_block(broker_id):
@@ -1939,7 +2172,8 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
                 name_frac = name_frac / 100.0
     except (TypeError, ValueError):
         name_frac = float(MAX_SINGLE_NAME_EQUITY_FRAC)
-    name_frac = min(0.40, max(0.05, name_frac))
+    # Micro full-deploy may pass ~90% name room; otherwise keep prior 40% soft ceiling.
+    name_frac = min(0.95, max(0.05, name_frac))
     soft_cap = eq * name_frac
     try:
         already = max(0.0, float(existing_name_value or 0.0))
@@ -1959,6 +2193,25 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
         if deployable >= min_d and risk_size >= min_d and name_limit >= min_d:
             # Floor to min when caps still allow a ticket (incl. scale-in with room)
             trade = min_d
+        elif (
+            deployable >= min_d
+            and name_limit >= min_d
+            and (risk_size + 1e-9 < min_d or trade + 1e-9 < min_d)
+        ):
+            # Beginner micro books: risk-$ alone would strand cash under min ticket.
+            # Raise to fundable notional; hard stop still exits the position.
+            trade = round(min(deployable, name_limit), 2)
+            if trade + 1e-9 >= min_d:
+                out["sizing_mode"] = "micro_full_deploy"
+                out["sizing_note"] = (
+                    "micro full-deploy — risk-$ floor raised to fundable ticket"
+                )
+                out["risk_size"] = round(max(float(out.get("risk_size") or 0), trade), 2)
+            else:
+                out["skip_reason"] = (
+                    f"sized add ${trade:.2f} < min ${min_d:.2f}"
+                )
+                return out
         else:
             if already > 0 and soft_room < min_d:
                 if soft_room <= 0.01:
@@ -2885,10 +3138,43 @@ def buy_rank_score(ticker, is_crypto=True):
     return score
 
 
+def affordability_rank_boost(
+    *,
+    price,
+    buying_power,
+    is_crypto=False,
+    utilization=0.88,
+) -> float:
+    """
+    Soft score nudge so micro equity books prefer names under the whole-share ceiling.
+    Crypto already fractions — no boost/penalty here.
+    """
+    if is_crypto:
+        return 0.0
+    try:
+        px = float(price or 0.0)
+        bp = float(buying_power or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if px <= 0 or bp <= 0:
+        return 0.0
+    max_sh = max_affordable_share_price(bp, utilization=utilization)
+    if max_sh <= 0:
+        return 0.0
+    if px <= max_sh * 0.55:
+        return 10.0
+    if px <= max_sh:
+        return 5.0
+    if px <= max_sh * 1.35:
+        return -4.0
+    return -12.0
+
+
 def buy_rank_score_for_book(ticker, is_crypto=True, held_tickers=None, holdings_meta=None,
                             portfolio_value=0.0, scale_in_candidate=False,
-                            crypto_only_broker=False, prefer_equity_rth=False):
-    """Signal quality + soft portfolio-fit adjustment for this book."""
+                            crypto_only_broker=False, prefer_equity_rth=False,
+                            price=None, buying_power=None):
+    """Signal quality + soft portfolio-fit (+ affordability) adjustment for this book."""
     base = buy_rank_score(ticker, is_crypto=is_crypto)
     adj = portfolio_buy_rank_adjust(
         ticker, held_tickers, holdings_meta=holdings_meta,
@@ -2897,7 +3183,10 @@ def buy_rank_score_for_book(ticker, is_crypto=True, held_tickers=None, holdings_
         crypto_only_broker=crypto_only_broker,
         prefer_equity_rth=prefer_equity_rth,
     )
-    return base + adj
+    boost = affordability_rank_boost(
+        price=price, buying_power=buying_power, is_crypto=is_crypto,
+    )
+    return base + adj + boost
 
 
 # =========================================================================
@@ -3490,7 +3779,8 @@ def last_rotation_reject_reason():
 
 def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", live_price=None,
                      exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0,
-                     allow_flat_time_banks=False):
+                     allow_flat_time_banks=False, equity=None, holding_value=None,
+                     quantity=None):
     """
     Trailing take-profit / hard stop / time-stop.
     Fee thresholds change by broker so CB doesn't take thin RH-style exits.
@@ -3503,6 +3793,8 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
 
     Unknown / dust cost basis: TTP and flat green exits stay gated (honesty). Hard stop
     and stale use a live-price reference so bags are not unmanaged forever.
+
+    Small-ticket crypto on micro books: slightly earlier TTP arm / time exits (fee floor still applies).
     """
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
@@ -3518,11 +3810,20 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     if unknown_basis:
         avg_cost = current_price  # protective reference only
 
+    hv = holding_value
+    if hv is None and quantity is not None:
+        try:
+            hv = float(quantity or 0.0) * float(current_price)
+        except (TypeError, ValueError):
+            hv = None
+
     fees = resolve_exit_fees(
         broker_id, ticker, asset_type,
         exit_roi_scale=exit_roi_scale,
         exit_time_scale=exit_time_scale,
         ttp_arm_scale=ttp_arm_scale,
+        equity=equity,
+        holding_value=hv,
     )
     now = time.time()
     if broker_id not in _portfolio_memory: _portfolio_memory[broker_id] = {}
@@ -3566,7 +3867,21 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
         return "HOLD (Unknown Cost — TTP/ROI gated)"
 
     peak_roi = (highest - avg_cost) / avg_cost
+    mem = _portfolio_memory[broker_id][ticker]
     if peak_roi >= fees["ttp_arm"]:
+        if (
+            not mem.get("ttp_partial_done")
+            and ttp_partial_scale_eligible(
+                broker_id, ticker, asset_type, equity=equity, holding_value=hv,
+            )
+        ):
+            mem["ttp_partial_done"] = True
+            save_state(force=True)
+            pct = int(round(TTP_PARTIAL_SCALE_PCT * 100))
+            return (
+                f"SELL_PARTIAL (TTP Scale-Out {pct}% — "
+                f"Peak: +{peak_roi*100:.2f}%, Now: +{roi*100:.2f}%)"
+            )
         trail_trigger_price = highest * (1.0 - fees["ttp_trail"])
         if current_price <= trail_trigger_price:
             save_state(force=True)

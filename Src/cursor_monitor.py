@@ -225,7 +225,15 @@ def build_agent_digest(status: dict) -> dict:
         try:
             from trader_context import format_trader_digest
 
-            td = format_trader_digest(by_broker)
+            day_pnl = None
+            try:
+                bals = status.get("balances") or {}
+                comb = bals.get("combined") or {}
+                if "day_pnl" in comb:
+                    day_pnl = float(comb.get("day_pnl") or 0)
+            except Exception:
+                day_pnl = None
+            td = format_trader_digest(by_broker, day_pnl=day_pnl)
             if td:
                 summary_parts.append(td.replace("\n", " | "))
         except Exception:
@@ -267,6 +275,42 @@ def fetch_snags(conn: dict | None = None) -> dict:
         )
     except Exception as e:
         return {"ok": False, "error": str(e), "snags": []}
+
+
+def fetch_crash_log(
+    conn: dict | None = None,
+    *,
+    max_chars: int = 12000,
+    max_lines: int = 120,
+) -> dict:
+    c = conn or connection_from_env()
+    try:
+        return fetch_json(
+            c["url"],
+            user=c.get("user") or "",
+            password=c.get("password") or "",
+            token=c.get("token") or "",
+            path=(
+                f"/api/agent/crash_log?chars={int(max_chars)}"
+                f"&lines={int(max_lines)}"
+            ),
+            verify_tls=bool(c.get("verify_tls")),
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e), "text": ""}
+
+
+def format_crash_log(payload: dict | None) -> str:
+    p = payload or {}
+    if p.get("error"):
+        return f"Crash log unreachable: {p.get('error')}"
+    head = "Crash log"
+    if p.get("truncated"):
+        head += " (truncated)"
+    if p.get("exists") is False:
+        return f"{head}: (empty — no hard faults recorded)"
+    body = str(p.get("text") or "").strip()
+    return f"{head}:\n{body}" if body else f"{head}: (empty)"
 
 
 def format_snag_report(report: dict | None) -> str:

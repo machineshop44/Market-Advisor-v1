@@ -58,6 +58,44 @@ def _notional(row: dict) -> float:
         return 0.0
 
 
+def infer_engine(row: dict) -> str:
+    """Best-effort engine tag for P&L breakdown (journal engine field or reason heuristics)."""
+    eng = str(row.get("engine") or "").strip().upper()
+    if eng:
+        return eng
+    reason = str(row.get("reason") or "").upper()
+    rotate_for = str(row.get("rotate_for") or "").strip()
+    if rotate_for or "ROTATE" in reason:
+        return "ROTATE"
+    for token in ("CRYPTO", "PENNY", "CORE", "PORTFOLIO"):
+        if token in reason:
+            return token
+    if "TTP" in reason or "HARD STOP" in reason or "STALE" in reason:
+        return "PORTFOLIO"
+    side = str(row.get("side") or "").upper()
+    if side == "SELL":
+        return "PORTFOLIO"
+    return "OTHER"
+
+
+def _empty_fill_bucket() -> dict:
+    return {
+        "buys": 0,
+        "sells": 0,
+        "rotates": 0,
+        "buy_notional": 0.0,
+        "sell_notional": 0.0,
+        "fee_est": 0.0,
+        "realized_pnl": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "net_wins": 0,
+        "net_losses": 0,
+        "hold_minutes_sum": 0.0,
+        "hold_samples": 0,
+    }
+
+
 def read_journal_since(path: str, days: int | None = 7, limit: int = 5000) -> list[dict]:
     """Load journal rows from the last N days (newest last).
 
@@ -98,25 +136,17 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
     buys = sells = rotates = 0
     buy_notional = sell_notional = fee_est = 0.0
     by_broker: dict[str, dict] = {}
+    by_engine: dict[str, dict] = {}
 
     def _bkt(name: str) -> dict:
         if name not in by_broker:
-            by_broker[name] = {
-                "buys": 0,
-                "sells": 0,
-                "rotates": 0,
-                "buy_notional": 0.0,
-                "sell_notional": 0.0,
-                "fee_est": 0.0,
-                "realized_pnl": 0.0,
-                "wins": 0,
-                "losses": 0,
-                "net_wins": 0,
-                "net_losses": 0,
-                "hold_minutes_sum": 0.0,
-                "hold_samples": 0,
-            }
+            by_broker[name] = _empty_fill_bucket()
         return by_broker[name]
+
+    def _eng(name: str) -> dict:
+        if name not in by_engine:
+            by_engine[name] = _empty_fill_bucket()
+        return by_engine[name]
 
     # Open lots for FIFO-ish pairing: (broker, ticker) -> list of {qty, price, dollars, ts}
     lots: dict[tuple[str, str], list[dict]] = {}
@@ -159,18 +189,24 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
         fe = float(fe or 0.0)
 
         bucket = _bkt(b)
+        eng_name = infer_engine(row)
+        eng_bucket = _eng(eng_name)
         fee_est += fe
         bucket["fee_est"] += fe
+        eng_bucket["fee_est"] += fe
 
         if "ROTATE" in reason.upper():
             rotates += 1
             bucket["rotates"] += 1
+            eng_bucket["rotates"] += 1
 
         if side == "BUY":
             buys += 1
             buy_notional += notion
             bucket["buys"] += 1
             bucket["buy_notional"] += notion
+            eng_bucket["buys"] += 1
+            eng_bucket["buy_notional"] += notion
             key = (b, ticker)
             lots.setdefault(key, []).append({
                 "qty": abs(float(row.get("qty") or 0) or (notion / float(row.get("price") or 1))),
@@ -184,6 +220,8 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
             sell_notional += notion
             bucket["sells"] += 1
             bucket["sell_notional"] += notion
+            eng_bucket["sells"] += 1
+            eng_bucket["sell_notional"] += notion
             key = (b, ticker)
             sell_qty = abs(float(row.get("qty") or 0) or 0.0)
             sell_px = float(row.get("price") or 0.0)
@@ -216,18 +254,23 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
             net_pnl = pnl - fe - buy_fees
             realized += pnl
             bucket["realized_pnl"] += pnl
+            eng_bucket["realized_pnl"] += pnl
             if pnl > 1e-9:
                 wins += 1
                 bucket["wins"] += 1
+                eng_bucket["wins"] += 1
             elif pnl < -1e-9:
                 losses += 1
                 bucket["losses"] += 1
+                eng_bucket["losses"] += 1
             if net_pnl > 1e-9:
                 net_wins += 1
                 bucket["net_wins"] += 1
+                eng_bucket["net_wins"] += 1
             elif net_pnl < -1e-9:
                 net_losses += 1
                 bucket["net_losses"] += 1
+                eng_bucket["net_losses"] += 1
 
     turnover = buy_notional + sell_notional
     closed = wins + losses
@@ -235,17 +278,22 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
     net_closed = net_wins + net_losses
     net_win_rate = (net_wins / net_closed) if net_closed > 0 else None
     avg_hold_min = (hold_sum / hold_n) if hold_n > 0 else None
-    for bkt in by_broker.values():
+
+    def _finalize_bucket(bkt: dict) -> None:
         c = int(bkt.get("wins") or 0) + int(bkt.get("losses") or 0)
         bkt["win_rate"] = (bkt["wins"] / c) if c > 0 else None
         nc = int(bkt.get("net_wins") or 0) + int(bkt.get("net_losses") or 0)
         bkt["net_win_rate"] = (bkt["net_wins"] / nc) if nc > 0 else None
         hs = int(bkt.get("hold_samples") or 0)
         bkt["avg_hold_min"] = (bkt["hold_minutes_sum"] / hs) if hs > 0 else None
-        # Fee drag = est fees / turnover for this broker
         bt = float(bkt.get("buy_notional") or 0) + float(bkt.get("sell_notional") or 0)
         bkt["fee_drag_pct"] = (float(bkt.get("fee_est") or 0) / bt * 100.0) if bt > 0 else 0.0
         bkt["net_after_fees"] = float(bkt.get("realized_pnl") or 0) - float(bkt.get("fee_est") or 0)
+
+    for bkt in by_broker.values():
+        _finalize_bucket(bkt)
+    for bkt in by_engine.values():
+        _finalize_bucket(bkt)
 
     return {
         "buys": buys,
@@ -266,7 +314,33 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
         "net_win_rate": net_win_rate,
         "avg_hold_min": avg_hold_min,
         "by_broker": by_broker,
+        "by_engine": by_engine,
     }
+
+
+def format_engine_pnl_line(by_engine: dict | None, *, money_fmt=None, limit: int = 4) -> str:
+    """Compact engine net P&L for Home tooltip / Discord digest."""
+
+    def _m(x):
+        if callable(money_fmt):
+            return money_fmt(x)
+        try:
+            return f"${float(x or 0):,.2f}"
+        except (TypeError, ValueError):
+            return "$0.00"
+
+    items = []
+    for name, b in sorted((by_engine or {}).items()):
+        net = float(b.get("net_after_fees") or 0.0)
+        sells = int(b.get("sells") or 0)
+        if sells <= 0 and abs(net) < 0.01:
+            continue
+        items.append((name, net, sells))
+    if not items:
+        return ""
+    items.sort(key=lambda x: abs(x[1]), reverse=True)
+    parts = [f"{n} {_m(v)}" for n, v, _ in items[: max(1, int(limit))]]
+    return "Engines: " + " · ".join(parts)
 
 
 def _row_broker_fee_dollars(row: dict) -> float | None:
