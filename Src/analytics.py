@@ -21,6 +21,17 @@ except ImportError:
     normalize_risk_posture = lambda x: "balanced"  # noqa: E731
     get_risk_posture_profile = lambda x=None: {}  # noqa: E731
 
+try:
+    from crypto_symbols import KNOWN_CRYPTOS, is_known_crypto
+except ImportError:
+    KNOWN_CRYPTOS = frozenset({
+        "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
+        "FET", "AMP", "ADA", "DOT", "MATIC", "POL", "ATOM", "LTC", "BCH", "XRP", "NEAR", "AAVE",
+    })
+
+    def is_known_crypto(ticker):
+        return str(ticker or "").upper().replace("-USD", "").strip() in KNOWN_CRYPTOS
+
 
 def _parse_ts(row: dict) -> datetime | None:
     ts = str(row.get("timestamp") or "")
@@ -94,38 +105,6 @@ def _empty_fill_bucket() -> dict:
         "hold_minutes_sum": 0.0,
         "hold_samples": 0,
     }
-
-
-def read_journal_since(path: str, days: int | None = 7, limit: int = 5000) -> list[dict]:
-    """Load journal rows from the last N days (newest last).
-
-    ``days=None`` (or < 0) = all time — no date cutoff; still capped by ``limit``.
-    """
-    import json
-    import os
-
-    if not os.path.exists(path):
-        return []
-    all_time = days is None or int(days) < 0
-    cutoff = None if all_time else datetime.now() - timedelta(days=max(0, int(days)))
-    rows: list[dict] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        for ln in lines[-max(limit, 1):]:
-            try:
-                row = json.loads(ln)
-            except Exception:
-                continue
-            ts = _parse_ts(row)
-            if ts is None:
-                continue
-            if cutoff is not None and ts < cutoff:
-                continue
-            rows.append(row)
-    except Exception:
-        return []
-    return rows
 
 
 def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str, Any]:
@@ -247,6 +226,8 @@ def summarize_fills(rows: list[dict], *, broker: str | None = None) -> dict[str,
                     hold_n += 1
                     bucket["hold_minutes_sum"] += hold_m
                     bucket["hold_samples"] += 1
+                    eng_bucket["hold_minutes_sum"] += hold_m
+                    eng_bucket["hold_samples"] += 1
                 lot["qty"] = lot_qty - take
                 remaining -= take
                 if float(lot.get("qty") or 0) <= 1e-12:
@@ -1002,7 +983,7 @@ def _yahoo_symbol(ticker: str, *, is_crypto: bool = False) -> str:
     clean = str(ticker or "").upper().replace("-USD", "").strip()
     if not clean:
         return ""
-    if is_crypto or clean in {"BTC", "ETH", "SOL", "DOGE", "ADA", "XRP", "AVAX", "LINK", "DOT", "MATIC"}:
+    if is_crypto or is_known_crypto(clean):
         return f"{clean}-USD"
     return clean
 
@@ -1210,7 +1191,7 @@ def build_bar_candidates_from_journal(fill_rows: list[dict]) -> list[dict[str, A
         key = (broker, ticker)
         is_crypto = (
             "crypto" in str(row.get("asset_type") or "").lower()
-            or ticker in {"BTC", "ETH", "SOL", "DOGE", "ADA", "XRP", "AVAX", "LINK", "DOT", "MATIC"}
+            or is_known_crypto(ticker)
         )
         if side == "BUY" and qty > 0:
             open_lots.setdefault(key, []).append({

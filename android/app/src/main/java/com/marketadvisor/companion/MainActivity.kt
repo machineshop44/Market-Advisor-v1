@@ -32,7 +32,7 @@ class MainActivity : AppCompatActivity() {
     private var pollJob: Job? = null
     private var refreshJob: Job? = null
     private var syncingUi = false
-    /** Bumped on local arm/disarm/halt so stale in-flight polls cannot paint old ON state. */
+    private var tlsRenewShown = false
     private var statusEpoch = 0L
     /** Broker whose confirm dialog is open — poll must not overwrite that switch mid-tap. */
     private var dialogBroker: String? = null
@@ -140,6 +140,19 @@ class MainActivity : AppCompatActivity() {
     private fun updateSetupOverlay() {
         val show = needsSetup()
         binding.setupOverlay.visibility = if (show) View.VISIBLE else View.GONE
+    }
+
+    private fun showTlsRenewDialog() {
+        if (tlsRenewShown || isFinishing) return
+        tlsRenewShown = true
+        AlertDialog.Builder(this)
+            .setTitle(R.string.tls_pin_renew_title)
+            .setMessage(R.string.tls_pin_renew_body)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.open_companion_settings) { _, _ ->
+                startActivity(Intent(this, SettingsActivity::class.java))
+            }
+            .show()
     }
 
     private fun startPolling() {
@@ -607,9 +620,21 @@ class MainActivity : AppCompatActivity() {
                     }
                     else -> e.message ?: e.javaClass.simpleName
                 }
-                binding.statusLine.text = "Offline / stale: $detail"
-                binding.bannerLine.text = "Desktop offline or not publishing yet"
-                binding.controlsHint.setText(R.string.controls_hint_offline)
+                val isTls = e is MonitorApiException && e.kind == MonitorApiException.KIND_TLS
+                binding.statusLine.text = if (isTls) {
+                    "TLS pin expired: $detail"
+                } else {
+                    "Offline / stale: $detail"
+                }
+                binding.bannerLine.text = if (isTls) {
+                    "Renew TLS fingerprint — scan the PC setup QR"
+                } else {
+                    "Desktop offline or not publishing yet"
+                }
+                binding.controlsHint.setText(
+                    if (isTls) R.string.tls_pin_renew_hint else R.string.controls_hint_offline,
+                )
+                if (isTls) showTlsRenewDialog()
                 markMetricsStale()
                 syncingUi = true
                 for (row in brokerRows) {

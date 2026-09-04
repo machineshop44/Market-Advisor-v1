@@ -214,6 +214,7 @@ def propose(
     engine: str = "",
     reason: str = "entry",
     ttl_sec: int = DEFAULT_TTL_SEC,
+    regime_caution: bool = False,
 ) -> dict | None:
     """Create or refresh a pending proposal for broker+ticker."""
     broker_s = str(broker or "").strip()
@@ -238,6 +239,7 @@ def propose(
                 p["score"] = float(score or 0)
                 p["engine"] = str(engine or "")
                 p["reason"] = str(reason or "entry")
+                p["regime_caution"] = bool(regime_caution)
                 p["updated_at"] = now
                 p["expires_at"] = now + float(ttl_sec or DEFAULT_TTL_SEC)
                 _save(data)
@@ -252,6 +254,7 @@ def propose(
             "score": float(score or 0),
             "engine": str(engine or ""),
             "reason": str(reason or "entry"),
+            "regime_caution": bool(regime_caution),
             "status": "pending",
             "created_at": now,
             "updated_at": now,

@@ -37,6 +37,45 @@ _models_cache: dict[str, tuple[float, list[str]]] = {}
 _MODELS_CACHE_TTL = 300.0
 _last_gemini_model_used = ""
 
+# Free-tier Gemini budgets (override via settings)
+_ai_call_times: list[float] = []
+_ai_day_key: str = ""
+_ai_day_count: int = 0
+
+
+def _ai_budget_ok(settings: dict | None) -> tuple[bool, str]:
+    """Enforce per-minute / per-day caps so free Gemini isn't burned in one burst."""
+    global _ai_day_key, _ai_day_count
+    s = settings or {}
+    try:
+        per_min = int(s.get("advisor_ai_max_per_minute") or 4)
+    except (TypeError, ValueError):
+        per_min = 4
+    try:
+        per_day = int(s.get("advisor_ai_max_per_day") or 20)
+    except (TypeError, ValueError):
+        per_day = 20
+    per_min = max(1, min(60, per_min))
+    per_day = max(1, min(500, per_day))
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    if day != _ai_day_key:
+        _ai_day_key = day
+        _ai_day_count = 0
+    if _ai_day_count >= per_day:
+        return False, f"daily AI budget ({per_day}/day) exhausted — local rules"
+    while _ai_call_times and now - _ai_call_times[0] > 60.0:
+        _ai_call_times.pop(0)
+    if len(_ai_call_times) >= per_min:
+        return False, f"per-minute AI budget ({per_min}/min) — local rules"
+    return True, ""
+
+
+def _ai_budget_record():
+    global _ai_day_count
+    _ai_call_times.append(time.time())
+    _ai_day_count += 1
+
 
 def resolve_ai_source(settings: dict | None) -> str:
     """One of: local | gemini | openai (pick exactly one for trade briefs)."""
@@ -54,9 +93,19 @@ def ai_enabled(settings: dict | None) -> bool:
     return resolve_ai_source(settings) != "local"
 
 
+def resolve_api_key(settings: dict | None = None) -> str:
+    """Prefer OS keyring; fall back to settings.json plaintext (legacy)."""
+    try:
+        import credentials as cred
+
+        return cred.resolve_advisor_api_key(settings)
+    except Exception:
+        return str((settings or {}).get("advisor_ai_api_key") or "").strip()
+
+
 def ai_configured(settings: dict | None) -> bool:
     s = settings or {}
-    return ai_enabled(s) and bool(str(s.get("advisor_ai_api_key") or "").strip())
+    return ai_enabled(s) and bool(resolve_api_key(s))
 
 
 def _provider(settings: dict | None) -> str:
@@ -85,6 +134,119 @@ def _clamp_verdict(v: str) -> str:
     return VERDICT_WAIT
 
 
+_research_cache: dict[str, tuple[float, dict]] = {}
+_RESEARCH_TTL_SEC = 120.0
+
+
+def build_research_pack(proposal: dict, context: dict | None = None) -> dict:
+    """
+    Fresh facts for Gemini — not model web search. We gather; the model judges.
+    Cached ~2 min per ticker so auto-apply bursts stay snappy.
+    """
+    tick = str(proposal.get("ticker") or "").replace("-USD", "").upper().strip()
+    if not tick:
+        return {"ok": False, "notes": ["no ticker"]}
+    now = time.time()
+    hit = _research_cache.get(tick)
+    if hit and now - float(hit[0] or 0.0) < _RESEARCH_TTL_SEC:
+        return dict(hit[1])
+
+    ctx = context or {}
+    is_crypto = "crypto" in str(proposal.get("asset_type") or "").lower() or bool(
+        proposal.get("is_crypto")
+    )
+    yahoo = f"{tick}-USD" if is_crypto else tick
+    pack: dict[str, Any] = {
+        "ticker": tick,
+        "yahoo_symbol": yahoo,
+        "ok": True,
+        "price_action": {},
+        "book_history": {},
+        "regime": ctx.get("regime"),
+        "notes": [],
+    }
+
+    # Price / volume — short history only (worker thread; still keep it light)
+    try:
+        import yfinance as yf
+
+        df = yf.Ticker(yahoo).history(period="5d", interval="1d")
+        if df is not None and len(df) >= 2:
+            closes = [float(x) for x in df["Close"].tolist() if x == x]
+            vols = []
+            if "Volume" in df.columns:
+                vols = [float(x) for x in df["Volume"].tolist() if x == x]
+            if len(closes) >= 2 and closes[-2] > 0:
+                chg = (closes[-1] / closes[-2] - 1.0) * 100.0
+                pack["price_action"]["last_close"] = round(closes[-1], 6)
+                pack["price_action"]["day_chg_pct"] = round(chg, 2)
+                pack["notes"].append(f"1d change {chg:+.1f}%")
+            if len(closes) >= 3 and closes[0] > 0:
+                chg5 = (closes[-1] / closes[0] - 1.0) * 100.0
+                pack["price_action"]["chg_5d_pct"] = round(chg5, 2)
+                pack["notes"].append(f"~5d change {chg5:+.1f}%")
+            if len(vols) >= 2 and vols[-2] > 0:
+                vratio = vols[-1] / vols[-2]
+                pack["price_action"]["vol_vs_prior"] = round(vratio, 2)
+                if vratio >= 1.5:
+                    pack["notes"].append("volume elevated vs prior day")
+                elif vratio <= 0.6:
+                    pack["notes"].append("volume light vs prior day")
+        else:
+            pack["notes"].append("no recent daily bars")
+    except Exception as e:
+        pack["notes"].append(f"price fetch limited: {str(e)[:80]}")
+
+    # Our own fills for this name — cheap "did we already get burned?" signal
+    try:
+        import journal as journal_mod
+
+        rows = journal_mod.read_since_days(days=14, limit=1500)
+        buys = sells = 0
+        pnlish = 0.0
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            t = str(r.get("ticker") or "").replace("-USD", "").upper()
+            if t != tick:
+                continue
+            side = str(r.get("side") or r.get("action") or "").upper()
+            if side.startswith("BUY") or side == "BUY":
+                buys += 1
+            elif side.startswith("SELL") or side == "SELL":
+                sells += 1
+            try:
+                pnlish += float(r.get("pnl") or r.get("realized_pnl") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        pack["book_history"] = {
+            "buys_14d": buys,
+            "sells_14d": sells,
+            "realized_pnl_hint": round(pnlish, 2),
+        }
+        if buys or sells:
+            pack["notes"].append(
+                f"desk traded {tick} {buys} buys / {sells} sells in 14d"
+                + (f" · pnl hint ${pnlish:+.2f}" if abs(pnlish) > 0.01 else "")
+            )
+        else:
+            pack["notes"].append(f"no desk fills on {tick} in 14d")
+    except Exception:
+        pack["notes"].append("journal history unavailable")
+
+    # Proposal / scanner crumbs already computed locally
+    try:
+        score = float(proposal.get("score") or 0)
+        pack["scanner_score"] = round(score, 1)
+    except (TypeError, ValueError):
+        pass
+    if proposal.get("regime_caution"):
+        pack["notes"].append("local regime caution on this name")
+
+    _research_cache[tick] = (now, pack)
+    return dict(pack)
+
+
 def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
     """Rule-based brief when no API key — still useful for beginners."""
     ctx = context or {}
@@ -104,11 +266,18 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
 
     reasons_skip = []
     reasons_ok = []
+    regime_caution = bool(proposal.get("regime_caution"))
 
     for blk in ctx.get("blockers") or []:
         code = str(blk.get("code") or "")
-        if code in ("halt", "offline", "reauth", "dd_pause", "low_bp", "regime_equity", "regime_crypto"):
-            reasons_skip.append(str(blk.get("message") or code))
+        msg = str(blk.get("message") or code)
+        if code in ("halt", "offline", "reauth", "dd_pause", "low_bp"):
+            reasons_skip.append(msg)
+        elif code in ("regime_equity", "regime_crypto"):
+            if regime_caution:
+                reasons_ok.append(f"SPY/BTC gate blocked scan — approve to override ({msg})")
+            else:
+                reasons_skip.append(msg)
 
     if dd_pause and not any("drawdown" in r.lower() or "dd" in r.lower() for r in reasons_skip):
         reasons_skip.append(f"drawdown pause active ({ctx.get('dd_reason') or 'peak/day DD'})")
@@ -170,7 +339,11 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def _proposal_prompt(proposal: dict, context: dict | None) -> str:
+def _proposal_prompt(
+    proposal: dict,
+    context: dict | None,
+    research: dict | None = None,
+) -> str:
     ctx = context or {}
     payload = {
         "proposal": proposal,
@@ -192,19 +365,24 @@ def _proposal_prompt(proposal: dict, context: dict | None) -> str:
             "auto_ready": ctx.get("auto_ready"),
             "summary": ctx.get("summary"),
         },
+        "research": research or {},
         "trader_note": (
             "Beginner auto-pilot desk. Small account. Explain simply. "
             "Your verdict may auto-execute under hard rails (DD/halt/min ticket). "
             "Be conservative: prefer skip/wait when unsure. Never override DD or halt. "
-            "Prefer fundable ticket sizes for the book."
+            "Prefer fundable ticket sizes for the book. "
+            "Use the research block (price action + desk fill history) — do not invent "
+            "headlines or numbers that are not in the data. Cite one research fact in detail."
         ),
     }
     return (
         "You are Desk Advisor for a beginner retail auto-trader (auto-pilot). "
+        "You receive a live research pack gathered by the app (not your own browsing). "
+        "Judge the trade using proposal + book + research. "
         "Reply with ONLY JSON: "
         '{"verdict":"approve|skip|wait","brief":"<=2 sentences plain English",'
-        '"detail":"one line why"}'
-        f"\n\nData:\n{json.dumps(payload, default=str)[:6000]}"
+        '"detail":"one line why (include one research fact)"}'
+        f"\n\nData:\n{json.dumps(payload, default=str)[:7500]}"
     )
 
 
@@ -375,17 +553,53 @@ def analyze_proposal(
     if not ai_configured(settings):
         return local_analyze_proposal(proposal, context)
 
-    key = str((settings or {}).get("advisor_ai_api_key") or "").strip()
+    # Clear local cases skip the cloud call (saves free-tier quota)
+    if bool((settings or {}).get("advisor_ai_local_when_clear", True)):
+        local = local_analyze_proposal(proposal, context)
+        score = float(proposal.get("score") or 0)
+        if local.get("verdict") == VERDICT_SKIP and score < 55:
+            local["detail"] = (
+                str(local.get("detail") or "") + " · cloud skipped (clear local skip)"
+            ).strip(" ·")[:500]
+            return local
+        if (
+            local.get("verdict") == VERDICT_APPROVE
+            and score >= 90
+            and not bool(proposal.get("regime_caution"))
+        ):
+            local["detail"] = (
+                str(local.get("detail") or "") + " · cloud skipped (clear local approve)"
+            ).strip(" ·")[:500]
+            return local
+
+    ok_budget, budget_why = _ai_budget_ok(settings)
+    if not ok_budget:
+        out = local_analyze_proposal(proposal, context)
+        out["source"] = "local_fallback"
+        out["error"] = budget_why
+        detail = str(out.get("detail") or "").strip()
+        out["detail"] = (f"{detail} · {budget_why}" if detail else budget_why)[:500]
+        return out
+
+    key = resolve_api_key(settings)
     provider = _provider(settings)
     model = _model(settings)
-    prompt = _proposal_prompt(proposal, context)
+    research = build_research_pack(proposal, context)
+    prompt = _proposal_prompt(proposal, context, research=research)
     try:
         raw = _call_openai(key, model, prompt) if provider == "openai" else _call_gemini(key, model, prompt)
+        _ai_budget_record()
         parsed = _extract_json_object(raw)
         if not parsed:
             out = local_analyze_proposal(proposal, context)
             out["source"] = "local_fallback"
             out["error"] = "AI response not JSON"
+            detail = str(out.get("detail") or "").strip()
+            out["detail"] = (
+                f"{detail} · cloud fail: AI response not JSON"
+                if detail else "cloud fail: AI response not JSON"
+            )[:500]
+            out["research"] = research
             return out
         return {
             "verdict": _clamp_verdict(parsed.get("verdict")),
@@ -393,11 +607,17 @@ def analyze_proposal(
             "detail": str(parsed.get("detail") or "")[:500],
             "source": provider,
             "ok": True,
+            "research": research,
         }
     except Exception as e:
         out = local_analyze_proposal(proposal, context)
         out["source"] = "local_fallback"
-        out["error"] = str(e)[:200]
+        err = str(e)[:200]
+        out["error"] = err
+        # Keep local brief; append why cloud failed so Journal/Activity can show it
+        detail = str(out.get("detail") or "").strip()
+        out["detail"] = (f"{detail} · cloud fail: {err}" if detail else f"cloud fail: {err}")[:500]
+        out["research"] = research
         return out
 
 
@@ -434,25 +654,32 @@ def analyze_desk_health(
 
     brief = issues[0]
     if ai_configured(settings):
-        try:
-            key = str((settings or {}).get("advisor_ai_api_key") or "").strip()
-            provider = _provider(settings)
-            model = _model(settings)
-            prompt = (
-                "Summarize this trading app issue for a beginner in ONE sentence. "
-                f"Issue context: {brief}. Recent log tail:\n" + "\n".join(lines[-8:])
-            )
-            raw = _call_openai(key, model, prompt) if provider == "openai" else _call_gemini(key, model, prompt)
-            if raw.strip():
-                return {
-                    "status": "warn",
-                    "brief": raw.strip()[:400],
-                    "source": provider,
-                    "ok": True,
-                    "at": time.time(),
-                }
-        except Exception:
-            pass
+        ok_budget, _why = _ai_budget_ok(settings)
+        if ok_budget:
+            try:
+                key = resolve_api_key(settings)
+                provider = _provider(settings)
+                model = _model(settings)
+                prompt = (
+                    "Summarize this trading app issue for a beginner in ONE sentence. "
+                    f"Issue context: {brief}. Recent log tail:\n" + "\n".join(lines[-8:])
+                )
+                raw = (
+                    _call_openai(key, model, prompt)
+                    if provider == "openai"
+                    else _call_gemini(key, model, prompt)
+                )
+                _ai_budget_record()
+                if raw.strip():
+                    return {
+                        "status": "warn",
+                        "brief": raw.strip()[:400],
+                        "source": provider,
+                        "ok": True,
+                        "at": time.time(),
+                    }
+            except Exception:
+                pass
 
     return {
         "status": "warn",
@@ -467,7 +694,7 @@ def test_connection(settings: dict | None) -> dict:
     """Settings → Test AI — lightweight ping."""
     if not ai_configured(settings):
         return {"ok": False, "error": "Enable AI and enter an API key first."}
-    key = str((settings or {}).get("advisor_ai_api_key") or "").strip()
+    key = resolve_api_key(settings)
     provider = _provider(settings)
     model = _model(settings)
     prompt = 'Reply JSON only: {"verdict":"wait","brief":"AI connection OK","detail":"test"}'

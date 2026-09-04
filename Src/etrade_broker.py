@@ -482,8 +482,8 @@ class ETradeAdapter(BaseBroker):
         if self.live_trading_enabled:
             return True, ""
         return False, (
-            "E*TRADE live trading is disabled (sandbox-first guard). "
-            "Enable etrade_live_trading in Settings after read-only validation."
+            "E*TRADE live trading is disabled. Arm Auto-Trader on a live E*TRADE "
+            "session (or enable Live orders in Settings)."
         )
 
     def _reject_crypto(self, ticker, asset_type):

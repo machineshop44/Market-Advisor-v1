@@ -9,8 +9,10 @@ import time
 from typing import Any
 
 from scoring import (
+    crypto_regime_required,
     describe_posture_for_broker,
     entry_regime_ok,
+    equity_regime_required,
     is_small_book,
     max_affordable_share_price,
     posture_knobs_for_broker,
@@ -144,6 +146,10 @@ def build_trader_context(
             "message": f"{broker_name} auto-trader disarmed",
         })
 
+    regime_blocks_entry = bool(
+        (supports_equities and regime_equity_ok is False and equity_regime_required(posture))
+        or (supports_crypto and regime_crypto_ok is False and crypto_regime_required(posture))
+    )
     hard_block = any(
         b["code"] in ("halt", "offline", "reauth", "dd_pause", "low_bp", "fully_deployed")
         for b in blockers
@@ -155,7 +161,7 @@ def build_trader_context(
         and not dd_paused
         and not hard_block
     )
-    auto_ready = bool(can_buy and armed)
+    auto_ready = bool(can_buy and armed and not regime_blocks_entry)
 
     afford_hint = (
         f"≤{max_share:.0f}/share whole"
@@ -214,9 +220,69 @@ def build_trader_context(
         "dd_mins_left": int(dd_mins_left or 0),
         "blockers": blockers,
         "can_place_new_buy": bool(can_buy),
+        "regime_blocks_entry": bool(regime_blocks_entry),
         "auto_ready": auto_ready,
         "summary": " · ".join(summary_parts)[:500],
     }
+
+
+def _regime_reason_short(reason: str) -> str:
+    text = str(reason or "").replace("DO NOT BUY (", "").rstrip(")").strip()
+    if "disagree" in text.lower():
+        return "sources disagree"
+    if "downtrend" in text.lower():
+        return "1H downtrend"
+    if "unavailable" in text.lower():
+        return "data unavailable"
+    return text[:48] if text else "blocked"
+
+
+def format_regime_chip(ctx: dict | None) -> tuple[str, str, str]:
+    """
+    Desk-wide regime strip for Home: (label, tooltip, css_color).
+    Growth/aggressive may skip SPY — show skipped state when gate not required.
+    """
+    ctx = ctx or {}
+    regime = ctx.get("regime") or {}
+    posture = str(ctx.get("posture") or "balanced")
+    eq_req = equity_regime_required(posture)
+    cr_req = crypto_regime_required(posture)
+    eq_ok = regime.get("equity_ok")
+    cr_ok = regime.get("crypto_ok")
+    parts = []
+    tips = []
+    blocked = False
+    if eq_req:
+        if eq_ok is True:
+            parts.append("SPY ok")
+        elif eq_ok is False:
+            blocked = True
+            why = _regime_reason_short(regime.get("equity_reason") or "")
+            parts.append(f"SPY {why}")
+            tips.append(f"Equity regime: {why}")
+        else:
+            parts.append("SPY …")
+    else:
+        parts.append("SPY skipped")
+        tips.append(f"Posture {posture}: SPY gate off for equities")
+    if cr_req:
+        if cr_ok is True:
+            parts.append("BTC ok")
+        elif cr_ok is False:
+            blocked = True
+            why = _regime_reason_short(regime.get("crypto_reason") or "")
+            parts.append(f"BTC {why}")
+            tips.append(f"Crypto regime: {why}")
+        else:
+            parts.append("BTC …")
+    elif ctx.get("broker") == "Coinbase" or cr_ok is not None:
+        parts.append("BTC turbulence only")
+    label = "Regime: " + " · ".join(parts)
+    tip = " · ".join(tips) if tips else label
+    if blocked:
+        tip += " · Advisor can propose past regime when you approve"
+    color = "#C62828" if blocked else ("#2E7D32" if parts else "#555")
+    return label, tip, color
 
 
 def build_from_monitor_status(status: dict | None, broker_name: str) -> dict[str, Any]:
@@ -243,8 +309,16 @@ def build_from_monitor_status(status: dict | None, broker_name: str) -> dict[str
         connected=bool(bro.get("connected", True)),
         halted=bool(st.get("halted")),
         reauth_needed=bool(bro.get("reauth_needed")),
-        supports_crypto=broker_name == "Coinbase",
-        supports_equities=broker_name != "Coinbase",
+        supports_crypto=bool(
+            bro.get("supports_crypto")
+            if "supports_crypto" in bro
+            else broker_name in ("Coinbase", "Robinhood")
+        ),
+        supports_equities=bool(
+            bro.get("supports_equities")
+            if "supports_equities" in bro
+            else broker_name != "Coinbase"
+        ),
         advisor_gate=bool((st.get("advisor") or {}).get("count", 0) >= 0),
     )
 
@@ -299,8 +373,12 @@ def format_trader_digest(by_broker: dict[str, dict], *, day_pnl: float | None = 
             continue
         if any(b.get("code") == "fully_deployed" for b in (ctx.get("blockers") or [])):
             flag = "DEPLOYED"
-        elif ctx.get("can_place_new_buy"):
+        elif ctx.get("regime_blocks_entry"):
+            flag = "REGIME"
+        elif ctx.get("auto_ready"):
             flag = "CAN BUY"
+        elif ctx.get("can_place_new_buy"):
+            flag = "PAUSED"
         else:
             flag = "BLOCKED"
         lines.append(f"  [{flag}] {ctx.get('summary') or name}")

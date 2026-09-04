@@ -6,6 +6,17 @@ import pickle
 import importlib
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
+try:
+    from crypto_symbols import KNOWN_CRYPTOS, is_known_crypto
+except Exception:  # pragma: no cover
+    KNOWN_CRYPTOS = frozenset({
+        "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
+        "FET", "AMP", "ADA", "DOT", "MATIC", "POL", "ATOM", "LTC", "BCH", "XRP", "NEAR", "AAVE",
+    })
+
+    def is_known_crypto(ticker):
+        return str(ticker or "").upper().replace("-USD", "").strip() in KNOWN_CRYPTOS
+
 
 # Coinbase Advanced REST: mirror etrade_client gap + retry (no OAuth inventing).
 _CB_MIN_REQUEST_GAP_SEC = 0.35
@@ -218,6 +229,109 @@ def _rh_parse_money_total(raw):
         return float(raw)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _rh_parse_qty(raw):
+    """Parse RH quantity leaf (string/number/{amount|value|quantity}) to float."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, dict):
+        for key in ("amount", "value", "quantity", "qty"):
+            if key not in raw:
+                continue
+            try:
+                v = float(raw.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rh_crypto_position_qty(pos):
+    """
+    Best total qty for a RH crypto position.
+
+    Prefer total quantity, then available, then locked/held-for-sell so Portfolio
+    matches equity when RH nests amounts as {amount: "..."} or splits fields.
+    """
+    if not isinstance(pos, dict):
+        return 0.0
+    keys = (
+        "quantity",
+        "quantity_available",
+        "quantity_available_for_trading",
+        "quantity_held_for_sells",
+        "quantity_held_for_buys",
+        "quantity_held_for_buy",
+        "qty",
+    )
+    best = 0.0
+    for key in keys:
+        if key not in pos:
+            continue
+        q = _rh_parse_qty(pos.get(key))
+        if q > best:
+            best = q
+    # Some payloads nest under "crypto" / "asset"
+    for nest_key in ("crypto", "asset", "position"):
+        nested = pos.get(nest_key)
+        if isinstance(nested, dict):
+            q = _rh_crypto_position_qty(nested)
+            if q > best:
+                best = q
+    return best
+
+
+def _rh_crypto_symbol(pos):
+    """Symbol from RH crypto position (currency object or code fields)."""
+    if not isinstance(pos, dict):
+        return ""
+    cur = pos.get("currency")
+    if isinstance(cur, dict):
+        symbol = cur.get("code") or cur.get("id") or cur.get("name") or ""
+    else:
+        symbol = str(cur or "")
+    if not symbol:
+        for key in ("currency_code", "asset_currency", "symbol", "code"):
+            raw = pos.get(key)
+            if isinstance(raw, dict):
+                symbol = raw.get("code") or raw.get("id") or ""
+            elif raw:
+                symbol = str(raw)
+            if symbol:
+                break
+    return str(symbol or "").replace("-USD", "").strip().upper()
+
+
+def _rh_account_buying_power(acc):
+    """
+    Best liquid BP from an RH account profile.
+
+    Stock `buying_power` is often $0 when cash sits in crypto buying power /
+    withdrawable cash — painting Home BP $0 while equity still shows ~$100.
+    """
+    if not isinstance(acc, dict):
+        return 0.0
+    best = 0.0
+    for key in (
+        "buying_power",
+        "crypto_buying_power",
+        "cash",
+        "cash_available_for_withdrawal",
+        "portfolio_cash",
+        "cash_held_for_options_collateral",  # rarely useful; skipped if 0
+    ):
+        if key == "cash_held_for_options_collateral":
+            continue
+        v = _rh_parse_money_total(acc.get(key))
+        if v > best:
+            best = v
+    return best
 
 
 def _rh_cost_bases_list_total(cb_list):
@@ -515,10 +629,14 @@ class RobinhoodAdapter(BaseBroker):
         acc = r.profiles.load_account_profile()
         if not isinstance(acc, dict):
             raise RuntimeError("Robinhood account profile unavailable")
-        portfolio_value = float(acc.get('portfolio_equity', 0) or acc.get('equity', 0) or 0.0)
-        cash = max(float(acc.get('buying_power', 0) or 0), float(acc.get('cash', 0) or 0))
+        portfolio_value = _rh_parse_money_total(acc.get("portfolio_equity"))
+        if portfolio_value <= 0.0:
+            portfolio_value = _rh_parse_money_total(acc.get("equity"))
+        cash = _rh_account_buying_power(acc)
 
-        if portfolio_value == 0.0:
+        # Profile equity already includes stocks + crypto on modern RH. Only
+        # synthesize when the profile prints $0 (classic empty/glitch path).
+        if portfolio_value <= 0.0:
             holdings = r.build_holdings()
             if isinstance(holdings, dict):
                 for t, d in holdings.items():
@@ -528,36 +646,33 @@ class RobinhoodAdapter(BaseBroker):
                         d.get('equity', 0)
                         or (float(d.get('quantity', 0) or 0) * float(d.get('price', 0) or 0))
                     )
-            portfolio_value += cash
-
-        crypto_positions = r.crypto.get_crypto_positions()
-        if crypto_positions:
-            for pos in crypto_positions:
-                if not isinstance(pos, dict):
-                    continue
-                qty = float(pos.get('quantity', 0) or 0)
-                if qty > 0:
-                    cur = pos.get('currency')
-                    if isinstance(cur, dict):
-                        symbol = cur.get('code') or cur.get('id') or ""
-                    else:
-                        symbol = str(cur or "")
+            crypto_positions = r.crypto.get_crypto_positions()
+            if crypto_positions:
+                for pos in crypto_positions:
+                    if not isinstance(pos, dict):
+                        continue
+                    qty = _rh_crypto_position_qty(pos)
+                    if qty <= 0:
+                        continue
+                    symbol = _rh_crypto_symbol(pos)
                     if not symbol:
                         continue
                     live_price = self.get_live_price(symbol)
                     portfolio_value += (qty * live_price)
+            portfolio_value += cash
         return portfolio_value, cash
 
     def get_current_holdings(self):
         assets = []
-        if not self.is_connected: return assets
+        if not self.is_connected:
+            return assets
         try:
             holdings = r.build_holdings()
             if isinstance(holdings, dict):
                 for ticker, data in holdings.items():
                     if not isinstance(data, dict):
                         continue
-                    qty = float(data.get('quantity', 0) or 0)
+                    qty = _rh_parse_qty(data.get("quantity"))
                     if qty > 0:
                         cost = float(data.get('average_buy_price', 0) or 0)
                         assets.append({
@@ -566,7 +681,10 @@ class RobinhoodAdapter(BaseBroker):
                             'cost': cost,
                             'type': 'Ready (Stock)',
                         })
-        except Exception: pass
+            elif holdings is not None:
+                print(f"Robinhood build_holdings unexpected type: {type(holdings)}")
+        except Exception as e:
+            print(f"Robinhood build_holdings error: {e}")
 
         try:
             crypto_positions = r.crypto.get_crypto_positions()
@@ -574,20 +692,9 @@ class RobinhoodAdapter(BaseBroker):
                 for pos in crypto_positions:
                     if not isinstance(pos, dict):
                         continue
-                    try:
-                        qty = float(
-                            pos.get("quantity")
-                            or pos.get("quantity_available")
-                            or 0
-                        )
-                    except (TypeError, ValueError):
-                        qty = 0.0
+                    qty = _rh_crypto_position_qty(pos)
                     if qty > 0:
-                        cur = pos.get('currency')
-                        if isinstance(cur, dict):
-                            symbol = cur.get('code') or cur.get('id') or ""
-                        else:
-                            symbol = str(cur or "")
+                        symbol = _rh_crypto_symbol(pos)
                         if not symbol:
                             continue
                         mark = _rh_pos_mark_price(pos)
@@ -608,11 +715,11 @@ class RobinhoodAdapter(BaseBroker):
                             seeded = _get_seeded_cost("ROBINHOOD", symbol)
                             if seeded > 0:
                                 avg_cost = seeded
-                                print(f"[Robinhood] Cost basis seeded for {str(symbol).replace('-USD', '').upper()}: ${avg_cost}")
+                                print(f"[Robinhood] Cost basis seeded for {symbol}: ${avg_cost}")
                         # -----------------------------------
 
                         row = {
-                            'ticker': str(symbol).replace("-USD", "").upper(),
+                            'ticker': symbol,
                             'shares': qty,
                             'cost': avg_cost,
                             'type': 'Ready (Crypto)',
@@ -621,13 +728,13 @@ class RobinhoodAdapter(BaseBroker):
                             row['price'] = mark
                             row['mark'] = mark
                         assets.append(row)
-        except Exception: pass
+        except Exception as e:
+            print(f"Robinhood get_crypto_positions error: {e}")
         return assets
 
     def get_live_price(self, ticker, allow_yahoo_fallback=True):
         clean = str(ticker).replace("-USD", "").upper()
-        cryptos = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
-        if clean in cryptos:
+        if clean in KNOWN_CRYPTOS:
             try:
                 q = r.crypto.get_crypto_quote(clean)
                 if isinstance(q, dict):
@@ -654,31 +761,46 @@ class RobinhoodAdapter(BaseBroker):
 
     def _get_crypto_order_limits(self, ticker):
         """Return (qty_increment, min_order_qty) for Robinhood crypto."""
-        if not hasattr(self, '_crypto_limits_cache'):
+        if not hasattr(self, "_crypto_limits_cache"):
             self._crypto_limits_cache = {}
-        if ticker in self._crypto_limits_cache:
-            return self._crypto_limits_cache[ticker]
-        inc = self._get_crypto_qty_increment(ticker)
+        now = time.time()
+        hit = self._crypto_limits_cache.get(ticker)
+        # (ts, inc, min_qty) — 1h TTL; never stick forever on a bad default
+        if isinstance(hit, tuple) and len(hit) == 3 and now - float(hit[0] or 0) < 3600.0:
+            return float(hit[1]), float(hit[2])
+        # Legacy 2-tuple cache from older builds
+        if isinstance(hit, tuple) and len(hit) == 2:
+            return float(hit[0]), float(hit[1])
+
+        pepe_like = str(ticker).upper() in ("PEPE", "SHIB", "BONK")
+        inc = 1.0 if pepe_like else 0.000001
         min_qty = inc
         try:
             raw_info = r.crypto.get_crypto_info(ticker)
             info = raw_info if isinstance(raw_info, dict) else {}
-            for key in ('min_order_size', 'crypto_min_order_size', 'min_order_quantity', 'min_order_quantity_increment'):
+            raw_inc = info.get("min_order_quantity_increment")
+            if raw_inc is not None and float(raw_inc) > 0:
+                inc = float(raw_inc)
+                min_qty = inc
+            for key in (
+                "min_order_size",
+                "crypto_min_order_size",
+                "min_order_quantity",
+            ):
                 raw = info.get(key)
                 if raw is None:
                     continue
                 val = float(raw)
-                if key.endswith('increment'):
-                    if val > 0:
-                        inc = val
-                elif val > 0:
+                if val > 0:
                     min_qty = max(min_qty, val)
-            # Some RH pairs expose min only via increment that is already the practical floor
             if min_qty < inc:
                 min_qty = inc
+            self._crypto_limits_cache[ticker] = (now, inc, min_qty)
+            self._crypto_inc_cache[ticker] = inc
         except Exception:
-            pass
-        self._crypto_limits_cache[ticker] = (inc, min_qty)
+            # Short negative TTL so a transient API blip doesn't stick all day
+            self._crypto_limits_cache[ticker] = (now - 3500.0, inc, min_qty)
+            self._crypto_inc_cache[ticker] = inc
         return inc, min_qty
 
     def position_is_dust(self, ticker, shares, price, asset_type=""):
@@ -691,9 +813,7 @@ class RobinhoodAdapter(BaseBroker):
         if shares <= 0 or price <= 0:
             return True, "invalid size/price"
 
-        is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in {
-            "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"
-        }
+        is_crypto = "crypto" in str(asset_type).lower() or is_known_crypto(ticker)
         notional = shares * price
         if is_crypto:
             inc, min_qty = self._get_crypto_order_limits(ticker)
@@ -760,8 +880,11 @@ class RobinhoodAdapter(BaseBroker):
         """
         Return (ok, instrument_id_or_none, reason).
         ok=False when RH has no tradeable instrument for this symbol (OTC/delisted).
+        Crypto must never use this — RH crypto has no equity instrument id.
         """
         clean = str(ticker).replace("-USD", "").upper().strip()
+        if clean in KNOWN_CRYPTOS:
+            return True, None, ""
         try:
             from robin_stocks.robinhood.stocks import id_for_stock
             iid = id_for_stock(clean)
@@ -781,14 +904,10 @@ class RobinhoodAdapter(BaseBroker):
         )
 
     def _get_crypto_qty_increment(self, ticker):
-        if ticker not in self._crypto_inc_cache:
-            try:
-                info = r.crypto.get_crypto_info(ticker)
-                inc = info.get('min_order_quantity_increment')
-                self._crypto_inc_cache[ticker] = float(inc) if inc else (1.0 if ticker in ["PEPE", "SHIB", "BONK"] else 0.000001)
-            except Exception:
-                self._crypto_inc_cache[ticker] = 1.0 if ticker in ["PEPE", "SHIB", "BONK"] else 0.000001
-        return self._crypto_inc_cache[ticker]
+        if ticker in self._crypto_inc_cache:
+            return self._crypto_inc_cache[ticker]
+        inc, _min = self._get_crypto_order_limits(ticker)
+        return float(inc)
 
     def _rh_place_fractional_order(self, symbol, quantity, side, use_ext_hours=False, time_in_force="gfd"):
         """
@@ -852,7 +971,7 @@ class RobinhoodAdapter(BaseBroker):
 
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
                         market_hours="regular_hours", allow_fractional=True):
-        is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
+        is_crypto = "crypto" in asset_type.lower() or is_known_crypto(ticker)
         if is_crypto:
             inc, min_qty = self._get_crypto_order_limits(ticker)
             d_inc = Decimal(str(inc))
@@ -1056,14 +1175,9 @@ class RobinhoodAdapter(BaseBroker):
                 for pos in positions:
                     if not isinstance(pos, dict):
                         continue
-                    cur = pos.get("currency")
-                    if isinstance(cur, dict):
-                        symbol = (cur.get("code") or cur.get("id") or "").upper()
-                    else:
-                        symbol = str(cur or "").upper()
-                    if symbol != clean:
+                    if _rh_crypto_symbol(pos) != clean:
                         continue
-                    qty = float(pos.get("quantity", 0) or 0)
+                    qty = _rh_crypto_position_qty(pos)
                     if qty > 0:
                         return qty
                 return None
@@ -1088,7 +1202,7 @@ class RobinhoodAdapter(BaseBroker):
 
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
                          market_hours="regular_hours", allow_fractional=True, sell_all=False):
-        is_crypto = "crypto" in asset_type.lower() or ticker.upper() in {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
+        is_crypto = "crypto" in asset_type.lower() or is_known_crypto(ticker)
         # RH has no native sell-all endpoint — refresh live qty and never int-truncate fractionals.
         if sell_all:
             live_qty = self._live_sellable_qty(ticker, is_crypto)
@@ -1343,9 +1457,7 @@ class RobinhoodAdapter(BaseBroker):
         RH equities: prefer trailing stop at hard_stop % (disaster trail), else fixed stop-loss.
         RH crypto: no stop API — caller keeps software TTP.
         """
-        is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in {
-            "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"
-        }
+        is_crypto = "crypto" in str(asset_type).lower() or is_known_crypto(ticker)
         if is_crypto:
             return False, None, "RH crypto has no stop/trailing API — software TTP only"
         try:

@@ -162,14 +162,17 @@ def ensure_tls_material(
     *,
     extra_ips: list[str] | None = None,
     refresh_lan_sans: bool = True,
+    force_rotate: bool = False,
 ) -> tuple[Path, Path, str]:
     """
     Ensure cert.pem + key.pem exist. Returns (cert, key, sha256_fingerprint).
 
-    When refresh_lan_sans is True and an existing cert is missing the current
-    private LAN IP(s), regenerate so phone HTTPS to https://<lan-ip>:port/ works.
-    Regenerating changes the fingerprint — companion QR / pin must be re-scanned
-    (same flow as first setup; pinning is not bypassed).
+    Existing certs are kept by default. Auto-regenerating when a new LAN IP
+    appears used to change the SHA-256 pin and make the Android companion look
+    "offline" on every network. Companion trusts the pin, not hostname SANs.
+
+    Set force_rotate=True (Settings → Rotate TLS cert) when you intentionally
+    want a new pin — phones must rescan the setup QR afterward.
     """
     _DIR.mkdir(parents=True, exist_ok=True)
     wanted = set()
@@ -178,22 +181,13 @@ def ensure_tls_material(
         if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
             wanted.add(ip)
 
-    if CERT_FILE.is_file() and KEY_FILE.is_file():
+    if CERT_FILE.is_file() and KEY_FILE.is_file() and not force_rotate:
         try:
             pem = CERT_FILE.read_bytes()
             fp = read_fingerprint() or fingerprint_from_pem(pem)
             if not fp:
                 fp = fingerprint_from_pem(pem)
                 FINGERPRINT_FILE.write_text(fp + "\n", encoding="utf-8")
-            have = cert_san_ips(pem)
-            missing = wanted - have if refresh_lan_sans else set()
-            # Always require loopback SAN on healthy certs
-            if "127.0.0.1" not in have:
-                missing.add("127.0.0.1")
-            if not missing:
-                return CERT_FILE, KEY_FILE, fp
-            # Stale localhost-only cert → regenerate with LAN SANs
-            fp = _write_cert_pair(common_name, extra_ips=list(wanted) or list(extra_ips or []))
             return CERT_FILE, KEY_FILE, fp
         except Exception:
             pass

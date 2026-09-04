@@ -19,39 +19,3 @@ def fetch_current_price(ticker_symbol):
         pass
 
     return 0.0
-
-
-def fetch_historical_data(ticker_symbol, period="1y"):
-    """Fetches historical data with fallback mechanisms."""
-    import pandas as pd
-
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period=period)
-        if hist is not None and not hist.empty:
-            return hist
-    except Exception:
-        pass
-
-    try:
-        import robin_stocks.robinhood as r
-        span_map = {"1mo": "month", "3mo": "3month", "6mo": "3month", "1y": "year", "2y": "5year"}
-        span = span_map.get(period, "year")
-
-        historicals = r.stocks.get_stock_historicals(ticker_symbol, interval="day", span=span)
-        if historicals and isinstance(historicals, list) and len(historicals) > 0:
-            df = pd.DataFrame(historicals)
-            df['Close'] = df['close_price'].astype(float)
-            df['Open'] = df['open_price'].astype(float)
-            df['High'] = df['high_price'].astype(float)
-            df['Low'] = df['low_price'].astype(float)
-            df['Volume'] = df['volume'].astype(float)
-            if 'begins_at' in df.columns:
-                df['Date'] = pd.to_datetime(df['begins_at'])
-                df.set_index('Date', inplace=True)
-            return df[['Open', 'High', 'Low', 'Close', 'Volume']]
-    except Exception:
-        pass
-
-    return pd.DataFrame()

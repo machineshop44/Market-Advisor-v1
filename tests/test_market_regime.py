@@ -17,6 +17,8 @@ class TestMarketRegimeFailClosed(unittest.TestCase):
         scoring._broker_price_samples = {}
         scoring._broker_hourly_closes = {}
         scoring._broker_last_sample_ts = {}
+        scoring._market_regime_result_cache = {}
+        scoring._yahoo_regime_cache = {}
 
     def test_yahoo_fail_broker_fail_no_last_good_blocks(self):
         import scoring
@@ -139,6 +141,21 @@ class TestBtcProxyRegime(unittest.TestCase):
         self.assertTrue(ok)
         mreg.assert_not_called()
         self.assertEqual(why, "")
+
+    def test_evaluate_opportunity_growth_skips_spy_gate(self):
+        import scoring
+        with patch("scoring.fetch_current_price", return_value=100.0), \
+             patch("scoring.market_regime_ok", return_value=(False, "DO NOT BUY (Regime: SPY 1H Downtrend)")) as mreg, \
+             patch("scoring._check_hysteresis", return_value=(True, "")), \
+             patch("scoring._get_trend_data") as trend:
+            trend.side_effect = [
+                (None, True, None, None),  # 60m macro uptrend
+                (True, None, 50.0, True),  # micro bullish, rsi, volume
+            ]
+            action = scoring.evaluate_opportunity("AAPL", posture="growth")
+        self.assertIn("BUY", action)
+        self.assertNotIn("DO NOT BUY", action)
+        mreg.assert_not_called()
 
     def test_small_book_prefers_breakouts(self):
         import scoring

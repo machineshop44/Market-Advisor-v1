@@ -85,6 +85,7 @@ def upsert_candidates(
             "asset_type": str(c.get("asset_type") or c.get("type") or ""),
             "is_crypto": bool(c.get("is_crypto"))
             or "crypto" in str(c.get("asset_type") or c.get("type") or "").lower(),
+            "regime_caution": bool(c.get("regime_caution")),
             "ts": now,
         }
 

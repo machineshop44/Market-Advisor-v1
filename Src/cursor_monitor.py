@@ -23,10 +23,23 @@ def generate_token() -> str:
 
 def ensure_token(settings: dict | None) -> str:
     s = settings or {}
-    tok = str(s.get("cursor_monitor_token") or "").strip()
+    try:
+        import credentials as cred
+
+        tok = cred.resolve_cursor_monitor_token(s)
+    except Exception:
+        tok = str(s.get("cursor_monitor_token") or "").strip()
     if tok:
+        s["cursor_monitor_token"] = tok
         return tok
-    return generate_token()
+    tok = generate_token()
+    try:
+        import credentials as cred
+
+        cred.persist_cursor_monitor_token(tok, s)
+    except Exception:
+        s["cursor_monitor_token"] = tok
+    return tok
 
 
 def monitor_base_url(settings: dict | None) -> str:

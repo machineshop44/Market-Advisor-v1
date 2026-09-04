@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "market-advisor": {
+      "command": "py",
+      "args": ["tools/market_advisor_mcp.py"],
+      "env": {
+        "MARKET_ADVISOR_URL": "https://127.0.0.1:8791",
+        "MARKET_ADVISOR_TOKEN": "PASTE_TOKEN_FROM_MARKET_ADVISOR_SETTINGS",
+        "MARKET_ADVISOR_VERIFY_TLS": "false"
+      }
+    }
+  }
+}

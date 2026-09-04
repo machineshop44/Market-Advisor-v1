@@ -1,3 +1,4 @@
+keyring
 PyQt5
 yfinance
 pandas

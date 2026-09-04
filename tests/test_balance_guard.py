@@ -257,32 +257,59 @@ class TestDayLossTripConfirm(unittest.TestCase):
         )
 
 
-    def test_holdings_do_not_block_day_loss_trip_confirm(self):
+    def test_sep1_buy_lag_never_confirms(self):
         from balance_guard import decide_suspicious_equity
 
-        # Real mark-to-market while still holding names must be confirmable
-        d1 = decide_suspicious_equity(
-            78.23,
-            88.81,
-            87.66,
-            last_trusted=88.81,
-            holdings_count=4,
-            bad_streak=0,
-            loss_limit=8.0,
-        )
-        self.assertEqual(d1["action"], "keep")
-        self.assertIn("day-loss trip", d1["reason"].lower())
-        d3 = decide_suspicious_equity(
-            78.23,
-            88.81,
-            87.66,
-            last_trusted=88.81,
-            holdings_count=4,
+        # Exact weekend numbers from activity_log
+        d = decide_suspicious_equity(
+            81.85, 100.49, 100.49,
+            last_trusted=100.49,
             bad_streak=2,
-            loss_limit=8.0,
+            loss_limit=5.0,
+            recent_buy_notional=18.64,
         )
-        self.assertEqual(d3["action"], "accept")
-        self.assertTrue(d3["trusted"])
+        self.assertEqual(d["action"], "keep")
+        self.assertFalse(d["trusted"])
+        self.assertIn("buy", d["reason"].lower())
+
+    def test_phantom_day_pnl_cash_to_holdings(self):
+        from balance_guard import day_pnl_looks_like_cash_to_holdings_baseline
+
+        # Live desk: RH eq 81.54, BP 63.39, BTC~18.15, Day P&L -18.95 — no sell
+        self.assertTrue(
+            day_pnl_looks_like_cash_to_holdings_baseline(
+                81.54, 63.39, 18.15, -18.95
+            )
+        )
+        # Real mark loss with cash still matching book shouldn't match holdings size
+        self.assertFalse(
+            day_pnl_looks_like_cash_to_holdings_baseline(
+                81.54, 63.39, 18.15, -2.00
+            )
+        )
+        # Book inconsistent (missing holdings in equity) — don't auto-rebase
+        self.assertFalse(
+            day_pnl_looks_like_cash_to_holdings_baseline(
+                81.54, 63.39, 40.0, -18.95
+            )
+        )
+
+    def test_ghost_zero_buying_power(self):
+        from balance_guard import buying_power_looks_unreliable, repair_buying_power
+
+        # Screenshot case: equity ~100, holdings ~18, BP painted $0
+        self.assertTrue(
+            buying_power_looks_unreliable(100.49, 0.0, holdings_value=18.15, prior_bp=63.0)
+        )
+        fixed = repair_buying_power(100.49, 0.0, holdings_value=18.15, prior_bp=63.0)
+        self.assertGreaterEqual(fixed, 63.0)
+        # Prefer prior BP over inflated implied when holdings snapshot missing
+        fixed2 = repair_buying_power(100.49, 0.0, holdings_value=0.0, prior_bp=63.0)
+        self.assertAlmostEqual(fixed2, 63.0)
+        # Fully invested book — BP $0 is legitimate
+        self.assertFalse(
+            buying_power_looks_unreliable(50.0, 0.0, holdings_value=50.0, prior_bp=0.0)
+        )
 
 
 if __name__ == "__main__":

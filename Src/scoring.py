@@ -106,7 +106,7 @@ FEE_PROFILES = {
     },
 }
 
-CRYPTO_TICKERS = {"BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI"}
+from crypto_symbols import KNOWN_CRYPTOS as CRYPTO_TICKERS
 
 # Hold bias / less churn (FinRL: prefer no-trade; crypto OW fees ~0.95–1.2%)
 CRYPTO_COOLDOWN = 20 * 60   # 20 minutes after selling crypto (was 10m)
@@ -2663,17 +2663,30 @@ def _closes_above_ema(closes, confirm_bars=REGIME_CONFIRM_BARS, buffer=REGIME_EM
     return True
 
 
+_yahoo_regime_cache: dict = {}
+_market_regime_result_cache: dict = {}
+_MARKET_REGIME_RESULT_TTL = 45.0
+
+
 def _yahoo_regime_vote(proxy, period):
     """
     Source 1 — Yahoo 1H closed bars vs EMA20.
     Returns (available, ok, last_ema20_or_none, detail).
+    Cached ~90s so monitor/Home rebuilds do not re-hit Yahoo every few seconds.
     """
+    key = (str(proxy or ""), str(period or ""))
+    now = time.time()
+    hit = _yahoo_regime_cache.get(key)
+    if hit and now - float(hit[0] or 0.0) < 90.0:
+        return hit[1]
     try:
         df = _get_yf().Ticker(proxy).history(period=period, interval="60m")
         df = _closed_bars(df)
         need = 20 + REGIME_CONFIRM_BARS
         if df is None or df.empty or len(df) < need:
-            return False, False, None, "yahoo empty"
+            out = (False, False, None, "yahoo empty")
+            _yahoo_regime_cache[key] = (now, out)
+            return out
         ema20 = df["Close"].ewm(span=20, adjust=False).mean()
         last_ema = float(ema20.iloc[-1])
         thresh = 1.0 + REGIME_EMA_BUFFER
@@ -2682,9 +2695,13 @@ def _yahoo_regime_vote(proxy, period):
             if float(df["Close"].iloc[i]) <= float(ema20.iloc[i]) * thresh:
                 ok = False
                 break
-        return True, ok, last_ema, "yahoo 1H"
+        out = (True, ok, last_ema, "yahoo 1H")
+        _yahoo_regime_cache[key] = (now, out)
+        return out
     except Exception:
-        return False, False, None, "yahoo error"
+        out = (False, False, None, "yahoo error")
+        _yahoo_regime_cache[key] = (now, out)
+        return out
 
 
 def _fetch_broker_regime_price(is_crypto):
@@ -2825,6 +2842,12 @@ def market_regime_ok(is_crypto=False):
     else fail-closed. Never fail-open on total blackout.
     Returns (ok: bool, reason: str).
     """
+    cache_key = bool(is_crypto)
+    now = time.time()
+    hit = _market_regime_result_cache.get(cache_key)
+    if hit and now - float(hit[0] or 0.0) < _MARKET_REGIME_RESULT_TTL:
+        return hit[1]
+
     proxy, ring_key = _regime_proxy_keys(is_crypto)
     period = "5d" if is_crypto else "1mo"
 
@@ -2834,33 +2857,46 @@ def market_regime_ok(is_crypto=False):
     if y_avail and b_avail:
         if y_ok and b_ok:
             _store_regime_last_good(proxy, True, "yahoo+broker")
-            return True, ""
-        if (not y_ok) and (not b_ok):
+            out = (True, "")
+        elif (not y_ok) and (not b_ok):
             _store_regime_last_good(proxy, False, "yahoo+broker")
-            return False, f"DO NOT BUY (Regime: {proxy} 1H Downtrend)"
-        # Disagree → fail closed; stamp last-good blocked so TTL cannot re-allow
-        _store_regime_last_good(proxy, False, "disagree")
-        return False, f"DO NOT BUY (Regime: {proxy} sources disagree — blocked)"
+            out = (False, f"DO NOT BUY (Regime: {proxy} 1H Downtrend)")
+        else:
+            # Disagree → fail closed; stamp last-good blocked so TTL cannot re-allow
+            _store_regime_last_good(proxy, False, "disagree")
+            out = (False, f"DO NOT BUY (Regime: {proxy} sources disagree — blocked)")
+        _market_regime_result_cache[cache_key] = (now, out)
+        return out
 
     if y_avail:
         _store_regime_last_good(proxy, y_ok, "yahoo")
-        if y_ok:
-            return True, ""
-        return False, f"DO NOT BUY (Regime: {proxy} 1H Downtrend)"
+        out = (True, "") if y_ok else (False, f"DO NOT BUY (Regime: {proxy} 1H Downtrend)")
+        _market_regime_result_cache[cache_key] = (now, out)
+        return out
 
     if b_avail:
         _store_regime_last_good(proxy, b_ok, "broker")
-        if b_ok:
-            return True, ""
-        return False, f"DO NOT BUY (Regime: {proxy} broker trend down)"
+        out = (
+            (True, "")
+            if b_ok
+            else (False, f"DO NOT BUY (Regime: {proxy} broker trend down)")
+        )
+        _market_regime_result_cache[cache_key] = (now, out)
+        return out
 
     lg_avail, lg_ok, _lg_detail = _last_good_regime_vote(proxy)
     if lg_avail:
-        if lg_ok:
-            return True, ""
-        return False, f"DO NOT BUY (Regime: {proxy} last-good downtrend)"
+        out = (
+            (True, "")
+            if lg_ok
+            else (False, f"DO NOT BUY (Regime: {proxy} last-good downtrend)")
+        )
+        _market_regime_result_cache[cache_key] = (now, out)
+        return out
 
-    return False, f"DO NOT BUY (Regime: {proxy} data unavailable)"
+    out = (False, f"DO NOT BUY (Regime: {proxy} data unavailable)")
+    _market_regime_result_cache[cache_key] = (now, out)
+    return out
 
 
 def _swing_low_levels(lows, cluster_pct=0.015):
@@ -3109,12 +3145,6 @@ def evaluate_scale_in(ticker, current_price, avg_cost, broker_id="ROBINHOOD",
     result["allowed"] = True
     result["reason"] = detail
     return result
-
-
-def scale_in_allowed(ticker, current_price, avg_cost, **kwargs):
-    """Convenience bool wrapper around evaluate_scale_in."""
-    ev = evaluate_scale_in(ticker, current_price, avg_cost, **kwargs)
-    return bool(ev.get("allowed")), str(ev.get("reason") or ""), ev
 
 
 def buy_rank_score(ticker, is_crypto=True):
@@ -4048,13 +4078,6 @@ def explain_gate_from_recommendation(rec: str) -> str:
     return text[:100]
 
 
-def crypto_signal_factors(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live_price=None):
-    """Alias for signal_research_bundle (scanner signal card)."""
-    return signal_research_bundle(
-        ticker, is_crypto=is_crypto, broker_id=broker_id, live_price=live_price,
-    )
-
-
 def signal_research_bundle(ticker, *, is_crypto=True, broker_id="ROBINHOOD", live_price=None):
     """
     Research polish: factors + sparkline closes + RS + levels for the signal card.
@@ -4173,13 +4196,18 @@ def signal_research_bundle(ticker, *, is_crypto=True, broker_id="ROBINHOOD", liv
     return out
 
 
-def evaluate_opportunity(ticker, is_penny_stock=False, broker_id="ROBINHOOD", live_price=None):
+def evaluate_opportunity(
+    ticker, is_penny_stock=False, broker_id="ROBINHOOD", live_price=None, posture="balanced",
+):
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "DO NOT BUY (Awaiting Price)"
 
-    ok, reason = market_regime_ok(is_crypto=uses_btc_regime(ticker, False))
-    if not ok: return reason
+    ok, reason = entry_regime_ok(
+        is_crypto=False, posture=posture, ticker=ticker,
+    )
+    if not ok:
+        return reason
 
     allowed, reason = _check_hysteresis(ticker, current_price, is_crypto=False, broker_id=broker_id)
     if not allowed: return reason

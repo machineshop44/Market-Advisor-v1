@@ -23,9 +23,12 @@ def test_resolve_focus_broker_picks_deployable():
 def test_focus_parks_non_focus_broker():
     import desk_orchestration as do
 
-    assert do.focus_parks_buys("Robinhood", "E*TRADE", {"desk_focus_mode": "auto"})
-    assert not do.focus_parks_buys("E*TRADE", "E*TRADE", {"desk_focus_mode": "auto"})
-    assert not do.focus_parks_buys("Robinhood", "E*TRADE", {"desk_focus_mode": "off"})
+    # Default: focus does not starve other brokers' buy engines
+    assert not do.focus_parks_buys("Robinhood", "E*TRADE", {"desk_focus_mode": "auto"})
+    exclusive = {"desk_focus_mode": "auto", "desk_focus_park_others": True}
+    assert do.focus_parks_buys("Robinhood", "E*TRADE", exclusive)
+    assert not do.focus_parks_buys("E*TRADE", "E*TRADE", exclusive)
+    assert not do.focus_parks_buys("Robinhood", "E*TRADE", {"desk_focus_mode": "off", "desk_focus_park_others": True})
 
 
 def test_deployable_open_count_excludes_otc():

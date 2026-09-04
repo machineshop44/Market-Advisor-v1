@@ -66,4 +66,8 @@
     <string name="stale_suffix"> · stale</string>
     <string name="tls_pin_mismatch">TLS certificate does not match the saved fingerprint</string>
     <string name="tls_pin_required">Paste TLS fingerprint from PC Settings first</string>
+    <string name="tls_pin_renew_title">Renew TLS fingerprint</string>
+    <string name="tls_pin_renew_body">Market Advisor is reachable, but its HTTPS certificate no longer matches the pin saved on this phone. That usually happens after a desktop update or a new TLS cert.\n\nOn the PC: Settings → Companion… → Show setup QR. Scan it here (or paste the new fingerprint). Until you do, Companion will look offline.</string>
+    <string name="tls_pin_renew_hint">TLS pin mismatch — rescan the PC setup QR. The desk can still be running.</string>
+    <string name="open_companion_settings">Open Settings</string>
 </resources>

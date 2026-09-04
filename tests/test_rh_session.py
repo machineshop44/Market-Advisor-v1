@@ -83,6 +83,7 @@ class TestRobinhoodSellAllQty(unittest.TestCase):
         adapter = RobinhoodAdapter()
         adapter._live_sellable_qty = MagicMock(return_value=10.37)
         adapter.confirm_order = MagicMock(return_value=(True, "filled"))
+        adapter._rh_equity_sellable = MagicMock(return_value=(True, "id", ""))
         with patch("broker.r") as mock_r:
             mock_r.order_sell_fractional_by_quantity.return_value = {"id": "ord-frac", "state": "filled"}
             mock_r.order_sell_limit = MagicMock()

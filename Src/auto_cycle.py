@@ -129,6 +129,14 @@ def throttle_scan_drops(
 def coach_drop_bucket(line: str) -> str:
     """Classify a scan-drop line into a coach tip bucket."""
     d = str(line or "").lower()
+    if "regime" in d or "do not buy (regime" in d:
+        return "regime"
+    if "fee" in d and ("gate" in d or "clear" in d or "edge" in d):
+        return "fee_gate"
+    if "afford" in d or "whole share" in d or "bp <" in d:
+        return "afford"
+    if "frac" in d or "overnight" in d or "session" in d:
+        return "session_frac"
     if "missing cost" in d:
         return "missing_cost"
     if "hard stop" in d:
@@ -158,6 +166,22 @@ def coach_tip_for_scan_drops(broker, engine, dropped) -> tuple[str, str]:
     """
     dominant = dominant_coach_drop_bucket(dropped)
     tips = {
+        "regime": (
+            f"{broker}/{engine}: BUY signals blocked by SPY/BTC regime — "
+            f"Growth posture skips SPY; Advisor can propose overrides when enabled."
+        ),
+        "fee_gate": (
+            f"{broker}/{engine}: candidates failed fee/edge gate — "
+            f"expected profit must clear round-trip friction before autosize buys."
+        ),
+        "afford": (
+            f"{broker}/{engine}: signals exist but BP can't afford whole shares "
+            f"or min ticket — consolidate stack or wait for a cheaper name."
+        ),
+        "session_frac": (
+            f"{broker}/{engine}: session blocks fractional equity buys on RH — "
+            f"wait for REGULAR hours or pick a lower-priced ticker."
+        ),
         "missing_cost": (
             f"{broker}/{engine}: scale-in blocked — cost basis unknown on held names. "
             f"Reconnect or wait until RH reports avg cost; TTP/ROI stay gated."
@@ -268,6 +292,11 @@ def clear_scale_in_skip_throttle(store: dict, broker_name: str, ticker: str) -> 
 DEFAULT_CRYPTO_TICKERS = frozenset({
     "BTC", "ETH", "SOL", "DOGE", "SHIB", "PEPE", "BONK", "XLM", "AVAX", "LINK", "UNI",
 })
+try:
+    from crypto_symbols import KNOWN_CRYPTOS as _KNOWN
+    DEFAULT_CRYPTO_TICKERS = frozenset(DEFAULT_CRYPTO_TICKERS | set(_KNOWN))
+except Exception:
+    pass
 
 CRYPTO_MOVER_BLOCKLIST = frozenset({
     "USDT", "USDC", "DAI", "USD", "EUR", "GBP", "PYUSD", "EURC",
@@ -914,24 +943,6 @@ def effective_book_equity(equity, locked_value) -> float:
     except (TypeError, ValueError):
         locked = 0.0
     return max(0.0, eq - locked)
-
-
-def locked_value_for_broker(summary: dict | None, broker_name: str) -> float:
-    """Sum locked notional for one broker from locked_capital_summary rows."""
-    if not isinstance(summary, dict):
-        return 0.0
-    want = str(broker_name or "").strip()
-    total = 0.0
-    for row in summary.get("rows") or []:
-        if not isinstance(row, dict):
-            continue
-        if want and str(row.get("broker") or "").strip() != want:
-            continue
-        try:
-            total += max(0.0, float(row.get("value") or 0.0))
-        except (TypeError, ValueError):
-            pass
-    return total
 
 
 def locked_value_from_holdings(holdings: Iterable, *, broker_name: str | None = None) -> float:

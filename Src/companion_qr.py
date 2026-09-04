@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import socket
+import time
+import urllib.request
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
@@ -73,16 +75,107 @@ def detect_lan_ip() -> str:
     return "127.0.0.1"
 
 
-def companion_base_url(host: str, port: int, use_https: bool, lan_ip: str | None = None) -> str:
+def _looks_like_ipv4(ip: str) -> bool:
+    try:
+        parts = [int(x) for x in (ip or "").split(".")]
+        return len(parts) == 4 and all(0 <= p <= 255 for p in parts)
+    except Exception:
+        return False
+
+
+def _is_hostname(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if not h or _looks_like_ipv4(h) or ":" in h:
+        return False
+    return "." in h or h == "localhost"
+
+
+_PUBLIC_IP_CACHE: tuple[str, float] = ("", 0.0)
+_PUBLIC_IP_TTL_SEC = 300.0
+_PUBLIC_IP_URLS = (
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+    "https://ifconfig.me/ip",
+)
+
+
+def detect_public_ip(timeout: float = 2.0) -> str:
+    """Best-effort public IPv4 for away companion URLs. Cached ~5 minutes."""
+    global _PUBLIC_IP_CACHE
+    cached, at = _PUBLIC_IP_CACHE
+    now = time.time()
+    if cached and (now - at) < _PUBLIC_IP_TTL_SEC:
+        return cached
+    for url in _PUBLIC_IP_URLS:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "MarketAdvisor-companion/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+                ip = (resp.read() or b"").decode("utf-8", errors="replace").strip()
+            if _looks_like_ipv4(ip) and not _is_private_ipv4(ip) and not ip.startswith("127."):
+                _PUBLIC_IP_CACHE = (ip, now)
+                return ip
+        except Exception:
+            continue
+    return cached or ""
+
+
+def normalize_reachable_host(host: str) -> str:
+    """Strip scheme/path from a typed public IP, DDNS, or LAN host."""
+    h = (host or "").strip()
+    if not h:
+        return ""
+    if "://" in h:
+        try:
+            parsed = urlparse(h if "://" in h else f"https://{h}")
+            h = parsed.hostname or h
+        except Exception:
+            h = h.split("/")[0]
+    if ":" in h and not h.count(":") > 1:
+        # host:port — keep host only (IPv6 skipped)
+        left, right = h.rsplit(":", 1)
+        if right.isdigit():
+            h = left
+    h = h.strip().strip("[]")
+    if h.startswith("127.") or h in ("localhost", "::1"):
+        return ""
+    return h
+
+
+def companion_base_url(
+    host: str,
+    port: int,
+    use_https: bool,
+    lan_ip: str | None = None,
+    *,
+    public_host: str | None = None,
+    prefer_public: bool = False,
+) -> str:
     """
     Reachable base URL for the companion.
-    When bind is 0.0.0.0 / all-interfaces, substitute the LAN IP (not 127.0.0.1).
-    Optional lan_ip overrides detection when host is all-interfaces.
+
+    When bind is 0.0.0.0 / all-interfaces:
+      - prefer_public + public_host (or detected WAN IP) → away/work URL
+      - otherwise LAN IP (home Wi‑Fi)
+    Optional lan_ip / public_host override detection.
     """
     h = (host or "127.0.0.1").strip()
     if h in ("0.0.0.0", "::", "*"):
-        override = (lan_ip or "").strip()
-        if override and not override.startswith("127.") and not override.startswith("::1"):
+        pub = normalize_reachable_host(public_host or "")
+        override = normalize_reachable_host(lan_ip or "")
+        if prefer_public:
+            if override and not _is_private_ipv4(override):
+                h = override
+            elif pub:
+                h = pub
+            elif override:
+                h = override
+            else:
+                detected = detect_public_ip()
+                h = detected or detect_lan_ip()
+        elif override and not override.startswith("127."):
             h = override
         else:
             h = detect_lan_ip()

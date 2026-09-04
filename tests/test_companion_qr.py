@@ -91,13 +91,34 @@ def test_list_lan_ips_shape():
         assert len(parts) == 4
 
 
+def test_companion_base_url_prefers_public_when_bound_all():
+    url = cq.companion_base_url(
+        "0.0.0.0", 8791, True,
+        public_host="67.84.101.14",
+        prefer_public=True,
+    )
+    assert url == "https://67.84.101.14:8791/"
+
+
 def test_companion_base_url_lan_ip_override():
-    url = cq.companion_base_url("0.0.0.0", 8791, True, lan_ip="192.168.9.9")
-    assert url == "https://192.168.9.9:8791/"
-    # Blank / loopback override falls back to detection
-    url2 = cq.companion_base_url("0.0.0.0", 8791, True, lan_ip="127.0.0.1")
-    assert "0.0.0.0" not in url2
-    assert url2.startswith("https://")
+    url = cq.companion_base_url("0.0.0.0", 8791, True, lan_ip="10.0.0.42")
+    assert url == "https://10.0.0.42:8791/"
+
+
+def test_companion_base_url_lan_override_wins_when_selected():
+    url = cq.companion_base_url(
+        "0.0.0.0", 8791, True,
+        lan_ip="192.168.1.20",
+        public_host="67.84.101.14",
+        prefer_public=False,
+    )
+    assert url == "https://192.168.1.20:8791/"
+
+
+def test_normalize_reachable_host():
+    assert cq.normalize_reachable_host("https://67.84.101.14:8791/") == "67.84.101.14"
+    assert cq.normalize_reachable_host("67.84.101.14") == "67.84.101.14"
+    assert cq.normalize_reachable_host("127.0.0.1") == ""
 
 
 if __name__ == "__main__":
@@ -109,4 +130,7 @@ if __name__ == "__main__":
     test_companion_base_url_localhost()
     test_list_lan_ips_shape()
     test_companion_base_url_lan_ip_override()
+    test_companion_base_url_prefers_public_when_bound_all()
+    test_companion_base_url_lan_override_wins_when_selected()
+    test_normalize_reachable_host()
     print("ok")

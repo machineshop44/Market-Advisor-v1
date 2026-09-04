@@ -7,6 +7,7 @@ via gui._compute_trade_dollars / auto_cycle.capital_planner_snapshot.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Any
 
 BROKER_ORDER = ("E*TRADE", "Robinhood", "Coinbase")
@@ -25,8 +26,117 @@ def focus_mode(settings: dict | None) -> str:
     return mode if mode in ("auto", "off", "manual") else "auto"
 
 
-def focus_scan_multiplier(broker_name: str, focus_broker: str | None, settings: dict | None) -> float:
-    """2× cadence (half interval) for focus broker when mode is on."""
+def micro_broker_buy_parked(
+    broker_name: str,
+    deployable_bp: float,
+    settings: dict | None,
+) -> tuple[bool, str]:
+    """
+    Optional Coinbase buy park when cash cannot fund a min ticket.
+
+    Default OFF — crypto is dollar-notional; cheap coins (SHIB etc.) can still
+    deploy leftover BP via autosizing. When enabled, floor follows
+    capital_min_deployable_buy (else min_trade_dollars). Legacy key
+    capital_park_micro_floor is still accepted as an alias. Sells still run.
+    """
+    if not bool((settings or {}).get("capital_park_micro_crypto", False)):
+        return False, ""
+    if str(broker_name or "") != "Coinbase":
+        return False, ""
+    try:
+        s = settings or {}
+        # Canonical UI key first; legacy alias second
+        override = s.get("capital_min_deployable_buy")
+        if override is None:
+            override = s.get("capital_park_micro_floor")
+        if override is None:
+            floor = float(s.get("min_trade_dollars") or 5.0)
+        else:
+            floor = float(override)
+    except (TypeError, ValueError):
+        floor = 5.0
+    floor = max(1.0, floor)
+    try:
+        deploy = float(deployable_bp or 0.0)
+    except (TypeError, ValueError):
+        deploy = 0.0
+    if deploy + 1e-9 < floor:
+        return True, (
+            f"Micro crypto park — deployable ${deploy:.0f} < ${floor:.0f} "
+            f"(consolidate to primary; sells still run)"
+        )
+    return False, ""
+
+
+def capital_efficiency_grade(
+    by_broker: dict[str, dict],
+    *,
+    focus_broker: str | None = None,
+    settings: dict | None = None,
+    min_fragment: float = 8.0,
+) -> dict[str, Any]:
+    """fragmented | consolidating | single_stack."""
+    preview = consolidated_deployable_preview(
+        by_broker, focus_broker=focus_broker, settings=settings,
+    )
+    focus = preview.get("focus")
+    fragmented = list(preview.get("fragmented") or [])
+    try:
+        extra = float(preview.get("extra") or 0.0)
+        focus_deploy = float(preview.get("focus_deploy") or 0.0)
+    except (TypeError, ValueError):
+        extra, focus_deploy = 0.0, 0.0
+    if not focus:
+        grade = "fragmented"
+    elif not fragmented or extra < min_fragment:
+        grade = "single_stack"
+    elif focus_deploy >= 40 and extra >= min_fragment:
+        grade = "consolidating"
+    else:
+        grade = "fragmented"
+    return {
+        "grade": grade,
+        "focus": focus,
+        "focus_deploy": focus_deploy,
+        "extra": extra,
+        "combined": float(preview.get("combined") or 0.0),
+        "fragmented": fragmented,
+    }
+
+
+def format_capital_efficiency_line(
+    grade_info: dict[str, Any],
+    *,
+    money_fmt=None,
+) -> str:
+    def _m(x):
+        if callable(money_fmt):
+            return money_fmt(x)
+        return f"${float(x or 0):,.0f}"
+
+    g = str(grade_info.get("grade") or "")
+    focus = grade_info.get("focus") or "—"
+    if g == "single_stack":
+        return f"Capital: single stack · {focus} {_m(grade_info.get('focus_deploy'))}"
+    if g == "consolidating":
+        return (
+            f"Capital: consolidating · move {_m(grade_info.get('extra'))} → {focus} "
+            f"for ~{_m(grade_info.get('combined'))}"
+        )
+    return (
+        f"Capital: fragmented · primary {focus} {_m(grade_info.get('focus_deploy'))} "
+        f"(+{_m(grade_info.get('extra'))} elsewhere)"
+    )
+
+
+def focus_scan_multiplier(
+    broker_name: str,
+    focus_broker: str | None,
+    settings: dict | None,
+    *,
+    morning_boost: bool = False,
+) -> float:
+    """2× cadence (half interval) for focus broker; optional RTH morning 3×."""
     if not focus_broker or focus_mode(settings) == "off":
         return 1.0
     if str(broker_name or "") != str(focus_broker):
@@ -35,14 +145,43 @@ def focus_scan_multiplier(broker_name: str, focus_broker: str | None, settings: 
         mult = float((settings or {}).get("focus_broker_scan_mult") or 2.0)
     except (TypeError, ValueError):
         mult = 2.0
+    if morning_boost:
+        try:
+            morning = float((settings or {}).get("focus_morning_scan_mult") or 3.0)
+        except (TypeError, ValueError):
+            morning = 3.0
+        mult = max(mult, morning)
     return max(1.0, min(4.0, mult))
 
 
-def interval_scale_for_focus(base_sec: float, broker_name: str, focus_broker: str | None, settings: dict | None) -> float:
-    mult = focus_scan_multiplier(broker_name, focus_broker, settings)
+def interval_scale_for_focus(
+    base_sec: float,
+    broker_name: str,
+    focus_broker: str | None,
+    settings: dict | None,
+    *,
+    morning_boost: bool = False,
+) -> float:
+    mult = focus_scan_multiplier(
+        broker_name, focus_broker, settings, morning_boost=morning_boost,
+    )
     if mult <= 1.0:
         return float(base_sec)
     return max(15.0, float(base_sec) / mult)
+
+
+def is_rth_morning_window(now_et=None) -> bool:
+    """True during 9:30–11:00 America/New_York on a weekday."""
+    try:
+        if now_et is None:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() >= 5:
+            return False
+        sod = now_et.hour * 3600 + now_et.minute * 60 + now_et.second
+        return (9 * 3600 + 30 * 60) <= sod < (11 * 3600)
+    except Exception:
+        return False
 
 
 def resolve_focus_broker(
@@ -51,7 +190,7 @@ def resolve_focus_broker(
 ) -> str | None:
     """
     Pick the broker that should receive buy-engine priority.
-    auto: highest deployable_bp among can_place_new_buy; tie-break ET > RH > CB.
+    auto: highest deployable_bp among can_place_new_buy; preferred primary then ET > RH > CB.
     manual: desk_focus_broker when set and can buy.
     """
     mode = focus_mode(settings)
@@ -63,6 +202,7 @@ def resolve_focus_broker(
             return manual
         return None
 
+    preferred = str((settings or {}).get("desk_preferred_primary") or "E*TRADE").strip()
     candidates: list[tuple[float, str]] = []
     for name, ctx in (by_broker or {}).items():
         if not isinstance(ctx, dict):
@@ -73,6 +213,9 @@ def resolve_focus_broker(
             deploy = float(ctx.get("deployable_bp") or ctx.get("buying_power") or 0.0)
         except (TypeError, ValueError):
             deploy = 0.0
+        parked, _ = micro_broker_buy_parked(name, deploy, settings)
+        if parked:
+            continue
         candidates.append((deploy, str(name)))
 
     if not candidates:
@@ -82,18 +225,27 @@ def resolve_focus_broker(
 
     def sort_key(item: tuple[float, str]) -> tuple:
         deploy, name = item
+        pref_rank = 0 if name == preferred else 1
         try:
             rank = BROKER_ORDER.index(name)
         except ValueError:
             rank = 99
-        return (-deploy, rank)
+        return (pref_rank, -deploy, rank)
 
     candidates.sort(key=sort_key)
     return candidates[0][1]
 
 
 def focus_parks_buys(broker_name: str, focus_broker: str | None, settings: dict | None) -> bool:
-    """True when non-focus broker buy engines should rest."""
+    """
+    True when non-focus broker buy engines should rest.
+
+    Default OFF: focus only speeds scans on the primary (interval multiplier).
+    Exclusive parking starved E*TRADE/Coinbase whenever Robinhood was focus.
+    Set desk_focus_park_others True to rest non-focus buys again.
+    """
+    if not bool((settings or {}).get("desk_focus_park_others", False)):
+        return False
     if focus_mode(settings) == "off" or not focus_broker:
         return False
     return str(broker_name or "") != str(focus_broker)
@@ -126,11 +278,16 @@ def deployable_open_count(holdings: list, *, broker_name: str = "", classify_loc
     return n
 
 
-def next_desk_action(by_broker: dict[str, dict], *, focus_broker: str | None = None) -> str:
+def next_desk_action(
+    by_broker: dict[str, dict],
+    *,
+    focus_broker: str | None = None,
+    settings: dict | None = None,
+) -> str:
     """One-line actionable next step for Home command center."""
     if not by_broker:
         return "Arm auto-trader and refresh balances."
-    focus = focus_broker or resolve_focus_broker(by_broker, {"desk_focus_mode": "auto"})
+    focus = focus_broker or resolve_focus_broker(by_broker, settings or {"desk_focus_mode": "auto"})
     parts: list[str] = []
     for name, ctx in by_broker.items():
         if not isinstance(ctx, dict):
@@ -148,8 +305,8 @@ def next_desk_action(by_broker: dict[str, dict], *, focus_broker: str | None = N
             parts.append(f"{name} low BP — deposit or exit to fund")
         elif blockers:
             parts.append(f"{name}: {(blockers[0] or {}).get('message') or code}")
-    if focus and focus_parks_buys("Robinhood", focus, {"desk_focus_mode": "auto"}):
-        # only mention focus when multi-broker
+    if focus and focus_parks_buys("Robinhood", focus, settings or {}):
+        # only mention focus when exclusive park is on and multi-broker
         buyable = [n for n, c in by_broker.items() if c.get("can_place_new_buy")]
         if len(buyable) == 1 and buyable[0] == focus:
             return f"Focus {focus} — " + (parts[0] if parts else "awaiting scan signals")
@@ -163,6 +320,7 @@ def format_profit_command_center(
     by_broker: dict[str, dict],
     *,
     focus_broker: str | None = None,
+    settings: dict | None = None,
     money_fmt=None,
     engine_line: str = "",
 ) -> str:
@@ -180,7 +338,7 @@ def format_profit_command_center(
     nwr = s.get("net_win_rate")
     closed = int(s.get("net_wins") or 0) + int(s.get("net_losses") or 0)
     wr = f"{float(nwr) * 100:.0f}%" if nwr is not None and closed > 0 else "—"
-    action = next_desk_action(by_broker, focus_broker=focus_broker)
+    action = next_desk_action(by_broker, focus_broker=focus_broker, settings=settings)
     focus_txt = f" · Focus {focus_broker}" if focus_broker else ""
     line = (
         f"7d net {_m(net)} · WR {wr} · fee {drag:.1f}%"
@@ -191,11 +349,17 @@ def format_profit_command_center(
     return line
 
 
-def format_consolidation_playbook(by_broker: dict[str, dict]) -> str:
+def format_consolidation_playbook(
+    by_broker: dict[str, dict],
+    *,
+    settings: dict | None = None,
+) -> str:
     """Human checklist when capital is fragmented across brokers."""
+    preferred = str((settings or {}).get("desk_preferred_primary") or "E*TRADE").strip()
     lines = ["Consolidation playbook (manual — brokers don't auto-transfer):"]
     deployable = []
     stuck = []
+    idle_cash = []
     for name, ctx in (by_broker or {}).items():
         if not isinstance(ctx, dict):
             continue
@@ -204,10 +368,32 @@ def format_consolidation_playbook(by_broker: dict[str, dict]) -> str:
             deploy = float(ctx.get("deployable_bp") or bp)
         except (TypeError, ValueError):
             bp, deploy = 0.0, 0.0
+        blockers = ctx.get("blockers") or []
+        codes = {
+            str((b or {}).get("code") or "")
+            for b in blockers
+            if isinstance(b, dict)
+        }
+        if "fully_deployed" in codes:
+            stuck.append(name)
+        if deploy >= 8.0 and name != preferred:
+            idle_cash.append((name, deploy))
         if ctx.get("can_place_new_buy") and deploy >= 5.0:
             deployable.append((name, deploy))
-        elif (ctx.get("blockers") or []) and str((ctx["blockers"][0] or {}).get("code")) == "fully_deployed":
-            stuck.append(name)
+    focus = None
+    for n, d in sorted(deployable, key=lambda x: -x[1]):
+        if n == preferred:
+            focus = n
+            break
+    if focus is None and deployable:
+        focus = max(deployable, key=lambda x: x[1])[0]
+
+    if idle_cash and focus:
+        bits = ", ".join(f"{n} (~${d:.0f})" for n, d in idle_cash)
+        lines.append(
+            f"• ACH idle cash {bits} → {focus} to lift capital grade "
+            f"(one stack beats three micro tickets)."
+        )
     if len(deployable) == 1 and stuck:
         target, amt = deployable[0]
         lines.append(
@@ -217,10 +403,17 @@ def format_consolidation_playbook(by_broker: dict[str, dict]) -> str:
         )
     elif len(deployable) > 1:
         names = ", ".join(f"{n} (${d:.0f})" for n, d in deployable)
-        lines.append(f"• Multiple buyers: {names} — focus mode picks one; consider merging to reduce fee drag.")
-    else:
+        lines.append(
+            f"• Multiple buyers: {names} — focus mode prefers {preferred}; "
+            f"disarm secondaries or merge cash to cut fee drag."
+        )
+    elif not idle_cash:
         lines.append("• No broker can fund a new min ticket — exit or deposit before consolidating.")
     lines.append("• OTC/dust (*Q) bags: sell in broker app; excluded from sizing/deploy counts.")
+    lines.append(
+        "• Day P&L is mark-to-market vs morning baseline (not realized sells). "
+        "Use Reset Day P&L if a buy/lag glitch fakes a loss."
+    )
     return "\n".join(lines)
 
 
@@ -415,16 +608,6 @@ def session_boundary_tasks(
     return ("PORTFOLIO", "CORE", "PENNY")
 
 
-def is_otc_permanent_skip(ticker: str, *, broker_name: str = "") -> bool:
-    """OTC/delisted *Q bags — skip repeated portfolio scoring noise."""
-    t = str(ticker or "").upper().replace("-USD", "").strip()
-    if not t:
-        return False
-    if t.endswith("Q") and len(t) >= 4:
-        return True
-    return False
-
-
 def focus_advisor_auto_clear(
     candidates: list[dict],
     broker_name: str,
@@ -444,6 +627,8 @@ def focus_advisor_auto_clear(
             return False
         ticker = str(c.get("ticker") or "").upper()
         if not ticker:
+            return False
+        if c.get("regime_caution"):
             return False
         asset_type = str(c.get("asset_type") or "")
         is_crypto = (

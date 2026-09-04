@@ -13,15 +13,27 @@ import java.security.cert.X509Certificate
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.TrustManager
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
 class MonitorApiException(
     message: String,
     val httpCode: Int = 0,
     val lockoutSeconds: Int? = null,
-) : Exception(message)
+    val kind: String = KIND_HTTP,
+) : Exception(message) {
+    companion object {
+        const val KIND_HTTP = "http"
+        const val KIND_TLS = "tls_pin"
+        const val KIND_NETWORK = "network"
+    }
+}
 
 object MonitorApi {
     data class BrokerInfo(
@@ -257,6 +269,48 @@ object MonitorApi {
         return conn
     }
 
+    private fun mapConnectError(e: Exception): Nothing {
+        if (e is MonitorApiException) throw e
+        when (e) {
+            is CertificateException,
+            is SSLHandshakeException,
+            is SSLPeerUnverifiedException,
+            -> throw MonitorApiException(
+                "TLS fingerprint mismatch. Rescan the PC setup QR to renew the pin.",
+                kind = MonitorApiException.KIND_TLS,
+            )
+            is ConnectException,
+            is SocketTimeoutException,
+            is UnknownHostException,
+            -> throw MonitorApiException(
+                e.message ?: "Cannot reach Market Advisor.",
+                kind = MonitorApiException.KIND_NETWORK,
+            )
+            else -> {
+                val msg = (e.message ?: "").lowercase()
+                val tlsish = msg.contains("trust") || msg.contains("fingerprint") ||
+                    msg.contains("certificat") || msg.contains("ssl")
+                throw MonitorApiException(
+                    if (tlsish) {
+                        "TLS fingerprint mismatch. Rescan the PC setup QR to renew the pin."
+                    } else {
+                        e.message ?: e.javaClass.simpleName
+                    },
+                    kind = if (tlsish) MonitorApiException.KIND_TLS else MonitorApiException.KIND_NETWORK,
+                )
+            }
+        }
+    }
+
+    private fun execute(conn: HttpURLConnection): Pair<Int, String> {
+        return try {
+            val code = conn.responseCode
+            code to readBody(conn, code)
+        } catch (e: Exception) {
+            mapConnectError(e)
+        }
+    }
+
     private fun readBody(conn: HttpURLConnection, code: Int): String {
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
         return stream?.let { BufferedReader(InputStreamReader(it)).readText() } ?: ""
@@ -328,8 +382,7 @@ object MonitorApi {
 
     fun fetchStatus(baseUrl: String, user: String, pass: String, pinFp: String): Status {
         val conn = open("${baseUrl.trimEnd('/')}/api/status", user, pass, "GET", pinFp)
-        val code = conn.responseCode
-        val text = readBody(conn, code)
+        val (code, text) = execute(conn)
         if (code !in 200..299) {
             val (msg, lockout) = parseErrorMessage(text, code)
             throw MonitorApiException(msg, httpCode = code, lockoutSeconds = lockout)

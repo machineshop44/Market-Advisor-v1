@@ -31,7 +31,7 @@ class TestMonitorTlsSans(unittest.TestCase):
                 self.assertIn("127.0.0.1", sans)
                 self.assertIn("192.168.1.50", sans)
 
-    def test_localhost_only_cert_refreshes_when_lan_appears(self):
+    def test_existing_cert_keeps_pin_when_lan_ip_changes(self):
         import monitor_tls as mt
 
         with tempfile.TemporaryDirectory() as td:
@@ -42,9 +42,6 @@ class TestMonitorTlsSans(unittest.TestCase):
                  patch.object(mt, "FINGERPRINT_FILE", td_path / "fingerprint.txt"), \
                  patch.object(mt, "_discover_lan_ips", return_value=[]):
                 _, _, fp1 = mt.ensure_tls_material(refresh_lan_sans=True)
-                sans1 = mt.cert_san_ips()
-                self.assertIn("127.0.0.1", sans1)
-                self.assertNotIn("10.0.0.9", sans1)
 
             with patch.object(mt, "_DIR", td_path), \
                  patch.object(mt, "CERT_FILE", td_path / "cert.pem"), \
@@ -52,10 +49,11 @@ class TestMonitorTlsSans(unittest.TestCase):
                  patch.object(mt, "FINGERPRINT_FILE", td_path / "fingerprint.txt"), \
                  patch.object(mt, "_discover_lan_ips", return_value=["10.0.0.9"]):
                 _, _, fp2 = mt.ensure_tls_material(refresh_lan_sans=True)
-                sans2 = mt.cert_san_ips()
-                self.assertIn("10.0.0.9", sans2)
-                # Fingerprint changes on regen — companion must re-pin via QR (expected)
-                self.assertNotEqual(fp1, fp2)
+                # Keep the pin so companion does not go "offline" after a DHCP change
+                self.assertEqual(fp1, fp2)
+                _, _, fp3 = mt.ensure_tls_material(force_rotate=True)
+                self.assertNotEqual(fp1, fp3)
+                self.assertIn("10.0.0.9", mt.cert_san_ips())
 
 
 if __name__ == "__main__":

@@ -443,7 +443,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="grid brokers" id="broker_cards" style="margin-top:14px"></div>
 
   <div class="card" style="margin-top:14px">
-    <div class="label">Recent Trades</div>
+    <div class="label">Recent Trades (app fills)</div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Time</th><th>Broker</th><th>Side</th><th>Ticker</th><th>Status</th></tr></thead>

@@ -1,6 +1,7 @@
 """AI Desk Advisor — local rules + optional LLM briefs."""
 import os
 import sys
+import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Src"))
 if ROOT not in sys.path:
@@ -147,3 +148,102 @@ def test_format_advisor_summary_includes_ai():
     )
     assert "gemini API" in s2
     assert "Cursor on" in s2
+
+
+def test_research_pack_shape_and_prompt():
+    prop = {
+        "ticker": "BTC",
+        "broker": "Coinbase",
+        "dollars": 20.0,
+        "price": 95000.0,
+        "score": 90.0,
+        "engine": "CRYPTO",
+        "asset_type": "crypto",
+        "is_crypto": True,
+    }
+    # Force empty cache path with a unique synthetic ticker to avoid network flake
+    prop["ticker"] = "ZZZTEST"
+    pack = dai.build_research_pack(prop, {"regime": {"label": "neutral"}})
+    assert pack.get("ticker") == "ZZZTEST"
+    assert "notes" in pack
+    prompt = dai._proposal_prompt(prop, {"buying_power": 24.0}, research=pack)
+    assert "research" in prompt
+    assert "research pack" in prompt.lower() or "Use the research block" in prompt
+    assert "ZZZTEST" in prompt
+
+
+def test_ai_budget_blocks_after_cap(monkeypatch):
+    dai._ai_call_times.clear()
+    dai._ai_day_key = ""
+    dai._ai_day_count = 0
+    settings = {"advisor_ai_max_per_minute": 2, "advisor_ai_max_per_day": 3}
+    assert dai._ai_budget_ok(settings)[0] is True
+    dai._ai_budget_record()
+    dai._ai_budget_record()
+    ok, why = dai._ai_budget_ok(settings)
+    assert ok is False
+    assert "per-minute" in why
+    dai._ai_call_times.clear()
+    dai._ai_budget_record()  # day count now 3
+    ok2, why2 = dai._ai_budget_ok(settings)
+    assert ok2 is False
+    assert "daily" in why2
+
+
+def test_local_when_clear_skips_cloud(monkeypatch):
+    called = {"n": 0}
+
+    def boom(*_a, **_k):
+        called["n"] += 1
+        raise AssertionError("cloud should not be called")
+
+    monkeypatch.setattr(dai, "_call_gemini", boom)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key": "fake-key",
+        "advisor_ai_local_when_clear": True,
+    }
+    weak = {
+        "ticker": "XYZ",
+        "broker": "E*TRADE",
+        "dollars": 10.0,
+        "price": 5.0,
+        "score": 40.0,
+        "engine": "CORE",
+        "asset_type": "stock",
+    }
+    out = dai.analyze_proposal(weak, {"buying_power": 100.0}, settings)
+    assert called["n"] == 0
+    assert out["source"] == "local"
+    assert out["verdict"] == "skip"
+    assert "cloud skipped" in str(out.get("detail") or "")
+
+
+def test_budget_exhausted_falls_back_local(monkeypatch):
+    dai._ai_call_times.clear()
+    dai._ai_day_key = time.strftime("%Y-%m-%d")
+    dai._ai_day_count = 99
+
+    def boom(*_a, **_k):
+        raise AssertionError("cloud should not be called")
+
+    monkeypatch.setattr(dai, "_call_gemini", boom)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key": "fake-key",
+        "advisor_ai_local_when_clear": False,
+        "advisor_ai_max_per_day": 5,
+        "advisor_ai_max_per_minute": 4,
+    }
+    prop = {
+        "ticker": "TLT",
+        "broker": "E*TRADE",
+        "dollars": 45.0,
+        "price": 88.0,
+        "score": 72.0,
+        "engine": "CORE",
+        "asset_type": "stock",
+    }
+    out = dai.analyze_proposal(prop, {"buying_power": 100.0}, settings)
+    assert out["source"] == "local_fallback"
+    assert "daily AI budget" in str(out.get("error") or out.get("detail") or "")
