@@ -557,14 +557,16 @@ class MainActivity : AppCompatActivity() {
                     status.controlsEnabled && adv.count > 0
                 binding.btnEodRun.isEnabled = status.controlsEnabled
 
-                val etNeedReauth = status.brokers["E*TRADE"]?.reauthNeeded == true
+                val anyNeedReauth = status.brokers.values.any { it.reauthNeeded }
+                val reauthBrokers = status.brokers.filter { it.value.reauthNeeded }.keys.toList()
                 ReauthNotifier.maybeNotifyFromStatus(
                     this@MainActivity,
-                    reauthNeeded = etNeedReauth,
+                    reauthNeeded = anyNeedReauth,
                     ddPaused = status.portfolioHeat.ddPaused,
                     halted = status.halted,
                     signalAlert = status.signalAlert,
                     advisorCount = adv.count,
+                    reauthBrokers = reauthBrokers,
                 )
 
                 syncingUi = true
@@ -621,6 +623,11 @@ class MainActivity : AppCompatActivity() {
                     else -> e.message ?: e.javaClass.simpleName
                 }
                 val isTls = e is MonitorApiException && e.kind == MonitorApiException.KIND_TLS
+                ReauthNotifier.maybeNotifyUnreachable(
+                    this@MainActivity,
+                    unreachable = true,
+                    tlsPin = isTls,
+                )
                 binding.statusLine.text = if (isTls) {
                     "TLS pin expired: $detail"
                 } else {
@@ -637,8 +644,11 @@ class MainActivity : AppCompatActivity() {
                 if (isTls) showTlsRenewDialog()
                 markMetricsStale()
                 syncingUi = true
+                val linkDown = getString(R.string.link_down_broker_detail)
                 for (row in brokerRows) {
                     row.binding.brokerSwitch.isEnabled = false
+                    row.binding.brokerDetail.visibility = View.VISIBLE
+                    row.binding.brokerDetail.text = linkDown
                 }
                 binding.btnHaltAll.isEnabled = false
                 binding.btnEodRun.isEnabled = false

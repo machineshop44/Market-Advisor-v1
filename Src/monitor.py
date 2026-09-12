@@ -219,17 +219,52 @@ def clear_auth_lockouts():
 
 
 def is_running() -> bool:
-    return _server is not None
+    """True only when the bind socket exists and the serve thread is alive."""
+    if _server is None:
+        return False
+    if _thread is not None and not _thread.is_alive():
+        return False
+    return True
+
+
+def probe_localhost(timeout_sec: float = 1.5) -> bool:
+    """
+    True when the local monitor accepts an HTTP(S) request on loopback.
+    Detects zombie threads where is_running() is True but the socket is dead.
+    Uses /api/health (auth-free, loopback-only).
+    """
+    if not is_running() or _server is None:
+        return False
+    try:
+        port = int(_server.server_address[1])
+    except Exception:
+        return False
+    scheme = "https" if _tls_enabled else "http"
+    url = f"{scheme}://127.0.0.1:{port}/api/health"
+    try:
+        import urllib.request
+
+        ctx = None
+        if _tls_enabled:
+            ctx = ssl._create_unverified_context()
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=float(timeout_sec), context=ctx) as resp:
+            code = int(getattr(resp, "status", None) or resp.getcode() or 0)
+            return 200 <= code < 300
+    except Exception:
+        return False
 
 
 def describe_runtime() -> dict:
     """Live monitor process state (not draft Settings widgets)."""
+    alive = is_running()
     return {
-        "running": _server is not None,
-        "tls": bool(_tls_enabled),
-        "controls_enabled": bool(_controls_enabled),
+        "running": alive,
+        "tls": bool(_tls_enabled) if alive else False,
+        "controls_enabled": bool(_controls_enabled) if alive else False,
         "has_auth": bool(_auth_user),
         "fingerprint": _cert_fingerprint or "",
+        "thread_alive": bool(_thread is not None and _thread.is_alive()),
     }
 
 
@@ -694,6 +729,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        # Loopback-only liveness for desktop watchdog (no auth — never expose remotely).
+        if path.startswith("/api/health"):
+            ip = (_client_ip(self) or "").strip().lower()
+            if ip not in ("127.0.0.1", "::1", "localhost"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self._json_response(200, {"ok": True, "tls": bool(_tls_enabled)})
+            return
         # Public: cert fingerprint for companion TOFU / pin check (not a secret)
         if path.startswith("/api/tls"):
             self._json_response(200, {
@@ -1010,9 +1054,14 @@ def start_monitor(
     global _server, _thread, _auth_user, _auth_pass, _controls_enabled
     configure_cursor_agent(cursor_agent_enabled, cursor_agent_token)
     global _auth_required, _tls_enabled, _cert_fingerprint
-    if _server is not None:
+    # Stale bind: socket still set but serve thread died — clean up so restart works.
+    if _server is not None and _thread is not None and not _thread.is_alive():
+        stop_monitor()
+    if _server is not None and is_running():
         scheme = "https" if _tls_enabled else "http"
         return True, f"Monitor already running on {scheme}://{host}:{port}"
+    if _server is not None:
+        stop_monitor()
 
     host = (host or "127.0.0.1").strip()
     remote_bind = host not in ("127.0.0.1", "localhost", "::1")
@@ -1043,6 +1092,8 @@ def start_monitor(
 
     try:
         _server = ThreadingHTTPServer((host, int(port)), _Handler)
+        _server.daemon_threads = True
+        _server.timeout = 2.0
         if want_tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -1065,13 +1116,34 @@ def start_monitor(
         _status["tls"] = _tls_enabled
         _status["cert_fingerprint"] = _cert_fingerprint
 
-    def _run():
+    def _run(httpd):
+        global _server, _thread, _tls_enabled
+        exit_why = "stopped"
         try:
-            _server.serve_forever(poll_interval=0.5)
-        except Exception:
-            pass
+            httpd.serve_forever(poll_interval=0.5)
+        except Exception as e:
+            exit_why = f"error: {e}"
+        finally:
+            # Only clear globals if we still own the active server (avoid killing a restart).
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+            if _server is httpd:
+                _server = None
+                _thread = None
+                _tls_enabled = False
+            try:
+                with _lock:
+                    _status["monitor_exit"] = exit_why
+                    _status["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            except Exception:
+                pass
 
-    _thread = threading.Thread(target=_run, name="MA-Monitor", daemon=True)
+    bound = _server
+    _thread = threading.Thread(
+        target=_run, args=(bound,), name="MA-Monitor", daemon=True
+    )
     _thread.start()
     scheme = "https" if _tls_enabled else "http"
     auth_note = " (Basic Auth on)" if _auth_user else ""
@@ -1080,17 +1152,38 @@ def start_monitor(
     return True, f"Monitor at {scheme}://{host}:{port}/{auth_note}{ctrl_note}{tls_note}"
 
 
-def stop_monitor():
+def stop_monitor(timeout_sec: float = 5.0):
+    """Shut down the monitor; hard-close if shutdown blocks past timeout_sec."""
     global _server, _thread, _tls_enabled
-    if _server is not None:
+    srv = _server
+    thr = _thread
+    if srv is None:
+        _thread = None
+        _tls_enabled = False
+        return
+    done = threading.Event()
+
+    def _shutdown():
         try:
-            _server.shutdown()
+            srv.shutdown()
         except Exception:
             pass
         try:
-            _server.server_close()
+            srv.server_close()
         except Exception:
             pass
+        done.set()
+
+    t = threading.Thread(target=_shutdown, name="MA-Monitor-Stop", daemon=True)
+    t.start()
+    if not done.wait(timeout=float(timeout_sec)):
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+    if thr is not None and thr.is_alive():
+        thr.join(timeout=1.0)
+    if _server is srv:
         _server = None
         _thread = None
         _tls_enabled = False

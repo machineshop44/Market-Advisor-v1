@@ -58,7 +58,7 @@
     "use_limit_entries": true,
     "use_limit_exits": true,
     "attach_protective_stops": true,
-    "et_flatten_before_close": false,
+    "et_flatten_before_close": true,
     "target_bp_utilization_pct": 88.0,
     "sizing_focus_slots": 6,
     "max_single_name_equity_pct": 15.0,

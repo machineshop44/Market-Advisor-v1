@@ -418,8 +418,9 @@ class ETradeAdapter(BaseBroker):
         try:
             data = self.client.get_portfolio(self.account_id_key)
             return normalize_etrade_holdings(data)
-        except Exception:
-            return []
+        except Exception as e:
+            # Do not pretend flat — empty list looks like a wipe to day-loss / EOD paths
+            raise RuntimeError(f"E*TRADE holdings unavailable: {e}") from e
 
     def prefetch_quotes(self, tickers):
         """Batch quote fetch — one API round-trip for many symbols."""
@@ -495,8 +496,33 @@ class ETradeAdapter(BaseBroker):
         clean = str(ticker).upper().replace("-USD", "")
         return clean in CRYPTO_TICKERS
 
+    def _regular_session_required(self, use_ext_hours, market_hours):
+        """
+        Until supports_extended_hours is proven, never emit orders outside RTH.
+        Sending marketSession=REGULAR while the street is EXTENDED yields:
+          Extended hours and market hours mismatch
+        """
+        if self.supports_extended_hours:
+            return True, ""
+        mh = str(market_hours or "").strip().lower()
+        if mh and mh not in ("regular_hours", "regular", ""):
+            return (
+                False,
+                f"Skipped: E*TRADE REGULAR-only (clock {market_hours}; "
+                f"avoids Extended hours / market hours mismatch)",
+            )
+        # Callers may pass market_hours=regular_hours even in EXTENDED (legacy).
+        # Prefer explicit use_ext only when extended is unsupported.
+        if bool(use_ext_hours):
+            return (
+                False,
+                "Skipped: E*TRADE REGULAR-only (extended flag set; "
+                "avoids Extended hours / market hours mismatch)",
+            )
+        return True, ""
+
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
-                        market_hours="regular_hours", allow_fractional=True):
+                        market_hours="regular_hours", allow_fractional=True, session_label=None):
         if self._reject_crypto(ticker, asset_type):
             return "E*TRADE does not support crypto via API", 0.0, None
         ok, reason = self._orders_allowed()
@@ -504,6 +530,17 @@ class ETradeAdapter(BaseBroker):
             return reason, 0.0, None
         if not self.is_connected or not self.client or not self.account_id_key:
             return "E*TRADE not connected", 0.0, None
+        label = str(session_label or "").upper()
+        if label and label != "REGULAR" and not self.supports_extended_hours:
+            return (
+                f"Skipped: E*TRADE equities idle in {label} "
+                f"(API REGULAR-only; avoids hours mismatch)",
+                0.0,
+                None,
+            )
+        sess_ok, sess_why = self._regular_session_required(use_ext_hours, market_hours)
+        if not sess_ok:
+            return sess_why, 0.0, None
 
         price = float(price or 0) or self.get_live_price(ticker)
         dollars = float(trade_dollars or 0)
@@ -569,12 +606,55 @@ class ETradeAdapter(BaseBroker):
             order_id = _extract_order_id(placed)
             spent = round(qty * price, 4)
             self._last_order_meta[str(order_id)] = {"side": "BUY", "qty": qty, "symbol": str(ticker).upper()}
-            return f"E*TRADE Buy submitted ({price_type} {qty} {str(ticker).upper()})", spent, order_id
+            sym = str(ticker).upper()
+            # Confirm briefly so "submitted" ≠ treated as filled (LIMIT often rests).
+            # MARKET gets a slightly longer window; LIMIT cancels on timeout (RH parity)
+            # so resting buys do not lock buying power overnight.
+            # Align closer to RH confirm windows; LIMIT still cancels on timeout.
+            confirm_sec = 20 if str(price_type).upper() == "MARKET" else 25
+            filled, state = False, "unknown"
+            if order_id:
+                try:
+                    filled, state = self.confirm_order(order_id, timeout_sec=confirm_sec)
+                except Exception as e:
+                    filled, state = False, str(e)[:80]
+            if filled:
+                return (
+                    f"E*TRADE Buy Filled ({price_type} {qty} {sym})",
+                    spent,
+                    order_id,
+                )
+            if order_id and str(price_type).upper() == "LIMIT":
+                cancel_ok, cancel_st = False, "no_id"
+                try:
+                    cancel_ok, cancel_st = self.cancel_order(order_id)
+                except Exception as e:
+                    cancel_ok, cancel_st = False, str(e)[:80]
+                if cancel_ok:
+                    return (
+                        f"Skipped: Limit unfilled ({state}) — cancelled",
+                        0.0,
+                        order_id,
+                    )
+                return (
+                    f"E*TRADE Buy submitted pending fill "
+                    f"({price_type} {qty} {sym}; {state}; cancel failed: {cancel_st})",
+                    spent,
+                    order_id,
+                )
+            # MARKET not confirmed — do not book spent/BP as filled (working-order honesty).
+            return (
+                f"E*TRADE Buy submitted pending fill "
+                f"({price_type} {qty} {sym}; {state})",
+                0.0,
+                order_id,
+            )
         except Exception as e:
             return f"E*TRADE buy error: {e}", 0.0, None
 
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-                         market_hours="regular_hours", allow_fractional=True, sell_all=False):
+                         market_hours="regular_hours", allow_fractional=True, sell_all=False,
+                         session_label=None):
         if self._reject_crypto(ticker, asset_type):
             return "E*TRADE does not support crypto via API", None
         ok, reason = self._orders_allowed()
@@ -582,6 +662,16 @@ class ETradeAdapter(BaseBroker):
             return reason, None
         if not self.is_connected or not self.client or not self.account_id_key:
             return "E*TRADE not connected", None
+        label = str(session_label or "").upper()
+        if label and label != "REGULAR" and not self.supports_extended_hours:
+            return (
+                f"Skipped: E*TRADE equities idle in {label} "
+                f"(API REGULAR-only; avoids hours mismatch)",
+                None,
+            )
+        sess_ok, sess_why = self._regular_session_required(use_ext_hours, market_hours)
+        if not sess_ok:
+            return sess_why, None
 
         # No native sell-all / close-position in E*TRADE equity XML — refresh live qty on full exit.
         if sell_all:
@@ -644,7 +734,37 @@ class ETradeAdapter(BaseBroker):
             order_id = _extract_order_id(placed)
             self._last_order_meta[str(order_id)] = {"side": "SELL", "qty": qty, "symbol": str(ticker).upper()}
             label = "Sell-All" if sell_all else "Sell"
-            return f"E*TRADE {label} submitted ({price_type} {qty} {str(ticker).upper()})", order_id
+            sym = str(ticker).upper()
+            confirm_sec = 15 if str(price_type).upper() == "MARKET" else 8
+            filled, state = False, "unknown"
+            if order_id:
+                try:
+                    filled, state = self.confirm_order(order_id, timeout_sec=confirm_sec)
+                except Exception as e:
+                    filled, state = False, str(e)[:80]
+            if filled:
+                return f"E*TRADE {label} Filled ({price_type} {qty} {sym})", order_id
+            if order_id and str(price_type).upper() == "LIMIT":
+                cancel_ok, cancel_st = False, "no_id"
+                try:
+                    cancel_ok, cancel_st = self.cancel_order(order_id)
+                except Exception as e:
+                    cancel_ok, cancel_st = False, str(e)[:80]
+                if cancel_ok:
+                    return (
+                        f"Skipped: Limit unfilled ({state}) — cancelled",
+                        order_id,
+                    )
+                return (
+                    f"E*TRADE {label} submitted pending fill "
+                    f"({price_type} {qty} {sym}; {state}; cancel failed: {cancel_st})",
+                    order_id,
+                )
+            return (
+                f"E*TRADE {label} submitted pending fill "
+                f"({price_type} {qty} {sym}; {state})",
+                order_id,
+            )
         except Exception as e:
             return f"E*TRADE sell error: {e}", None
 

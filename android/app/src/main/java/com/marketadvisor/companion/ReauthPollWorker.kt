@@ -20,18 +20,25 @@ class ReauthPollWorker(
         if (pin.isBlank()) return Result.success()
         return try {
             val status = MonitorApi.fetchStatus(url, user, pass, pin)
-            val need = status.brokers["E*TRADE"]?.reauthNeeded == true
+            val needBrokers = status.brokers.filter { it.value.reauthNeeded }.keys.toList()
             val dd = status.portfolioHeat.ddPaused
             ReauthNotifier.maybeNotifyFromStatus(
                 applicationContext,
-                reauthNeeded = need,
+                reauthNeeded = needBrokers.isNotEmpty(),
                 ddPaused = dd,
                 halted = status.halted,
                 signalAlert = status.signalAlert,
                 advisorCount = status.advisor.count,
+                reauthBrokers = needBrokers,
             )
             Result.success()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            val tls = e is MonitorApiException && e.kind == MonitorApiException.KIND_TLS
+            ReauthNotifier.maybeNotifyUnreachable(
+                applicationContext,
+                unreachable = true,
+                tlsPin = tls,
+            )
             Result.retry()
         }
     }
@@ -44,7 +51,7 @@ class ReauthPollWorker(
                 .build()
             WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(
                 UNIQUE,
-                ExistingPeriodicWorkPolicy.UPDATE,
+                ExistingPeriodicWorkPolicy.KEEP,
                 req,
             )
         }

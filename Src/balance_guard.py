@@ -20,7 +20,7 @@ LARGE_COLLAPSE_MIN_DROP = 15.0
 
 # Single-read drops that would newly trip max daily loss (small-account case).
 # Aug 4 2026: RH $88.81 (+$1.15) → ~$78.23 (−$9.43) with −$8 limit — no $0 wipe.
-DAY_LOSS_TRIP_CONFIRM_READS = 3
+DAY_LOSS_TRIP_CONFIRM_READS = 4
 
 # Sep 1 2026: RH baseline $100.49 after BTC buy → equity under-read $81.85 (−$18.64)
 # looked like MAX DAILY LOSS. Drop ≈ recent buy notional must never confirm as loss.
@@ -156,12 +156,16 @@ def repair_buying_power(
     ):
         return bp
     prior = _safe_float(prior_bp, 0.0)
-    # Prefer last good BP — implied cash can inflate when holdings snapshot is empty/stale
-    if prior >= 5.0:
-        return max(bp, prior)
     eq = _safe_float(equity, 0.0)
     hv = max(0.0, _safe_float(holdings_value, 0.0))
     implied = max(0.0, eq - hv)
+    # Prefer last good BP — implied cash can inflate when holdings snapshot is empty/stale.
+    # Cap prior repair so a stale high BP cannot outrun equity forever.
+    if prior >= 5.0:
+        capped = prior
+        if eq >= MIN_PRIOR_EQUITY:
+            capped = min(prior, max(bp, eq * 1.05))
+        return max(bp, min(capped, max(implied, bp) if implied > 0 else capped))
     return max(bp, implied)
 
 
@@ -172,15 +176,23 @@ def holdings_equity_gap(
     *,
     min_gap: float = 5.0,
     min_frac: float = 0.05,
+    prior_bp: float = 0.0,
 ) -> tuple[bool, float]:
     """
     True when equity − BP implies deployed capital that holdings mark does not cover.
     Returns (mismatch, ghost_dollars).
+
+    Ghost $0 BP (API glitch) must not look like missing holdings — callers should
+    repair BP first; we also refuse the lag banner when BP itself is unreliable.
     """
     eq = _safe_float(equity, 0.0)
     bp = _safe_float(buying_power, 0.0)
     hv = max(0.0, _safe_float(holdings_value, 0.0))
     if eq < MIN_PRIOR_EQUITY:
+        return False, 0.0
+    if buying_power_looks_unreliable(
+        eq, bp, holdings_value=hv, prior_bp=prior_bp
+    ):
         return False, 0.0
     implied = max(0.0, eq - bp)
     gap = implied - hv

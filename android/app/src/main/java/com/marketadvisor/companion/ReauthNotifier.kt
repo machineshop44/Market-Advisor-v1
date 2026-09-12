@@ -24,12 +24,17 @@ object ReauthNotifier {
     private const val NOTIFY_HALT = 3303
     private const val NOTIFY_SIGNAL = 3304
     private const val NOTIFY_ADVISOR = 3305
+    private const val NOTIFY_OFFLINE = 3306
+    private const val NOTIFY_TLS = 3307
 
     private const val KEY_LAST_REAUTH = "last_reauth_needed"
     private const val KEY_LAST_DD = "last_dd_paused"
     private const val KEY_LAST_HALT = "last_halted"
     private const val KEY_LAST_SIGNAL_ID = "last_signal_alert_id"
     private const val KEY_LAST_ADVISOR_COUNT = "last_advisor_count"
+    private const val KEY_LAST_OFFLINE = "last_desk_offline"
+    private const val KEY_LAST_TLS = "last_tls_mismatch"
+    private const val KEY_LAST_REAUTH_SIG = "last_reauth_brokers_sig"
 
     fun ensureChannel(ctx: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -44,14 +49,62 @@ object ReauthNotifier {
     }
 
     fun maybeNotify(ctx: Context, reauthNeeded: Boolean) {
-        edgeNotify(
+        maybeNotifyReauth(ctx, if (reauthNeeded) listOf("Unknown") else emptyList())
+    }
+
+    /** Per-broker reauth copy (RH/CB → open PC; ET → OAuth on phone). */
+    fun maybeNotifyReauth(ctx: Context, brokersNeeding: Collection<String>) {
+        ensureChannel(ctx)
+        val prefs = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        val names = brokersNeeding.map { it.trim() }.filter { it.isNotEmpty() }.distinct().sorted()
+        val active = names.isNotEmpty()
+        val sig = names.joinToString("|")
+        val wasActive = prefs.getBoolean(KEY_LAST_REAUTH, false)
+        val lastSig = prefs.getString(KEY_LAST_REAUTH_SIG, "") ?: ""
+        prefs.edit()
+            .putBoolean(KEY_LAST_REAUTH, active)
+            .putString(KEY_LAST_REAUTH_SIG, if (active) sig else "")
+            .apply()
+        if (!active) {
+            if (wasActive) NotificationManagerCompat.from(ctx).cancel(NOTIFY_REAUTH)
+            return
+        }
+        if (wasActive && sig == lastSig) return
+        if (Build.VERSION.SDK_INT >= 33) {
+            val ok = ContextCompat.checkSelfPermission(
+                ctx,
+                android.Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!ok) return
+        }
+        val (titleRes, bodyRes) = when {
+            names.size > 1 -> R.string.reauth_notify_title_multi to R.string.reauth_notify_body_multi
+            names.any { it.contains("E*TRADE", ignoreCase = true) || it.contains("etrade", ignoreCase = true) } ->
+                R.string.reauth_notify_title_etrade to R.string.reauth_notify_body_etrade
+            names.any { it.contains("Robinhood", ignoreCase = true) } ->
+                R.string.reauth_notify_title_robinhood to R.string.reauth_notify_body_robinhood
+            names.any { it.contains("Coinbase", ignoreCase = true) } ->
+                R.string.reauth_notify_title_coinbase to R.string.reauth_notify_body_coinbase
+            else -> R.string.reauth_notify_title to R.string.reauth_notify_body
+        }
+        val open = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pi = PendingIntent.getActivity(
             ctx,
-            active = reauthNeeded,
-            key = KEY_LAST_REAUTH,
-            notifyId = NOTIFY_REAUTH,
-            titleRes = R.string.reauth_notify_title,
-            bodyRes = R.string.reauth_notify_body,
+            NOTIFY_REAUTH,
+            open,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val note = NotificationCompat.Builder(ctx, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(ctx.getString(titleRes))
+            .setContentText(ctx.getString(bodyRes))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pi)
+            .build()
+        NotificationManagerCompat.from(ctx).notify(NOTIFY_REAUTH, note)
     }
 
     fun maybeNotifyDdPause(ctx: Context, ddPaused: Boolean) {
@@ -131,12 +184,84 @@ object ReauthNotifier {
         halted: Boolean,
         signalAlert: MonitorApi.SignalAlert? = null,
         advisorCount: Int = 0,
+        reauthBrokers: Collection<String> = emptyList(),
     ) {
-        maybeNotify(ctx, reauthNeeded)
+        // Reachable again — clear offline / TLS pin alerts
+        maybeNotifyUnreachable(ctx, unreachable = false, tlsPin = false)
+        val brokers = if (reauthBrokers.isNotEmpty()) {
+            reauthBrokers
+        } else if (reauthNeeded) {
+            listOf("Unknown")
+        } else {
+            emptyList()
+        }
+        maybeNotifyReauth(ctx, brokers)
         maybeNotifyDdPause(ctx, ddPaused)
         maybeNotifyHalt(ctx, halted)
         maybeNotifySignal(ctx, signalAlert)
         maybeNotifyAdvisor(ctx, advisorCount)
+    }
+
+    /**
+     * Edge-triggered when the phone cannot reach the desktop monitor (network)
+     * or gets a TLS fingerprint mismatch. Cleared when [maybeNotifyFromStatus] succeeds.
+     */
+    fun maybeNotifyUnreachable(ctx: Context, unreachable: Boolean, tlsPin: Boolean) {
+        if (!unreachable) {
+            edgeNotify(
+                ctx,
+                active = false,
+                key = KEY_LAST_OFFLINE,
+                notifyId = NOTIFY_OFFLINE,
+                titleRes = R.string.offline_notify_title,
+                bodyRes = R.string.offline_notify_body,
+            )
+            edgeNotify(
+                ctx,
+                active = false,
+                key = KEY_LAST_TLS,
+                notifyId = NOTIFY_TLS,
+                titleRes = R.string.tls_offline_notify_title,
+                bodyRes = R.string.tls_offline_notify_body,
+            )
+            return
+        }
+        if (tlsPin) {
+            // Prefer TLS wording; clear generic offline so we don't double-notify
+            edgeNotify(
+                ctx,
+                active = false,
+                key = KEY_LAST_OFFLINE,
+                notifyId = NOTIFY_OFFLINE,
+                titleRes = R.string.offline_notify_title,
+                bodyRes = R.string.offline_notify_body,
+            )
+            edgeNotify(
+                ctx,
+                active = true,
+                key = KEY_LAST_TLS,
+                notifyId = NOTIFY_TLS,
+                titleRes = R.string.tls_offline_notify_title,
+                bodyRes = R.string.tls_offline_notify_body,
+            )
+        } else {
+            edgeNotify(
+                ctx,
+                active = false,
+                key = KEY_LAST_TLS,
+                notifyId = NOTIFY_TLS,
+                titleRes = R.string.tls_offline_notify_title,
+                bodyRes = R.string.tls_offline_notify_body,
+            )
+            edgeNotify(
+                ctx,
+                active = true,
+                key = KEY_LAST_OFFLINE,
+                notifyId = NOTIFY_OFFLINE,
+                titleRes = R.string.offline_notify_title,
+                bodyRes = R.string.offline_notify_body,
+            )
+        }
     }
 
     fun maybeNotifyAdvisor(ctx: Context, count: Int) {
@@ -225,7 +350,10 @@ object ReauthNotifier {
     fun clear(ctx: Context) {
         NotificationManagerCompat.from(ctx).cancel(NOTIFY_REAUTH)
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_LAST_REAUTH, false).apply()
+            .edit()
+            .putBoolean(KEY_LAST_REAUTH, false)
+            .putString(KEY_LAST_REAUTH_SIG, "")
+            .apply()
     }
 
     fun clearAll(ctx: Context) {
@@ -235,6 +363,8 @@ object ReauthNotifier {
         nm.cancel(NOTIFY_HALT)
         nm.cancel(NOTIFY_SIGNAL)
         nm.cancel(NOTIFY_ADVISOR)
+        nm.cancel(NOTIFY_OFFLINE)
+        nm.cancel(NOTIFY_TLS)
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_LAST_REAUTH, false)
@@ -242,6 +372,9 @@ object ReauthNotifier {
             .putBoolean(KEY_LAST_HALT, false)
             .putString(KEY_LAST_SIGNAL_ID, "")
             .putInt(KEY_LAST_ADVISOR_COUNT, 0)
+            .putBoolean(KEY_LAST_OFFLINE, false)
+            .putBoolean(KEY_LAST_TLS, false)
+            .putString(KEY_LAST_REAUTH_SIG, "")
             .apply()
     }
 }

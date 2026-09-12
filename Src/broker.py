@@ -934,9 +934,29 @@ class RobinhoodAdapter(BaseBroker):
 
         use_ext = bool(use_ext_hours)
         price_type = "ask_price" if side == "buy" else "bid_price"
-        price = round_price(next(iter(get_latest_price(symbol, price_type, use_ext)), 0.00))
-        ask = round_price(next(iter(get_latest_price(symbol, "ask_price", use_ext)), 0.00))
-        bid = round_price(next(iter(get_latest_price(symbol, "bid_price", use_ext)), 0.00))
+
+        def _safe_round_quote(raw, fallback=0.0):
+            # get_latest_price can yield [None]; round_price(None) → TypeError
+            try:
+                if raw is None:
+                    return float(fallback)
+                return float(round_price(raw))
+            except (TypeError, ValueError):
+                return float(fallback)
+
+        price = _safe_round_quote(
+            next(iter(get_latest_price(symbol, price_type, use_ext) or []), None), 0.0
+        )
+        ask = _safe_round_quote(
+            next(iter(get_latest_price(symbol, "ask_price", use_ext) or []), None), 0.0
+        )
+        bid = _safe_round_quote(
+            next(iter(get_latest_price(symbol, "bid_price", use_ext) or []), None), 0.0
+        )
+        if price <= 0 and ask <= 0:
+            return {"detail": f"No usable RH quote for {symbol}"}
+        if price <= 0:
+            price = ask
         instruments = get_instruments_by_symbols(symbol, info="url") or []
         if not instruments:
             return {"detail": f"No instrument URL for {symbol}"}
@@ -1025,20 +1045,45 @@ class RobinhoodAdapter(BaseBroker):
                     )
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
             actual_spent = float(actual_spent_dec)
+            # Preflight quote — robin_stocks round_price(None) raises TypeError (NEAR/AMP spam).
+            try:
+                q = r.crypto.get_crypto_quote(ticker)
+                ask = None
+                if isinstance(q, dict):
+                    ask = q.get("ask_price") or q.get("mark_price") or q.get("bid_price")
+                if ask is None or float(ask) <= 0:
+                    return (
+                        f"Skipped: No RH crypto quote for {ticker} "
+                        "(session soft-dead or API gap)",
+                        0.0,
+                        None,
+                    )
+            except (TypeError, ValueError) as e:
+                return f"Skipped: RH crypto quote invalid for {ticker} ({e})", 0.0, None
+            except Exception as e:
+                return f"Skipped: RH crypto quote unavailable for {ticker} ({e})", 0.0, None
             try:
                 res = r.order_buy_crypto_by_quantity(ticker, safe_qty_str)
                 if isinstance(res, dict) and 'id' in res:
                     oid = res['id']
-                    conf, state = self.confirm_order(oid, is_crypto=True)
+                    conf, state = self.confirm_order(oid, is_crypto=True, timeout_sec=20)
                     if not conf and state and any(
                         x in str(state).lower() for x in ("reject", "fail", "cancel", "unconfirm")
                     ):
                         return f"Skipped: RH rejected ({state})", 0.0, None
+                    if oid and not conf:
+                        return self._rh_cancel_unfilled(oid, state, is_crypto=True)
                     tag = "Filled" if conf else f"Pending/{state}"
                     return f"Crypto Buy {tag} ({actual_spent:.2f})", actual_spent, oid
                 err = self._format_rh_order_error(res, what=f"crypto buy {ticker}")
                 if "422" in err or res is None:
                     return f"Skipped: RH rejected small/invalid crypto size ({err})", 0.0, None
+                return f"Fail: {err}", 0.0, None
+            except TypeError as e:
+                # round_price(None) inside robin_stocks when quote vanishes mid-call
+                err = str(e) if str(e).strip() else repr(e)
+                if "NoneType" in err or "float" in err:
+                    return f"Skipped: RH crypto price unavailable ({err})", 0.0, None
                 return f"Fail: {err}", 0.0, None
             except Exception as e:
                 err = str(e) if str(e).strip() and str(e).strip().lower() != "none" else repr(e)
@@ -1074,8 +1119,7 @@ class RobinhoodAdapter(BaseBroker):
                     oid = res.get("id")
                     conf, state = self.confirm_order(oid, is_crypto=False, timeout_sec=45) if oid else (False, "unknown")
                     if oid and not conf:
-                        self.cancel_order(oid, is_crypto=False)
-                        return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
+                        return self._rh_cancel_unfilled(oid, state, is_crypto=False)
                     tag = "Filled" if conf else f"Pending/{state}"
                     suffix = " Ext" if want_ext else ""
                     return f"Buy Fractional{suffix} {tag} ({trade_dollars:.2f})", trade_dollars, oid
@@ -1107,8 +1151,7 @@ class RobinhoodAdapter(BaseBroker):
                 oid = res.get("id")
                 conf, state = self.confirm_order(oid, is_crypto=False, timeout_sec=45) if oid else (False, "unknown")
                 if oid and not conf:
-                    self.cancel_order(oid, is_crypto=False)
-                    return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
+                    return self._rh_cancel_unfilled(oid, state, is_crypto=False)
                 tag = "Filled" if conf else f"Pending/{state}"
                 return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
             return f"Fail: {res}", 0.0, None
@@ -1134,12 +1177,25 @@ class RobinhoodAdapter(BaseBroker):
             oid = res.get("id")
             conf, state = self.confirm_order(oid, is_crypto=False, timeout_sec=45) if oid else (False, "unknown")
             if oid and not conf:
-                self.cancel_order(oid, is_crypto=False)
-                return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
+                return self._rh_cancel_unfilled(oid, state, is_crypto=False)
             tag = "Filled" if conf else f"Pending/{state}"
             return f"Buy Limit Ext {tag} ({qty_to_buy})", (qty_to_buy * limit_price), oid
         return f"Fail: {res}", 0.0, None
 
+    def _rh_cancel_unfilled(self, oid, state, *, is_crypto=False):
+        """Cancel resting order; only claim cancelled when cancel_order succeeds."""
+        ok_c, c_st = False, "no_id"
+        try:
+            ok_c, c_st = self.cancel_order(oid, is_crypto=is_crypto)
+        except Exception as e:
+            ok_c, c_st = False, str(e)[:80]
+        if ok_c:
+            return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
+        return (
+            f"Fail: Limit unfilled ({state}); cancel failed ({c_st})",
+            0.0,
+            oid,
+        )
 
     @staticmethod
     def _format_rh_order_error(res, what="order"):
@@ -1456,6 +1512,8 @@ class RobinhoodAdapter(BaseBroker):
         """
         RH equities: prefer trailing stop at hard_stop % (disaster trail), else fixed stop-loss.
         RH crypto: no stop API — caller keeps software TTP.
+        Note: RH stop APIs use extendedHours=False (RTH-centric). Overnight coverage is
+        software TTP / flatten — do not assume broker stops protect AH/overnight.
         """
         is_crypto = "crypto" in str(asset_type).lower() or is_known_crypto(ticker)
         if is_crypto:
@@ -1523,7 +1581,8 @@ class CoinbaseAdapter(BaseBroker):
         self.supports_crypto = True
         self.supports_fractional_equities = False
         self.supports_extended_hours = False
-        self.supports_protective_stops = False
+        # Stop-limit GTC sell is implemented; overnight risk uses broker stop + TTP.
+        self.supports_protective_stops = True
         self.min_equity_notional = 1.0
         self.client = None
         # Kill switch (default True — CB has no sandbox; uncheck to block live orders).
@@ -1792,6 +1851,7 @@ class CoinbaseAdapter(BaseBroker):
             "SPY", "QQQ", "TQQQ", "SOXL", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META",
             "AMZN", "VOO", "VTI", "IWM", "DIA", "PLTR", "SOUN", "SNDL", "PLUG", "GOEVQ",
             "SPCX", "NFLX", "GOOG", "GOOGL", "INTC", "BAC", "F", "GE", "DIS",
+            "AMC", "SMCI", "GME", "MULN", "FFIE", "NIO", "RIVN", "LCID", "SOFI",
         }
         if clean in equity_block or clean.endswith("Q") and len(clean) >= 4:
             return 0.0
@@ -1943,10 +2003,43 @@ class CoinbaseAdapter(BaseBroker):
 
             if data.get("success"):
                 oid = self._extract_order_id(data)
-                conf, state = self.confirm_order(oid, is_crypto=True) if oid else (False, "no_id")
-                tag = "Filled" if conf else f"Pending/{state}"
+                conf_sec = 20 if use_limit else 12
+                conf, state = (
+                    self.confirm_order(oid, is_crypto=True, timeout_sec=conf_sec)
+                    if oid
+                    else (False, "no_id")
+                )
                 kind = "limit" if use_limit else "market"
-                return f"Coinbase Buy {tag} ({kind} {trade_dollars:.2f})", trade_dollars, oid
+                if conf:
+                    return (
+                        f"Coinbase Buy Filled ({kind} {trade_dollars:.2f})",
+                        trade_dollars,
+                        oid,
+                    )
+                # GTC limits can rest forever — cancel so BP is not locked as "spent".
+                if oid and use_limit:
+                    cancel_ok, cancel_st = False, "no_id"
+                    try:
+                        cancel_ok, cancel_st = self.cancel_order(oid, is_crypto=True)
+                    except Exception as e:
+                        cancel_ok, cancel_st = False, str(e)[:80]
+                    if cancel_ok:
+                        return (
+                            f"Skipped: Limit unfilled ({state}) — cancelled",
+                            0.0,
+                            None,
+                        )
+                    return (
+                        f"Fail: Limit unfilled ({state}); cancel failed ({cancel_st})",
+                        0.0,
+                        oid,
+                    )
+                return (
+                    f"Coinbase Buy submitted pending fill "
+                    f"({kind} {trade_dollars:.2f}; {state})",
+                    0.0,
+                    oid,
+                )
             return f"Fail: {data.get('error_response', 'Unknown Error')}", 0.0, None
         except Exception as e:
             return f"Fail: {e}", 0.0, None

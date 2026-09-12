@@ -84,6 +84,72 @@ class TestLiveTradingGate(unittest.TestCase):
         self.assertEqual(spent, 0.0)
 
 
+class TestEtCancelUnfilledLimit(unittest.TestCase):
+    def test_limit_unfilled_is_cancelled(self):
+        from etrade_broker import ETradeAdapter
+
+        et = ETradeAdapter()
+        et.is_connected = True
+        et.environment = "sandbox"
+        et.live_trading_enabled = True
+        et.supports_fractional = True
+        et.account_id_key = "acct"
+        et.client = MagicMock()
+        et.client.preview_equity_order.return_value = {
+            "PreviewOrderResponse": {"PreviewIds": {"previewId": 7}}
+        }
+        et.client.place_equity_order.return_value = {
+            "PlaceOrderResponse": {"OrderIds": {"orderId": "OID9"}}
+        }
+        et.confirm_order = MagicMock(return_value=(False, "PENDING"))
+        et.cancel_order = MagicMock(return_value=(True, "cancelled"))
+
+        with patch("etrade_broker._extract_preview_id", return_value=7), patch(
+            "etrade_broker._extract_order_id", return_value="OID9"
+        ):
+            status, spent, oid = et.place_buy_order(
+                "SNAP", "stock", 10.0, 50.0, 0.005, False
+            )
+
+        self.assertIn("cancelled", status.lower())
+        self.assertIn("unfilled", status.lower())
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(oid, "OID9")
+        et.cancel_order.assert_called_once_with("OID9")
+
+    def test_market_pending_does_not_cancel(self):
+        from etrade_broker import ETradeAdapter
+
+        et = ETradeAdapter()
+        et.is_connected = True
+        et.environment = "sandbox"
+        et.live_trading_enabled = True
+        et.supports_fractional = True
+        et.account_id_key = "acct"
+        et.client = MagicMock()
+        et.client.preview_equity_order.return_value = {
+            "PreviewOrderResponse": {"PreviewIds": {"previewId": 8}}
+        }
+        et.client.place_equity_order.return_value = {
+            "PlaceOrderResponse": {"OrderIds": {"orderId": "OIDM"}}
+        }
+        et.confirm_order = MagicMock(return_value=(False, "PENDING"))
+        et.cancel_order = MagicMock(return_value=(True, "cancelled"))
+
+        with patch("etrade_broker._extract_preview_id", return_value=8), patch(
+            "etrade_broker._extract_order_id", return_value="OIDM"
+        ):
+            # offset 0 → MARKET
+            status, spent, oid = et.place_buy_order(
+                "PLUG", "stock", 5.0, 25.0, 0.0, False
+            )
+
+        self.assertIn("pending fill", status.lower())
+        # MARKET unconfirmed must not book spent as if filled (working-order honesty).
+        self.assertEqual(spent, 0.0)
+        et.cancel_order.assert_not_called()
+
+
 class TestCapabilities(unittest.TestCase):
     def test_broker_capabilities(self):
         from broker import RobinhoodAdapter, CoinbaseAdapter

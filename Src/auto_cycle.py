@@ -985,7 +985,8 @@ def locked_capital_summary(holdings: Iterable) -> dict[str, Any]:
     return {"count": len(rows), "total_value": total, "rows": rows}
 
 
-REGIME_IDLE_COACH_SEC = 3600  # ~1 hour of zero BUY signals
+REGIME_IDLE_COACH_SEC = 7200  # ~2 hours of zero BUY signals before regime-idle coach
+
 
 
 def regime_idle_coach_tip(
@@ -1166,6 +1167,45 @@ def sell_status_should_backoff(status: str) -> bool:
     if any(k in low for k in ("dust", "min", "too small", "otc", "delisted", "cannot trade", "no tradeable")):
         return True
     return False
+
+
+def buy_status_should_backoff(status: str) -> bool:
+    """True when a buy error is transient server-side and should cool down per ticker."""
+    low = str(status or "").lower()
+    needles = (
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 429",
+        "failed (500)",
+        "failed (502)",
+        "failed (503)",
+        "failed (429)",
+        "status_code=500",
+        "status_code=502",
+        "status_code=503",
+        "status_code=429",
+        "rate limit",
+        "too many requests",
+        "temporar",
+        "service unavailable",
+    )
+    return any(n in low for n in needles)
+
+
+def buy_order_is_working_unfilled(status: str) -> bool:
+    """True when broker accepted the order but it is not confirmed filled yet."""
+    st = str(status or "")
+    low = st.lower()
+    if "fail" in low or "skip" in low:
+        return False
+    if "filled" in low and "pending fill" not in low:
+        return False
+    return (
+        "pending fill" in low
+        or ("submitted" in low and "filled" not in low)
+        or "pending/" in low
+    )
 
 
 def locked_broker_entry(raw) -> tuple[float, int]:
@@ -1475,11 +1515,21 @@ def equity_buy_defer_reason(
     *,
     frac_ext_ineligible=None,
     known_cryptos: Optional[Iterable] = None,
+    broker_name: str = "Robinhood",
 ) -> Optional[str]:
     """
     Defer equity BUY when the resulting position could not be sold overnight
     (mirror of rh_equity_sell_defer_reason on projected size).
+
+    Robinhood-only: RH blocks fractional equity sells overnight / late extended.
+    E*TRADE supports fractional equities and is not subject to that RH session rule —
+    applying it there blocked live ET buys (e.g. SMCI) that sized under 1 share.
     """
+    bn = str(broker_name or "").upper().replace("*", "").replace(" ", "")
+    if "ETRADE" in bn or bn == "ET":
+        return None
+    if "COINBASE" in bn or bn == "CB":
+        return None
     overnight = {
         "label": "OVERNIGHT",
         "market_hours": "all_day_hours",
@@ -1504,6 +1554,68 @@ def equity_buy_defer_reason(
         if why2:
             return f"extended session exit risk — {why2}"
     return None
+
+
+def order_session_flags(broker_name: str, session: dict | None) -> dict:
+    """
+    Broker-aware order flags derived from the shared equity session clock.
+
+    RH owns fractional_ok (overnight / late-extended blocks).
+    E*TRADE and Coinbase must NOT inherit RH fractional_ok — that bled into
+    place_buy/place_sell and blocked ET sub-1 share tickets after 7:30pm ET
+    even when equity engines were still in EXTENDED.
+    Shared: use_ext / market_hours follow the ET calendar for equity venues.
+    """
+    sess = dict(session or {})
+    bn = str(broker_name or "").upper().replace("*", "").replace(" ", "")
+    use_ext = bool(sess.get("use_ext"))
+    market_hours = str(sess.get("market_hours") or "regular_hours")
+    if "COINBASE" in bn or bn == "CB":
+        return {
+            "allow_fractional": True,
+            "use_ext": False,
+            "market_hours": "regular_hours",
+        }
+    if "ETRADE" in bn or bn == "ET":
+        # ET API equity XML is REGULAR-only until supports_extended_hours is proven.
+        # Passing use_ext=True while still emitting REGULAR causes:
+        #   "Extended hours and market hours mismatch"
+        label = str(sess.get("label") or "").upper()
+        return {
+            "allow_fractional": True,
+            "use_ext": False,
+            "market_hours": "regular_hours",
+            "et_equity_session_ok": label == "REGULAR",
+            "session_label": label or "?",
+        }
+    # Robinhood (default)
+    return {
+        "allow_fractional": bool(sess.get("fractional_ok")),
+        "use_ext": use_ext,
+        "market_hours": market_hours,
+    }
+
+
+def etrade_equity_session_ok(session: dict | None = None, *, broker=None) -> tuple[bool, str]:
+    """
+    E*TRADE equities may only place when the shared clock is REGULAR, unless the
+    adapter has proven supports_extended_hours.
+    Returns (ok, reason_if_blocked).
+    """
+    if broker is not None and bool(getattr(broker, "supports_extended_hours", False)):
+        return True, ""
+    label = ""
+    if isinstance(session, dict):
+        label = str(session.get("label") or "").upper()
+    if label == "REGULAR":
+        return True, ""
+    if not label:
+        return False, "E*TRADE equity session unknown — waiting for REGULAR"
+    return (
+        False,
+        f"E*TRADE equities idle in {label} (API REGULAR-only; "
+        f"avoids Extended hours / market hours mismatch)",
+    )
 
 
 def equity_eod_action_for_holding(
@@ -1541,7 +1653,7 @@ def equity_eod_action_for_holding(
 
 
 def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
-    """Map crypto ticker -> broker name holding it."""
+    """Map crypto ticker -> set of broker names holding it (multi-venue safe)."""
     out: dict = {}
     for broker, rows in (holdings_by_broker or {}).items():
         for h in rows or []:
@@ -1560,17 +1672,23 @@ def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
                 sh = 0.0
             if sh <= 0:
                 continue
-            out[t] = str(broker)
+            out.setdefault(t, set()).add(str(broker))
     return out
 
 
 def crypto_held_on_other_broker(ticker, broker_name, held_map: dict) -> Optional[str]:
-    """Return broker name if ticker is held elsewhere."""
+    """Return another broker name if ticker is held elsewhere (multi-venue set-aware)."""
     clean = str(ticker or "").upper().replace("-USD", "")
-    owner = (held_map or {}).get(clean)
-    if owner and str(owner) != str(broker_name):
-        return str(owner)
-    return None
+    owners = (held_map or {}).get(clean)
+    if owners is None:
+        return None
+    if isinstance(owners, str):
+        return str(owners) if str(owners) != str(broker_name) else None
+    try:
+        others = [str(o) for o in owners if str(o) != str(broker_name)]
+    except TypeError:
+        return None
+    return others[0] if others else None
 
 
 def format_discord_settings_summary(*, webhook_set: bool, level: str) -> str:

@@ -36,15 +36,24 @@
     <string name="recent_trades_section">Recent Trades</string>
     <string name="queue_prefix">Queue:</string>
     <string name="pull_to_refresh">Pull down to refresh</string>
-    <string name="compat_note">Desktop 1.37.1+</string>
+    <string name="compat_note">Desktop 1.42.14+</string>
     <string name="reauth_etrade">Reauth E*TRADE</string>
     <string name="reauth_title">E*TRADE reauthorization</string>
     <string name="reauth_body">Open E*TRADE in the browser, approve access, then paste the verification code here.</string>
     <string name="reauth_open_browser">Open authorize page</string>
     <string name="reauth_paste_code">Paste verification code</string>
     <string name="reauth_complete">Complete reauth</string>
-    <string name="reauth_notify_title">E*TRADE needs reauth</string>
-    <string name="reauth_notify_body">Midnight token expired — open Market Advisor Companion to reauthorize.</string>
+    <string name="reauth_notify_title">Broker needs reauth</string>
+    <string name="reauth_notify_body">A connected broker needs reauthorization — open Companion to see which one.</string>
+    <string name="reauth_notify_title_etrade">E*TRADE needs reauth</string>
+    <string name="reauth_notify_body_etrade">Midnight token expired — open Companion and complete E*TRADE OAuth.</string>
+    <string name="reauth_notify_title_robinhood">Robinhood needs reauth</string>
+    <string name="reauth_notify_body_robinhood">Robinhood session expired — open Market Advisor on the PC and reconnect, then re-arm.</string>
+    <string name="reauth_notify_title_coinbase">Coinbase needs reauth</string>
+    <string name="reauth_notify_body_coinbase">Coinbase session expired — open Market Advisor on the PC and reconnect, then re-arm.</string>
+    <string name="reauth_notify_title_multi">Brokers need reauth</string>
+    <string name="reauth_notify_body_multi">Multiple brokers need reauthorization — open Companion / the PC desk.</string>
+    <string name="link_down_broker_detail">Link down — status unknown</string>
     <string name="reauth_channel_name">Broker reauth</string>
     <string name="ops_alerts_channel_name">Desk alerts</string>
     <string name="dd_notify_title">Drawdown pause</string>
@@ -70,4 +79,8 @@
     <string name="tls_pin_renew_body">Market Advisor is reachable, but its HTTPS certificate no longer matches the pin saved on this phone. That usually happens after a desktop update or a new TLS cert.\n\nOn the PC: Settings → Companion… → Show setup QR. Scan it here (or paste the new fingerprint). Until you do, Companion will look offline.</string>
     <string name="tls_pin_renew_hint">TLS pin mismatch — rescan the PC setup QR. The desk can still be running.</string>
     <string name="open_companion_settings">Open Settings</string>
+    <string name="offline_notify_title">Desk unreachable</string>
+    <string name="offline_notify_body">Companion cannot reach Market Advisor. Check the PC is running, same Wi‑Fi or Away URL, then rescan setup QR if needed.</string>
+    <string name="tls_offline_notify_title">TLS pin mismatch</string>
+    <string name="tls_offline_notify_body">Desktop cert no longer matches this phone. On the PC: Companion → Show setup QR, then scan here.</string>
 </resources>

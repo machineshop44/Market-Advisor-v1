@@ -193,3 +193,41 @@ def record_sell_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec
         f"(~{int(ttl_sec or 1800) // 60}m TTL or until reason changes)"
     )
     return False, note
+
+
+def buy_fail_should_skip(store, broker, ticker, *, now=None, ttl_sec=900):
+    """True when this buy ticker already hit a transient API error within TTL."""
+    import time
+    store = store if isinstance(store, dict) else {}
+    key = (str(broker), str(ticker).upper())
+    entry = store.get(key)
+    if not entry:
+        return False
+    ts_now = float(now if now is not None else time.time())
+    age = ts_now - float(entry.get("ts") or 0)
+    if age >= float(ttl_sec or 900):
+        store.pop(key, None)
+        return False
+    return True
+
+
+def record_buy_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec=900):
+    """Record a transient buy failure; return (already_recorded, note_or_none)."""
+    import time
+    if not isinstance(store, dict):
+        raise TypeError("store must be a dict")
+    key = (str(broker), str(ticker).upper())
+    reason = str(status or "Fail")[:180]
+    prev = store.get(key)
+    if prev and prev.get("reason") != reason:
+        store.pop(key, None)
+        prev = None
+    if prev and prev.get("reason") == reason:
+        return True, None
+    ts_now = float(now if now is not None else time.time())
+    store[key] = {"reason": reason, "ts": ts_now}
+    note = (
+        f"[{broker}] Buy FAIL [{ticker}]: {reason} — backing off retries "
+        f"(~{int(ttl_sec or 900) // 60}m TTL or until reason changes)"
+    )
+    return False, note

@@ -226,6 +226,86 @@ class TestCycleBookExtract(unittest.TestCase):
             ac.rh_equity_sell_defer_reason("AAPL", 0.5, 50, "stock", ext) or "",
         )
 
+    def test_equity_buy_defer_rh_only(self):
+        sess = {"label": "REGULAR", "fractional_ok": True, "equity_tradeable": True}
+        # Sub-1 share would be stuck overnight on RH
+        why = ac.equity_buy_defer_reason(
+            "SMCI", 0.4, 50.0, "stock", sess, broker_name="Robinhood",
+        )
+        self.assertIsNotNone(why)
+        self.assertIn("overnight", why.lower())
+        # E*TRADE must not inherit RH overnight fractional sell rules
+        self.assertIsNone(
+            ac.equity_buy_defer_reason(
+                "SMCI", 0.4, 50.0, "stock", sess, broker_name="E*TRADE",
+            )
+        )
+        self.assertIsNone(
+            ac.equity_buy_defer_reason(
+                "SMCI", 0.4, 50.0, "stock", sess, broker_name="Coinbase",
+            )
+        )
+
+    def test_order_session_flags_broker_parity(self):
+        """RH late-extended fractional_ok=False must not bleed to ET/CB."""
+        late_ext = {
+            "label": "EXTENDED",
+            "use_ext": True,
+            "market_hours": "extended_hours",
+            "fractional_ok": False,
+            "equity_tradeable": True,
+        }
+        rh = ac.order_session_flags("Robinhood", late_ext)
+        et = ac.order_session_flags("E*TRADE", late_ext)
+        cb = ac.order_session_flags("Coinbase", late_ext)
+        self.assertFalse(rh["allow_fractional"])
+        self.assertTrue(et["allow_fractional"])
+        self.assertTrue(cb["allow_fractional"])
+        self.assertTrue(et["use_ext"])
+        self.assertFalse(cb["use_ext"])
+
+        overnight = {
+            "label": "OVERNIGHT",
+            "use_ext": True,
+            "market_hours": "all_day_hours",
+            "fractional_ok": False,
+            "equity_tradeable": True,
+        }
+        self.assertFalse(ac.order_session_flags("Robinhood", overnight)["allow_fractional"])
+        self.assertTrue(ac.order_session_flags("E*TRADE", overnight)["allow_fractional"])
+        self.assertTrue(ac.order_session_flags("Coinbase", overnight)["allow_fractional"])
+
+    def test_partition_portfolio_sells_rh_defer_only(self):
+        sess = {"label": "OVERNIGHT", "fractional_ok": False, "equity_tradeable": True}
+        notes = []
+
+        def rh_defer(ticker, shares, price, asset_type, session):
+            if float(shares or 0) < 1:
+                return "fractional equity sells blocked"
+            return None
+
+        def note_deferred(broker, tick, defer, label, notes_tmp):
+            notes_tmp.append(f"{broker}:{tick}:{defer}")
+
+        sells = [
+            {"broker": "Robinhood", "ticker": "META", "shares": 0.5, "price": 100, "type": "stock"},
+            {"broker": "E*TRADE", "ticker": "SMCI", "shares": 0.5, "price": 50, "type": "stock"},
+            {"broker": "Coinbase", "ticker": "BTC", "shares": 0.01, "price": 60000, "type": "cryptocurrency"},
+        ]
+        actionable, deferred, _ = ac.partition_portfolio_sells(
+            sells,
+            broker_name="Robinhood",
+            session=sess,
+            sell_fail_should_skip=lambda b, t: False,
+            rh_defer_reason_fn=rh_defer,
+            note_deferred_fn=note_deferred,
+        )
+        tickers = {str(r.get("ticker")).upper() for r in actionable}
+        self.assertNotIn("META", tickers)
+        self.assertIn("SMCI", tickers)
+        self.assertIn("BTC", tickers)
+        self.assertIn("META", set(deferred))
+
     def test_rotate_and_portfolio_notes(self):
         self.assertIn("skipped", ac.format_rotate_skip_note("Coinbase", "no edge"))
         self.assertIn("fund SOL", ac.format_rotate_sell_note(
@@ -349,11 +429,15 @@ class TestCycleBookExtract(unittest.TestCase):
     def test_crypto_held_across_brokers(self):
         held = ac.crypto_held_across_brokers({
             "Robinhood": [{"ticker": "BTC", "shares": 0.01, "type": "crypto"}],
-            "Coinbase": [{"ticker": "ETH", "shares": 0.1, "type": "crypto"}],
+            "Coinbase": [
+                {"ticker": "ETH", "shares": 0.1, "type": "crypto"},
+                {"ticker": "BTC", "shares": 0.02, "type": "crypto"},
+            ],
         })
-        self.assertEqual(held.get("BTC"), "Robinhood")
+        self.assertEqual(held.get("BTC"), {"Robinhood", "Coinbase"})
         self.assertEqual(ac.crypto_held_on_other_broker("BTC", "Coinbase", held), "Robinhood")
-        self.assertIsNone(ac.crypto_held_on_other_broker("BTC", "Robinhood", held))
+        self.assertEqual(ac.crypto_held_on_other_broker("BTC", "Robinhood", held), "Coinbase")
+        self.assertIsNone(ac.crypto_held_on_other_broker("ETH", "Coinbase", held))
 
     def test_equity_eod_action_fractional_flatten(self):
         action = ac.equity_eod_action_for_holding(
@@ -364,6 +448,19 @@ class TestCycleBookExtract(unittest.TestCase):
             "MSFT", 2.0, 400.0, "stock", broker_name="Robinhood",
         )
         self.assertIn(action2, ("keep", "repair"))
+
+    def test_buy_status_backoff_and_working(self):
+        self.assertTrue(ac.buy_status_should_backoff("E*TRADE buy error: HTTP 500"))
+        self.assertFalse(ac.buy_status_should_backoff("E*TRADE Buy Filled (MARKET 1 A)"))
+        self.assertTrue(
+            ac.buy_order_is_working_unfilled(
+                "E*TRADE Buy submitted pending fill (LIMIT 1 SNAP; PENDING)"
+            )
+        )
+        self.assertFalse(
+            ac.buy_order_is_working_unfilled("Skipped: Limit unfilled (PENDING) — cancelled")
+        )
+        self.assertFalse(ac.buy_order_is_working_unfilled("E*TRADE Buy Filled (LIMIT 1 A)"))
 
 
 if __name__ == "__main__":

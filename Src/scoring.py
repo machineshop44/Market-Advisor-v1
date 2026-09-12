@@ -294,11 +294,11 @@ RISK_POSTURE_PROFILES = {
         "hint": (
             "Small-book mode (~$50–$500): micro full-deploy sizing, faster green takes, "
             "1 buy/cycle, tighter DD pause (~14% peak) so rough patches freeze entries sooner. "
-            "Skips SPY/BTC regime gates on new entries; still hard-stopped + fee-clear gate. "
+            "Uses SPY/BTC regime gates (same as Balanced); still hard-stopped + fee-clear gate. "
             "Auto-applies when auto-scale is on and equity is under $500."
         ),
-        "require_crypto_regime": False,
-        "require_equity_regime": False,
+        "require_crypto_regime": True,
+        "require_equity_regime": True,
         "target_bp_utilization_pct": 92.0,
         "sizing_focus_slots": 3,
         "max_open_positions": 4,

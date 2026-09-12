@@ -80,6 +80,8 @@ from activity_log_util import (  # noqa: E402
     explain_no_buys_after_rank as _explain_no_buys_after_rank_impl,
     sell_fail_should_skip as _sell_fail_should_skip_impl,
     record_sell_fail_backoff as _record_sell_fail_backoff_impl,
+    buy_fail_should_skip as _buy_fail_should_skip_impl,
+    record_buy_fail_backoff as _record_buy_fail_backoff_impl,
 )
 import auto_cycle as _auto_cycle  # noqa: E402
 import decision_log as _decision_log  # noqa: E402
@@ -151,6 +153,32 @@ def _is_manual_auth_failure(detail):
     if "(401)" in text or "(403)" in text:
         return True
     return False
+
+
+def _is_soft_session_death(detail):
+    """True when balance/API reads look like a dead session that never hard-401s.
+
+    Robinhood often keeps pickle 'connected' while profile/holdings soft-fail for hours.
+    """
+    text = str(detail or "").lower()
+    needles = (
+        "account profile unavailable",
+        "profile unavailable",
+        "saved session expired",
+        "session check returned no response",
+        "session disconnected",
+        "not connected",
+        "login required",
+        "please log in",
+        "authentication credentials",
+    )
+    return any(n in text for n in needles)
+
+
+# Consecutive bad balance polls while armed → escalate to reauth + Discord.
+# Balance poll is ~60s; 6 ≈ 6 min of soft death, 12 ≈ any long outage.
+_SOFT_REAUTH_STREAK = 6
+_SOFT_REAUTH_ANY_STREAK = 12
 
 
 class SuppressPrints:
@@ -225,7 +253,7 @@ def load_settings():
         "use_limit_entries": True,
         "use_limit_exits": True,
         "attach_protective_stops": True,
-        "et_flatten_before_close": False,
+        "et_flatten_before_close": True,
         "advisor_ask_before_apply": True,
         "advisor_ai_source": "local",
         "advisor_ai_enabled": True,
@@ -264,7 +292,7 @@ def load_settings():
         "risk_pct_per_trade": 0.75,
         "max_open_risk_pct": 6.0,
         "daily_profit_target": 0.0,
-        "daily_loss_limit": 8.0,
+        "daily_loss_limit": 15.0,
         "max_open_positions": 8,
         "max_buys_per_cycle": 1,
         "interval_crypto": 45,
@@ -283,6 +311,8 @@ def load_settings():
         "etrade_token_expires_at": 0.0,
         "etrade_live_trading": False,
         "etrade_arm_intent": False,
+        "robinhood_arm_intent": False,
+        "coinbase_arm_intent": False,
         "prefer_whole_shares_for_stops": True,
         "allow_fractional_ttp_only": True,
         "shadow_guardrail_enabled": True,
@@ -1507,6 +1537,8 @@ class MarketAdvisorGUI(QMainWindow):
         self._cost_seeded_logged = set()  # "Broker:TICKER:source" seeded-once log
         self._sell_fail_backoff = {}  # (broker, ticker) -> {reason, ts} hopeless sell defer
         self._sell_fail_backoff_ttl_sec = 1800  # 30m TTL; also clears when fail reason changes
+        self._buy_fail_backoff = {}  # (broker, ticker) -> transient buy API fail defer
+        self._buy_fail_backoff_ttl_sec = 900  # 15m for ET HTTP 500 / rate-limit spam
         self._frac_buy_defer_log = {}  # (broker, ticker, session) -> True once-per-session
         self._frac_stop_na_logged = set()  # Broker:TICKER fractional stop N/A logged once
         self._balances_refresh_in_flight = False
@@ -2483,7 +2515,28 @@ class MarketAdvisorGUI(QMainWindow):
                 row["stale"] = True
                 out.append(row)
             return out
-        assets = broker.get_current_holdings()
+        try:
+            assets = broker.get_current_holdings()
+        except Exception as e:
+            # Never treat a broker error as an empty book (false flatten / EOD).
+            if not hasattr(self, "_holdings_cache_by_broker"):
+                self._holdings_cache_by_broker = _blank_broker_map(list)
+            stale = list((self._holdings_cache_by_broker or {}).get(broker_name) or [])
+            self._throttled_log(
+                f"{broker_name}:holdings_fetch_error",
+                f"[{broker_name}] Holdings fetch failed — keeping "
+                f"{len(stale)} cached row(s) ({str(e)[:120]})",
+                cooldown_sec=60,
+            )
+            out = []
+            for a in stale:
+                if not isinstance(a, dict) or not a.get("ticker"):
+                    continue
+                row = dict(a)
+                row["broker"] = broker_name
+                row["stale"] = True
+                out.append(row)
+            return out
         # E*TRADE historically returned {SYM: {...}}; RH/CB return list[dict].
         if isinstance(assets, dict):
             normalized = []
@@ -2721,7 +2774,7 @@ class MarketAdvisorGUI(QMainWindow):
         try:
             from scoring import compute_slippage_bps, note_fill_slippage
             slip_bps = compute_slippage_bps(side, q, fp)
-            if confirmed and slip_bps is not None:
+            if confirmed and slip_bps is not None and "[PAPER]" not in str(status or ""):
                 fb_note = note_fill_slippage(slip_bps)
                 if fb_note:
                     try:
@@ -2875,6 +2928,13 @@ class MarketAdvisorGUI(QMainWindow):
         """Paper-mode-aware buy. Never calls the real broker API when self.paper_mode is True."""
         broker_name = self.cycle_broker_name
         offset_pct = self._effective_limit_offset(offset_pct, side="buy")
+        sess = self.get_equity_session_info()
+        if broker_name == "E*TRADE":
+            ok, why = _auto_cycle.etrade_equity_session_ok(
+                sess, broker=self.brokers.get("E*TRADE"),
+            )
+            if not ok:
+                return why, 0.0
         if self.paper_mode:
             cash = self.sandbox_cash.get(broker_name, 0.0)
             if price <= 0 or trade_dollars < 1.0:
@@ -2902,21 +2962,27 @@ class MarketAdvisorGUI(QMainWindow):
             )
             self._attach_protective_stop(broker_name, ticker, asset_type, price, trade_dollars)
             return status, trade_dollars
+        buy_kwargs = {
+            "market_hours": market_hours,
+            "allow_fractional": allow_fractional,
+        }
+        if broker_name == "E*TRADE":
+            buy_kwargs["session_label"] = str(sess.get("label") or "")
         result = self.cycle_broker.place_buy_order(
             ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
-            market_hours=market_hours, allow_fractional=allow_fractional,
+            **buy_kwargs,
         )
         if isinstance(result, tuple) and len(result) >= 3:
             status, spent, order_id = result[0], result[1], result[2]
         else:
             status, spent = result[0], result[1]
             order_id = None
-        if spent and spent > 0 and price > 0:
+        if spent and spent > 0 and price > 0 and "Filled" in str(status):
             self._record_buy_cost(broker_name, ticker, price, spent / price)
         fill_px = price
         try:
             qty_est = (spent / price) if price and spent else None
-            if qty_est:
+            if qty_est and "Filled" in str(status):
                 fill_px = float(spent) / float(qty_est)
         except Exception:
             fill_px = price
@@ -3021,6 +3087,13 @@ class MarketAdvisorGUI(QMainWindow):
             offset_pct = 0.0
         else:
             offset_pct = self._effective_limit_offset(offset_pct, side="sell")
+        sess = self.get_equity_session_info()
+        if broker_name == "E*TRADE":
+            ok, why = _auto_cycle.etrade_equity_session_ok(
+                sess, broker=self.brokers.get("E*TRADE"),
+            )
+            if not ok:
+                return why
         if self.paper_mode:
             book = self.sandbox_holdings.setdefault(broker_name, {})
             pos = book.get(ticker)
@@ -3051,20 +3124,34 @@ class MarketAdvisorGUI(QMainWindow):
             return status
         # Live: cancel protective first so reserved shares can sell
         self._cancel_protective_stop(broker_name, ticker, asset_type)
+        sell_kwargs = {
+            "market_hours": market_hours,
+            "allow_fractional": allow_fractional,
+            "sell_all": sell_all,
+        }
+        if broker_name == "E*TRADE":
+            sell_kwargs["session_label"] = str(sess.get("label") or "")
         result = self.cycle_broker.place_sell_order(
             ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
-            market_hours=market_hours, allow_fractional=allow_fractional, sell_all=sell_all,
+            **sell_kwargs,
         )
         if isinstance(result, tuple):
             status = result[0]
             order_id = result[1] if len(result) > 1 else None
         else:
             status, order_id = result, None
-        if "Fail" not in status and "Skipped" not in status:
+        # Only clear basis on a confirmed fill — bare "submitted" must not wipe TTP/ROI
+        st = str(status or "")
+        filled = (
+            "Fail" not in st
+            and "Skipped" not in st
+            and ("Filled" in st or "[PAPER]" in st)
+        )
+        if filled:
             self.cost_basis_cache.get(broker_name, {}).pop(ticker, None)
         # Don't journal session/eligibility skips — those are deferred and would spam Recent Trades
-        st_l = str(status).lower()
-        if "Skipped" in str(status) and (
+        st_l = st.lower()
+        if "Skipped" in st and (
             "overnight" in st_l
             or "fractional" in st_l
             or "ext. hours" in st_l
@@ -3100,12 +3187,17 @@ class MarketAdvisorGUI(QMainWindow):
                 tag = self.cycle_broker_name if self._cycle_broker else "App"
                 body = {"username": "MarketAdvisor"}
                 pfx = f"{prefix} " if prefix else ""
+                # @here on REAUTH so Discord mobile buzzes even when the companion is closed.
+                mention = ""
+                if urgent and "REAUTH" in str(prefix or "").upper():
+                    mention = "@here "
+                    body["allowed_mentions"] = {"parse": ["here"]}
                 if embed:
                     body["embeds"] = [embed]
                     if message:
-                        body["content"] = f"🤖 **MarketAdvisor [{tag}]** {pfx}".rstrip()
+                        body["content"] = f"{mention}🤖 **MarketAdvisor [{tag}]** {pfx}".rstrip()
                 else:
-                    body["content"] = f"🤖 **MarketAdvisor [{tag}]**: {pfx}{message}"
+                    body["content"] = f"{mention}🤖 **MarketAdvisor [{tag}]**: {pfx}{message}"
                 payload = json.dumps(body).encode('utf-8')
                 req = urllib.request.Request(
                     webhook_url,
@@ -3621,7 +3713,7 @@ class MarketAdvisorGUI(QMainWindow):
             broker=broker_name, engine=engine, session_label=sess,
             max_afford_share=max_sh, cycles=streak,
         )
-        if self._throttled_log(f"{key}:zero_signal_coach", msg, cooldown_sec=1800):
+        if self._throttled_log(f"{key}:zero_signal_coach", msg, cooldown_sec=3600):
             self.log_event(f"[COACH] {msg}")
 
     def _reorder_task_queue_buy_focus(self):
@@ -3979,6 +4071,41 @@ class MarketAdvisorGUI(QMainWindow):
                         self._handle_broker_auth_failure(
                             name, reason, source="balance_poll"
                         )
+                # Soft RH/CB death never hard-401s — escalate after a streak so Discord
+                # [REAUTH] fires without waiting for an app restart.
+                streak = int(self._balance_bad_streak.get(name, 0) or 0)
+                armed = bool((getattr(self, "auto_trade_enabled", {}) or {}).get(name))
+                already_reauth = bool(
+                    (getattr(self, "_broker_manual_auth_needed", {}) or {}).get(name)
+                )
+                if (
+                    armed
+                    and not already_reauth
+                    and not _is_manual_auth_failure(reason)
+                    and (
+                        (
+                            streak >= _SOFT_REAUTH_STREAK
+                            and (
+                                _is_soft_session_death(reason)
+                                or reason in ("disconnected", "zero_equity_unreliable")
+                                or str(reason).startswith("zero equity with")
+                            )
+                        )
+                        or (
+                            streak >= _SOFT_REAUTH_ANY_STREAK
+                            and (
+                                _is_soft_session_death(reason)
+                                or reason in ("disconnected", "zero_equity_unreliable")
+                                or str(reason).startswith("zero equity with")
+                            )
+                        )
+                    )
+                ):
+                    self._handle_broker_auth_failure(
+                        name,
+                        f"{reason} (soft-fail streak {streak})",
+                        source=f"balance_streak:{streak}",
+                    )
                 merged[name] = {"p_val": keep_p, "bp": keep_bp}
                 trusted[name] = False
                 continue
@@ -4392,6 +4519,7 @@ class MarketAdvisorGUI(QMainWindow):
         """
         if not self.settings.get("monitor_enabled", True):
             monitor.stop_monitor()
+            self._monitor_restart_in_flight = False
             return
         host = self.settings.get("monitor_host", "127.0.0.1") or "127.0.0.1"
         port = int(self.settings.get("monitor_port", 8791))
@@ -4444,8 +4572,68 @@ class MarketAdvisorGUI(QMainWindow):
         self.active_threads.append(task)
         task.start()
 
+    def _ensure_web_monitor_alive(self, now=None):
+        """If Companion monitor should be up but is dead/zombie, restart it."""
+        if not bool(self.settings.get("monitor_enabled", True)):
+            return
+        now = float(now if now is not None else time.time())
+        # Unstick watchdog if a prior restart never completed its callback
+        if bool(getattr(self, "_monitor_restart_in_flight", False)):
+            started = float(getattr(self, "_monitor_restart_started_at", 0.0) or 0.0)
+            if started and (now - started) >= 45.0:
+                self._monitor_restart_in_flight = False
+                self.log_event(
+                    "[Companion] Monitor restart timed out — clearing in-flight lock"
+                )
+            else:
+                return
+        try:
+            running = bool(monitor.is_running())
+        except Exception:
+            running = False
+        healthy = False
+        if running:
+            try:
+                healthy = bool(monitor.probe_localhost(timeout_sec=1.5))
+            except Exception:
+                healthy = False
+            if healthy:
+                return
+        last = float(getattr(self, "_monitor_watchdog_at", 0.0) or 0.0)
+        if (now - last) < 20.0:
+            return
+        self._monitor_watchdog_at = now
+        self._monitor_restart_in_flight = True
+        self._monitor_restart_started_at = now
+        exit_why = ""
+        try:
+            st = monitor.get_status() or {}
+            exit_why = str(st.get("monitor_exit") or "").strip()
+        except Exception:
+            exit_why = ""
+        if running and not healthy:
+            why = " (zombie: thread up, localhost probe failed)"
+        else:
+            why = f" ({exit_why})" if exit_why else ""
+        self.log_event(f"[Companion] Web monitor not healthy{why} — auto-restarting")
+        # Discord so remote desk notices even if companion poll is 15m behind
+        last_dc = float(getattr(self, "_monitor_restart_discord_at", 0.0) or 0.0)
+        if (now - last_dc) >= 1800.0:
+            self._monitor_restart_discord_at = now
+            try:
+                self.send_discord_alert(
+                    f"Companion web monitor was down{why} — auto-restarting. "
+                    f"If the phone shows offline, pull-to-refresh after ~1 min.",
+                    urgent=True,
+                    prefix="[MONITOR]",
+                )
+            except Exception:
+                pass
+        self._start_web_monitor()
+
     def _on_web_monitor_started(self, result):
         """UI follow-up after async monitor bind (ignore superseded restarts)."""
+        self._monitor_restart_in_flight = False
         result = result or {}
         if result.get("gen") != getattr(self, "_monitor_start_gen", 0):
             return
@@ -4972,7 +5160,7 @@ class MarketAdvisorGUI(QMainWindow):
                 self._disarm_broker(
                     broker,
                     notify_discord=was_on,
-                    clear_arm_intent=(broker == "E*TRADE"),
+                    clear_arm_intent=True,
                 )
                 self.publish_monitor_status()
                 self.log_event(f"[Companion] Auto-Trader DISARMED for {broker}")
@@ -6509,6 +6697,13 @@ class MarketAdvisorGUI(QMainWindow):
                 pass
             self.set_working_state(False)
             if unlock_queue_on_error:
+                cur_gen = int(getattr(self, "_cycle_gen", 0) or 0)
+                run_gen = int(getattr(self, "_running_cycle_gen", cur_gen) or 0)
+                if run_gen != cur_gen:
+                    self.log_event(
+                        f"[AUTO] Ignoring stale cycle error unlock (gen {run_gen}≠{cur_gen})"
+                    )
+                    return
                 if _is_manual_auth_failure(summary):
                     broker = getattr(self, "cycle_broker_name", None) or getattr(
                         self, "_cycle_broker", None
@@ -6518,7 +6713,7 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                 else:
                     self._send_cycle_error_discord(fname, summary)
-                self.cycle_finished()
+                self.cycle_finished(cycle_gen=run_gen)
 
         task.result_ready.connect(on_success_callback)
         task.error_occurred.connect(_on_error)
@@ -6554,7 +6749,19 @@ class MarketAdvisorGUI(QMainWindow):
 
     def run_cycle_thread(self, target_func, on_success_callback, *args):
         """Background work for auto-trade cycles — unlocks the queue if the worker crashes."""
-        self.run_thread(target_func, on_success_callback, *args, unlock_queue_on_error=True)
+        gen = int(getattr(self, "_running_cycle_gen", getattr(self, "_cycle_gen", 0)) or 0)
+
+        def _guarded_success(result):
+            if int(getattr(self, "_cycle_gen", 0) or 0) != gen:
+                self.log_event(
+                    f"[AUTO] Dropping stale cycle result (gen {gen}) — stall unlocked"
+                )
+                return
+            on_success_callback(result)
+
+        self.run_thread(
+            target_func, _guarded_success, *args, unlock_queue_on_error=True
+        )
 
     def log_event(self, message):
         timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -10114,7 +10321,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         eod_opts = QHBoxLayout()
         self.et_flatten_close_chk = QCheckBox("Flatten E*TRADE equities before close")
-        self.et_flatten_close_chk.setChecked(bool(self.settings.get("et_flatten_before_close", False)))
+        self.et_flatten_close_chk.setChecked(bool(self.settings.get("et_flatten_before_close", True)))
         self.et_flatten_close_chk.setToolTip(
             "Optional. At ~15:59 ET pre-close: market-sell ET equity holdings so you are not "
             "naked overnight if the app is off or midnight reauth fails. OFF by default — "
@@ -11645,8 +11852,8 @@ class MarketAdvisorGUI(QMainWindow):
             self._reset_autotrader_banner_style()
 
     def _disarm_broker(self, broker_name, notify_discord=False, *, clear_arm_intent=False):
-        if broker_name == "E*TRADE" and clear_arm_intent:
-            self._set_etrade_arm_intent(False)
+        if clear_arm_intent:
+            self._set_broker_arm_intent(broker_name, False)
         self.auto_trade_enabled[broker_name] = False
         self.task_queue = [
             item for item in self.task_queue
@@ -11661,60 +11868,79 @@ class MarketAdvisorGUI(QMainWindow):
                 prefix="[RISK]",
             )
 
-    def _set_etrade_arm_intent(self, want: bool):
-        """Remember user wanted ET armed through midnight reauth / session drop."""
-        prev = bool(self.settings.get("etrade_arm_intent", False))
+    def _arm_intent_key(self, broker_name):
+        return {
+            "E*TRADE": "etrade_arm_intent",
+            "Robinhood": "robinhood_arm_intent",
+            "Coinbase": "coinbase_arm_intent",
+        }.get(broker_name)
+
+    def _set_broker_arm_intent(self, broker_name, want: bool):
+        """Remember user wanted this broker armed through session drop / reauth."""
+        key = self._arm_intent_key(broker_name)
+        if not key:
+            return
+        prev = bool(self.settings.get(key, False))
         want = bool(want)
         if prev == want:
             return
-        self.settings["etrade_arm_intent"] = want
+        self.settings[key] = want
         try:
             save_settings(self.settings)
         except Exception:
             pass
 
-    def _maybe_restore_etrade_arm(self, *, source=""):
-        """
-        Re-arm E*TRADE after successful reconnect when user had it armed before
-        midnight expiry or auth failure. Full OAuth still required at midnight ET —
-        this only restores Auto-Trader once tokens are valid again.
-        """
-        if not bool(self.settings.get("etrade_arm_intent", False)):
+    def _set_etrade_arm_intent(self, want: bool):
+        """Backward-compatible alias for E*TRADE arm intent."""
+        self._set_broker_arm_intent("E*TRADE", want)
+
+    def _maybe_restore_broker_arm(self, broker_name, *, source=""):
+        """Re-arm a broker after reconnect when user had it armed before session death."""
+        key = self._arm_intent_key(broker_name)
+        if not key or not bool(self.settings.get(key, False)):
             return
-        if self.auto_trade_enabled.get("E*TRADE"):
-            self._set_etrade_arm_intent(False)
+        if self.auto_trade_enabled.get(broker_name):
+            self._set_broker_arm_intent(broker_name, False)
             return
-        et = self.brokers.get("E*TRADE")
-        if not et or not getattr(et, "is_connected", False):
+        broker = self.brokers.get(broker_name)
+        if not broker or not getattr(broker, "is_connected", False):
             return
-        if getattr(self, "_broker_manual_auth_needed", {}).get("E*TRADE"):
+        if getattr(self, "_broker_manual_auth_needed", {}).get(broker_name):
             return
-        env = str(getattr(et, "environment", None) or self.settings.get("etrade_environment", "")).lower()
-        if env != "live":
-            self._throttled_log(
-                "E*TRADE:arm_intent_wait_live",
-                "[E*TRADE] Arm intent saved — switch E*TRADE to Live environment, then "
-                "Complete Connection to resume CORE/BREAKOUT.",
-                cooldown_sec=3600,
-            )
-            return
-        self._enable_live_orders_on_arm("E*TRADE")
-        armed = self._arm_broker_engines(["E*TRADE"], warn=False)
+        if broker_name == "E*TRADE":
+            env = str(
+                getattr(broker, "environment", None)
+                or self.settings.get("etrade_environment", "")
+            ).lower()
+            if env != "live":
+                self._throttled_log(
+                    "E*TRADE:arm_intent_wait_live",
+                    "[E*TRADE] Arm intent saved — switch E*TRADE to Live environment, then "
+                    "Complete Connection to resume CORE/BREAKOUT.",
+                    cooldown_sec=3600,
+                )
+                return
+        self._enable_live_orders_on_arm(broker_name)
+        armed = self._arm_broker_engines([broker_name], warn=False)
         if armed:
-            self._set_etrade_arm_intent(False)
+            self._set_broker_arm_intent(broker_name, False)
             src = f" ({source})" if source else ""
             self.log_event(
-                f"[E*TRADE] Auto-Trader re-armed after reconnect{src} "
-                "(restored from pre-midnight intent)."
+                f"[{broker_name}] Auto-Trader re-armed after reconnect{src} "
+                "(restored from arm intent)."
             )
             self.send_discord_alert(
-                "✅ [E*TRADE] Auto-Trader **re-armed** after reconnect.",
+                f"✅ [{broker_name}] Auto-Trader **re-armed** after reconnect.",
                 urgent=False,
-                prefix="[ET]",
+                prefix="[ARM]",
             )
-            self._set_engine_banner("🤖 ⚡ E*TRADE re-armed — spinning up…")
+            self._set_engine_banner(f"🤖 ⚡ {broker_name} re-armed — spinning up…")
             QTimer.singleShot(0, self.director_tick)
             self._update_autotrade_ui()
+
+    def _maybe_restore_etrade_arm(self, *, source=""):
+        """Backward-compatible alias — restores E*TRADE from arm intent."""
+        self._maybe_restore_broker_arm("E*TRADE", source=source)
 
     def _maybe_etrade_midnight_handling(self, now_ts=None):
         """
@@ -11881,6 +12107,15 @@ class MarketAdvisorGUI(QMainWindow):
         if broker not in BROKER_NAMES:
             aq.complete(proposal_id, False)
             return {"ok": False, "error": f"Unknown broker: {broker}"}
+        if broker == "E*TRADE":
+            ok, why = _auto_cycle.etrade_equity_session_ok(
+                self.get_equity_session_info(),
+                broker=self.brokers.get("E*TRADE"),
+            )
+            if not ok:
+                aq.complete(proposal_id, False)
+                self.log_event(f"[Advisor] Skip apply — {why}")
+                return {"ok": False, "error": why}
         self.active_broker_name = broker
         self._cycle_broker = broker
         candidate = {
@@ -12385,6 +12620,30 @@ class MarketAdvisorGUI(QMainWindow):
         store = getattr(self, "_sell_fail_backoff", None) or {}
         store.pop((str(broker), str(ticker).upper()), None)
 
+    def _buy_fail_should_skip(self, broker, ticker):
+        store = getattr(self, "_buy_fail_backoff", None) or {}
+        ttl = float(getattr(self, "_buy_fail_backoff_ttl_sec", 900) or 900)
+        return _buy_fail_should_skip_impl(store, broker, ticker, ttl_sec=ttl)
+
+    def _record_buy_fail_backoff(self, broker, ticker, status, notes):
+        store = getattr(self, "_buy_fail_backoff", None)
+        if store is None:
+            self._buy_fail_backoff = {}
+            store = self._buy_fail_backoff
+        ttl = float(getattr(self, "_buy_fail_backoff_ttl_sec", 900) or 900)
+        already, note = _record_buy_fail_backoff_impl(
+            store, broker, ticker, status, ttl_sec=ttl,
+        )
+        if already:
+            return True
+        if note:
+            notes.append(note)
+        return False
+
+    def _clear_buy_fail_backoff(self, broker, ticker):
+        store = getattr(self, "_buy_fail_backoff", None) or {}
+        store.pop((str(broker), str(ticker).upper()), None)
+
     def _maybe_show_first_run_wizard(self):
         if bool(self.settings.get("onboarding_complete")):
             return
@@ -12589,6 +12848,8 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _handle_broker_auth_failure(self, broker_name, detail, *, source=""):
         """Mark needs-reauth, disarm only that broker, one Discord REAUTH alert (no cycle spam)."""
+        detail_s = str(detail or "auth failure")[:240]
+        src = f" ({source})" if source else ""
         broker_name = broker_name or getattr(self, "cycle_broker_name", None) or getattr(
             self, "_cycle_broker", None
         )
@@ -12602,9 +12863,11 @@ class MarketAdvisorGUI(QMainWindow):
             elif "coinbase" in text:
                 broker_name = "Coinbase"
             else:
-                broker_name = "E*TRADE"
-        detail_s = str(detail or "auth failure")[:240]
-        src = f" ({source})" if source else ""
+                self.log_event(
+                    f"[REAUTH] Auth failure with unknown broker{src} — "
+                    f"not defaulting to E*TRADE ({detail_s})"
+                )
+                return
         already = bool(getattr(self, "_broker_manual_auth_needed", {}).get(broker_name))
         was_armed = bool(self.auto_trade_enabled.get(broker_name))
 
@@ -12612,8 +12875,8 @@ class MarketAdvisorGUI(QMainWindow):
             self._broker_manual_auth_needed = _blank_broker_map(False)
         self._broker_manual_auth_needed[broker_name] = True
 
-        if broker_name == "E*TRADE" and was_armed:
-            self._set_etrade_arm_intent(True)
+        if was_armed:
+            self._set_broker_arm_intent(broker_name, True)
 
         broker = self.brokers.get(broker_name)
         if broker is not None:
@@ -13863,8 +14126,7 @@ class MarketAdvisorGUI(QMainWindow):
             self._seed_session_start_for_arm(broker_name)
             self.auto_trade_enabled[broker_name] = True
             self._panic_halted = False
-            if broker_name == "E*TRADE":
-                self._set_etrade_arm_intent(True)
+            self._set_broker_arm_intent(broker_name, True)
             # Force an immediate first pulse for this broker (don't wait a full interval)
             self.last_crypto_time[broker_name] = 0
             self.last_port_time[broker_name] = 0
@@ -14003,12 +14265,12 @@ class MarketAdvisorGUI(QMainWindow):
             self._disarm_broker(
                 broker_name,
                 notify_discord=True,
-                clear_arm_intent=(broker_name == "E*TRADE"),
+                clear_arm_intent=True,
             )
 
         newly_armed = self._arm_broker_engines(to_arm, warn=True) if to_arm else []
         if "E*TRADE" in to_arm:
-            self._set_etrade_arm_intent(False)
+            self._set_etrade_arm_intent(True)
 
         # Keep previously armed brokers that remain selected
         still_armed = [b for b in BROKER_NAMES if self.auto_trade_enabled.get(b)]
@@ -14053,14 +14315,19 @@ class MarketAdvisorGUI(QMainWindow):
         now = time.time()
         self.update_market_status()
 
-        # Stall watchdog: unlock queue if a cycle hangs too long
+        # Stall watchdog: unlock queue if a cycle hangs too long — bump gen so
+        # in-flight BackgroundTask results / cycle_finished are ignored.
         if self.is_processing_queue and self._queue_started_at:
             stalled_for = now - self._queue_started_at
             if stalled_for >= 180 and not self._stall_alerted:
                 self._stall_alerted = True
-                msg = f"⚠️ Cycle stall detected ({int(stalled_for)}s). Forcing queue unlock."
+                msg = (
+                    f"⚠️ Cycle stall detected ({int(stalled_for)}s). "
+                    f"Forcing queue unlock (in-flight results ignored)."
+                )
                 self.log_event(msg)
                 self.send_discord_alert(msg)
+                self._cycle_gen = int(getattr(self, "_cycle_gen", 0) or 0) + 1
                 self._cycle_broker = None
                 self.is_processing_queue = False
                 self._queue_started_at = None
@@ -14102,17 +14369,22 @@ class MarketAdvisorGUI(QMainWindow):
                         f"[{broker_name}] {rest_why}",
                         cooldown_sec=780,
                     )
+                    self.last_crypto_time[broker_name] = now
                 elif self._broker_supports(broker_name, "supports_crypto"):
                     task = (broker_name, "CRYPTO")
-                    if task not in self.task_queue: self.task_queue.append(task)
-                self.last_crypto_time[broker_name] = now
+                    if task not in self.task_queue:
+                        self.task_queue.append(task)
+                else:
+                    self.last_crypto_time[broker_name] = now
+                # Interval stamp for enqueued CRYPTO happens in process_queue
 
             # Portfolio / sell checks: all armed brokers, 24/7 (faster when buys rest)
             port_iv = self._portfolio_interval_sec(broker_name)
             if now - self.last_port_time[broker_name] >= port_iv:
                 task = (broker_name, "PORTFOLIO")
-                if task not in self.task_queue: self.task_queue.append(task)
-                self.last_port_time[broker_name] = now
+                if task not in self.task_queue:
+                    self.task_queue.append(task)
+                # Interval stamp moved to process_queue start
 
             # Equities: capability-driven (RH + E*TRADE; not Coinbase)
             if self._broker_supports(broker_name, "supports_equities"):
@@ -14124,6 +14396,67 @@ class MarketAdvisorGUI(QMainWindow):
                         f"(now {sess}) — PORTFOLIO sells still run 24/7.",
                         cooldown_sec=1800,
                     )
+                    # Stamp so we do not re-check every 1s director tick after hours
+                    if broker_name == "E*TRADE":
+                        self.last_penny_time[broker_name] = now
+                        self.last_core_time[broker_name] = now
+                elif broker_name == "E*TRADE":
+                    et_ok, et_why = _auto_cycle.etrade_equity_session_ok(
+                        self.get_equity_session_info(),
+                        broker=self.brokers.get("E*TRADE"),
+                    )
+                    if not et_ok:
+                        self._throttled_log(
+                            f"{broker_name}:et_extended_idle",
+                            f"[{broker_name}] {et_why}",
+                            cooldown_sec=1800,
+                        )
+                        self.last_penny_time[broker_name] = now
+                        self.last_core_time[broker_name] = now
+                    else:
+                        need_penny = (
+                            now - self.last_penny_time[broker_name]
+                            >= self._interval_with_focus(broker_name, "interval_penny", 60)
+                        )
+                        need_core = (
+                            now - self.last_core_time[broker_name]
+                            >= self._interval_with_focus(broker_name, "interval_core", 300)
+                        )
+                        rest, rest_why = (False, "")
+                        if need_penny or need_core:
+                            rest, rest_why = self._buy_engines_should_rest(broker_name)
+                        if need_penny:
+                            if rest:
+                                self._throttled_log(
+                                    f"{broker_name}:buy_engines_idle",
+                                    f"[{broker_name}] {rest_why}",
+                                    cooldown_sec=780,
+                                )
+                                self.last_penny_time[broker_name] = now
+                            else:
+                                task = (broker_name, "PENNY")
+                                if task not in self.task_queue:
+                                    self.task_queue.append(task)
+                        if need_core:
+                            if self._small_book_skip_core(broker_name):
+                                self._throttled_log(
+                                    f"{broker_name}:core_skip_small_book",
+                                    f"[{broker_name}] CORE parked for small book — Breakouts + Crypto "
+                                    f"target names your BP can actually fund.",
+                                    cooldown_sec=3600,
+                                )
+                                self.last_core_time[broker_name] = now
+                            elif rest:
+                                self._throttled_log(
+                                    f"{broker_name}:buy_engines_idle",
+                                    f"[{broker_name}] {rest_why}",
+                                    cooldown_sec=780,
+                                )
+                                self.last_core_time[broker_name] = now
+                            else:
+                                task = (broker_name, "CORE")
+                                if task not in self.task_queue:
+                                    self.task_queue.append(task)
                 else:
                     need_penny = (
                         now - self.last_penny_time[broker_name]
@@ -14143,10 +14476,12 @@ class MarketAdvisorGUI(QMainWindow):
                                 f"[{broker_name}] {rest_why}",
                                 cooldown_sec=780,
                             )
+                            self.last_penny_time[broker_name] = now
                         else:
                             task = (broker_name, "PENNY")
-                            if task not in self.task_queue: self.task_queue.append(task)
-                        self.last_penny_time[broker_name] = now
+                            if task not in self.task_queue:
+                                self.task_queue.append(task)
+                        # Interval stamp on process_queue start when enqueued
 
                     if need_core:
                         if self._small_book_skip_core(broker_name):
@@ -14156,16 +14491,19 @@ class MarketAdvisorGUI(QMainWindow):
                                 f"target names your BP can actually fund.",
                                 cooldown_sec=3600,
                             )
+                            self.last_core_time[broker_name] = now
                         elif rest:
                             self._throttled_log(
                                 f"{broker_name}:buy_engines_idle",
                                 f"[{broker_name}] {rest_why}",
                                 cooldown_sec=780,
                             )
+                            self.last_core_time[broker_name] = now
                         else:
                             task = (broker_name, "CORE")
-                            if task not in self.task_queue: self.task_queue.append(task)
-                        self.last_core_time[broker_name] = now
+                            if task not in self.task_queue:
+                                self.task_queue.append(task)
+                        # Interval stamp on process_queue start when enqueued
 
         self._reorder_task_queue_buy_focus()
         self.process_queue()
@@ -14189,6 +14527,9 @@ class MarketAdvisorGUI(QMainWindow):
         if now - last_pub >= 3.0:
             self._monitor_last_publish = now
             self.publish_monitor_status()
+
+        # Companion dies if the HTTPS thread exits silently — restart without app relaunch
+        self._ensure_web_monitor_alive(now)
 
     def _maybe_nudge_etrade_arm(self, now=None):
         """
@@ -14303,6 +14644,7 @@ class MarketAdvisorGUI(QMainWindow):
                 self.send_discord_alert(f"✅ [{broker_name}] Session restored after drop.")
                 self._update_autotrade_ui()
                 self._after_broker_session_restored(broker_name, source="reconnect")
+                self._maybe_restore_broker_arm(broker_name, source="reconnect")
                 if broker_name == "E*TRADE":
                     et = self.brokers.get("E*TRADE")
                     if et and getattr(et, "token_expires_at", None):
@@ -14311,7 +14653,6 @@ class MarketAdvisorGUI(QMainWindow):
                             save_settings(self.settings)
                         except Exception:
                             pass
-                    self._maybe_restore_etrade_arm(source="reconnect")
             else:
                 streak = self._reconnect_fail_streak.get(broker_name, 0) + 1
                 self._reconnect_fail_streak[broker_name] = streak
@@ -14352,6 +14693,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.is_processing_queue = True
         self._queue_started_at = time.time()
         self._stall_alerted = False
+        self._running_cycle_gen = int(getattr(self, "_cycle_gen", 0) or 0)
         broker_name, task = self.task_queue.pop(0)
         if not self.auto_trade_enabled.get(broker_name):
             self.log_event(f"[AUTO] Skipping {task} on {broker_name} (disarmed)")
@@ -14377,8 +14719,41 @@ class MarketAdvisorGUI(QMainWindow):
                 )
                 if logged:
                     self._journal_idle_skip(broker_name, idle_why, engine=task)
+                # Advance interval so we don't re-enqueue every director tick
+                now_ts = time.time()
+                if task == "CRYPTO":
+                    self.last_crypto_time[broker_name] = now_ts
+                elif task == "PENNY":
+                    self.last_penny_time[broker_name] = now_ts
+                elif task == "CORE":
+                    self.last_core_time[broker_name] = now_ts
                 self.cycle_finished()
                 return
+            if broker_name == "E*TRADE" and task in ("PENNY", "CORE"):
+                et_ok, et_why = _auto_cycle.etrade_equity_session_ok(
+                    self.get_equity_session_info(),
+                    broker=self.brokers.get("E*TRADE"),
+                )
+                if not et_ok:
+                    self.log_event(f"[AUTO] Skipping {task} on {broker_name} — {et_why}")
+                    now_ts = time.time()
+                    if task == "PENNY":
+                        self.last_penny_time[broker_name] = now_ts
+                    else:
+                        self.last_core_time[broker_name] = now_ts
+                    self.cycle_finished()
+                    return
+
+        # Stamp intervals when the cycle actually starts (not when enqueued / skipped).
+        now_ts = time.time()
+        if task == "CRYPTO":
+            self.last_crypto_time[broker_name] = now_ts
+        elif task == "PORTFOLIO":
+            self.last_port_time[broker_name] = now_ts
+        elif task == "PENNY":
+            self.last_penny_time[broker_name] = now_ts
+        elif task == "CORE":
+            self.last_core_time[broker_name] = now_ts
 
         if task == "CRYPTO":
             if not self._broker_supports(broker_name, "supports_crypto"):
@@ -14404,7 +14779,18 @@ class MarketAdvisorGUI(QMainWindow):
             self.log_event(f"[AUTO] Unknown task {task} — skipping")
             self.cycle_finished()
 
-    def cycle_finished(self):
+    def cycle_finished(self, *, cycle_gen=None):
+        expected = (
+            cycle_gen
+            if cycle_gen is not None
+            else getattr(self, "_running_cycle_gen", None)
+        )
+        cur = int(getattr(self, "_cycle_gen", 0) or 0)
+        if expected is not None and int(expected) != cur:
+            self.log_event(
+                f"[AUTO] Ignoring stale cycle_finished (gen {expected}≠{cur})"
+            )
+            return
         finished_broker = self._cycle_broker
         self._cycle_broker = None
         self.is_processing_queue = False
@@ -14633,6 +15019,7 @@ class MarketAdvisorGUI(QMainWindow):
         totals = getattr(self, "_last_balance_totals", {}) or {}
         lag_parts = []
         offline_parts = []
+        bp_parts = []
         if not hasattr(self, "_holdings_mismatch_by_broker"):
             self._holdings_mismatch_by_broker = _blank_broker_map(0.0)
         for name in BROKER_NAMES:
@@ -14663,7 +15050,37 @@ class MarketAdvisorGUI(QMainWindow):
                 hv = self._holdings_mark_value(
                     [{**h, "broker": name} for h in heat if isinstance(h, dict)], name
                 )
-            bad, gap = holdings_equity_gap(eq, bp, hv)
+            prior_bp = 0.0
+            try:
+                prior_bp = float(
+                    ((getattr(self, "_last_trusted_bp", {}) or {}).get(name))
+                    or ((getattr(self, "_last_balance_totals", {}) or {}).get(name) or {}).get("bp")
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                prior_bp = 0.0
+            from balance_guard import buying_power_looks_unreliable, repair_buying_power
+            if buying_power_looks_unreliable(
+                eq, bp, holdings_value=hv, prior_bp=prior_bp
+            ):
+                fixed = repair_buying_power(
+                    eq, bp, holdings_value=hv, prior_bp=prior_bp
+                )
+                bp_parts.append(
+                    f"{name} BP glitch ${bp:.0f}→${fixed:.0f}"
+                    if fixed > bp + 0.5
+                    else f"{name} BP unread (~$0)"
+                )
+                self._throttled_log(
+                    f"{name}:bp_ghost_banner",
+                    f"[{name}] Buying power unread/glitch ${bp:.2f} "
+                    f"(equity {format_currency(eq)}, listed {format_currency(hv)}) "
+                    "— not treating as missing holdings.",
+                    cooldown_sec=180,
+                )
+                self._holdings_mismatch_by_broker[name] = 0.0
+                continue
+            bad, gap = holdings_equity_gap(eq, bp, hv, prior_bp=prior_bp)
             self._holdings_mismatch_by_broker[name] = gap if bad else 0.0
             if bad:
                 lag_parts.append(f"{name} ~{format_currency(gap)}")
@@ -14682,6 +15099,11 @@ class MarketAdvisorGUI(QMainWindow):
                     "Disconnected — " + ", ".join(offline_parts)
                     + ". Reconnect in Settings, then Reload Holdings."
                 )
+            if bp_parts:
+                msgs.append(
+                    "Buying power unread — " + "; ".join(bp_parts)
+                    + ". Capital is fine; Reload Holdings after broker BP catches up."
+                )
             if lag_parts:
                 msgs.append(
                     "Holdings API lag — " + "; ".join(lag_parts)
@@ -14689,7 +15111,7 @@ class MarketAdvisorGUI(QMainWindow):
                 )
             lbl.setText(" ".join(msgs))
         # Also surface on Home stack line when capital chip exists
-        if hasattr(self, "home_stack_lbl") and (lag_parts or offline_parts):
+        if hasattr(self, "home_stack_lbl") and (lag_parts or offline_parts or bp_parts):
             pass  # capital banner owns the label; mismatch stays on Portfolio tab
 
     def _paint_portfolio_prices(self, assets):
@@ -15047,34 +15469,37 @@ class MarketAdvisorGUI(QMainWindow):
                 )
                 return
             is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
-            if is_crypto:
+            # RH has no crypto stop API; Coinbase stop-limit works for crypto.
+            if is_crypto and broker_name != "Coinbase":
                 self.log_event(
                     f"[{broker_name}] Skip broker stop [{ticker}]: crypto — software TTP only"
                 )
                 return
             # RH rejects stops on fractional qty — mark N/A once, never treat as retryable gap
-            try:
-                from scoring import _qty_is_whole_shares
-                whole = _qty_is_whole_shares(qty)
-            except Exception:
-                whole = abs(qty - round(qty)) < 1e-9 and qty >= 1.0
-            if not whole:
-                na_key = f"{broker_name}:{str(ticker).upper()}"
-                logged = getattr(self, "_frac_stop_na_logged", None)
-                if logged is None:
-                    self._frac_stop_na_logged = set()
-                    logged = self._frac_stop_na_logged
-                if na_key not in logged:
-                    logged.add(na_key)
-                    self.log_event(
-                        f"[{broker_name}] Fractional qty {qty:.4f} [{ticker}] — "
-                        f"broker stop N/A, TTP only (will not retry attach)"
-                    )
-                # Do not put in actionable gaps — repair would hammer forever
-                gaps = getattr(self, "_protective_gaps", None)
-                if gaps is not None:
-                    gaps.pop(na_key, None)
-                return
+            # Coinbase crypto can use fractional base size for stops.
+            if broker_name != "Coinbase":
+                try:
+                    from scoring import _qty_is_whole_shares
+                    whole = _qty_is_whole_shares(qty)
+                except Exception:
+                    whole = abs(qty - round(qty)) < 1e-9 and qty >= 1.0
+                if not whole:
+                    na_key = f"{broker_name}:{str(ticker).upper()}"
+                    logged = getattr(self, "_frac_stop_na_logged", None)
+                    if logged is None:
+                        self._frac_stop_na_logged = set()
+                        logged = self._frac_stop_na_logged
+                    if na_key not in logged:
+                        logged.add(na_key)
+                        self.log_event(
+                            f"[{broker_name}] Fractional qty {qty:.4f} [{ticker}] — "
+                            f"broker stop N/A, TTP only (will not retry attach)"
+                        )
+                    # Do not put in actionable gaps — repair would hammer forever
+                    gaps = getattr(self, "_protective_gaps", None)
+                    if gaps is not None:
+                        gaps.pop(na_key, None)
+                    return
             ok, oid, msg = broker.place_protective_stop(
                 ticker, asset_type, qty, price, stop_pct, trail_pct=trail_pct,
             )
@@ -15907,9 +16332,21 @@ class MarketAdvisorGUI(QMainWindow):
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
         session = self.get_equity_session_info()
-        use_ext = session["use_ext"]
-        market_hours = session["market_hours"]
-        allow_fractional = session["fractional_ok"]
+        _flags = _auto_cycle.order_session_flags(broker_name, session)
+        use_ext = bool(_flags["use_ext"])
+        market_hours = str(_flags["market_hours"])
+        allow_fractional = bool(_flags["allow_fractional"])
+        if broker_name == "E*TRADE":
+            et_ok, et_why = _auto_cycle.etrade_equity_session_ok(
+                session, broker=self.brokers.get("E*TRADE"),
+            )
+            if not et_ok:
+                return {
+                    "fills": [],
+                    "notes": [f"[{broker_name}] {et_why} — skipping buy batch"],
+                    "buys_done": 0,
+                    "broker": broker_name,
+                }
         posture = posture_for_broker(broker_name, self.settings)
         knobs = posture_knobs_for_broker(broker_name, self.settings)
         max_positions = int(knobs.get("max_open_positions", 8) or 8)
@@ -16415,6 +16852,25 @@ class MarketAdvisorGUI(QMainWindow):
 
             cand_score = float(c.get("score") or 0.0)
 
+            # Transient buy API failures (ET HTTP 500 etc.) — don't hammer every cycle
+            if self._buy_fail_should_skip(broker_name, ticker):
+                execute_skips.append(f"{ticker}: buy API backoff")
+                continue
+
+            # Coinbase is crypto-only — never place equity symbols (AMC etc. can leak via scores)
+            if broker_name == "Coinbase" and not is_crypto:
+                notes.append(
+                    f"[{broker_name}] Skipped [{ticker}]: equities not supported on Coinbase"
+                )
+                execute_skips.append(f"{ticker}: CB equity block")
+                self._log_decision(
+                    broker=broker_name, ticker=ticker, action="SKIP",
+                    score=cand_score, reason="cb_equity_block",
+                    posture=posture, open_count=open_count, max_open=max_positions,
+                    is_crypto=False, regime_ok=True,
+                )
+                continue
+
             # Overnight / late session: RH blocks fractional equity buys — preflight early
             # (before regime) so we don't burn a cycle on regime-ok names we can't size.
             if (
@@ -16634,8 +17090,34 @@ class MarketAdvisorGUI(QMainWindow):
                         self._last_frac_policy = pol
                     except Exception:
                         pass
+                # E*TRADE: when 1+ whole shares fit BP, prefer whole notional (matches
+                # affordability filter). Avoids tiny fractional tickets on small books.
                 if (
-                    broker_name in ("Robinhood", "E*TRADE")
+                    broker_name == "E*TRADE"
+                    and (not is_crypto)
+                    and row_dollars > 0
+                    and price > 0
+                ):
+                    try:
+                        import math as _math
+                        px = float(price)
+                        if px > 0 and float(bp) + 1e-9 >= px:
+                            whole = int(_math.floor(float(row_dollars) / px))
+                            if whole < 1:
+                                row_dollars = px
+                                notes.append(
+                                    f"[{broker_name}] Whole-share bump [{ticker}]: "
+                                    f"sizing undershot 1 share — buying 1 @ ${px:.2f}"
+                                )
+                            else:
+                                bumped = float(whole) * px
+                                if bumped + 1e-9 < float(row_dollars):
+                                    row_dollars = bumped
+                    except Exception:
+                        pass
+                # RH overnight / late-extended fractional exit risk only (not E*TRADE).
+                if (
+                    broker_name == "Robinhood"
                     and (not is_crypto)
                     and row_dollars > 0
                     and price > 0
@@ -16645,6 +17127,7 @@ class MarketAdvisorGUI(QMainWindow):
                         ticker, proj_shares, price, asset_type, session,
                         frac_ext_ineligible=getattr(self, "_frac_ext_ineligible", None),
                         known_cryptos=KNOWN_CRYPTOS,
+                        broker_name=broker_name,
                     )
                     if defer_buy:
                         self._note_frac_buy_defer(
@@ -16893,17 +17376,36 @@ class MarketAdvisorGUI(QMainWindow):
                     ):
                         continue
                 ok = "Fail" not in status and "Skipped" not in status
+                working = bool(ok and _auto_cycle.buy_order_is_working_unfilled(status))
+                filled = bool(ok and not working)
+                if (not ok) and _auto_cycle.buy_status_should_backoff(status):
+                    self._record_buy_fail_backoff(broker_name, ticker, status, notes)
+                elif filled:
+                    self._clear_buy_fail_backoff(broker_name, ticker)
                 self._log_decision(
                     broker=broker_name, ticker=ticker,
-                    action="BUY" if ok else "BUY_FAIL",
+                    action=("BUY" if filled else ("BUY_WORKING" if working else "BUY_FAIL")),
                     score=cand_score,
-                    reason=("scale_in" if scale_in else "entry") + (f":{status}" if not ok else ""),
+                    reason=("scale_in" if scale_in else "entry") + (f":{status}" if not filled else ""),
                     posture=posture,
                     dollars=float(spent or row_dollars or 0),
                     open_count=open_count, max_open=max_positions,
                     is_crypto=is_crypto, regime_ok=True,
                 )
-                if ok:
+                if working:
+                    notes.append(
+                        f"[{broker_name}] Order working (not filled yet) [{ticker}]: {status}"
+                    )
+                    # Count as an attempted buy so we don't spray more limits same pulse,
+                    # but do not mark held / inflate open_count until a real fill.
+                    buys_done += 1
+                    if spent:
+                        bp = max(0.0, bp - float(spent))
+                        try:
+                            self._note_recent_buy(broker_name, float(spent))
+                        except Exception:
+                            pass
+                elif filled:
                     if scale_in:
                         try:
                             record_scale_in(broker_id, ticker)
@@ -16937,7 +17439,9 @@ class MarketAdvisorGUI(QMainWindow):
                     "ticker": ticker,
                     "status": status,
                     "spent": spent,
-                    "ok": ok,
+                    "ok": filled or working,
+                    "filled": filled,
+                    "working": working,
                     "table_row": c.get("table_row"),
                     "scale_in": scale_in,
                 })
@@ -16981,7 +17485,9 @@ class MarketAdvisorGUI(QMainWindow):
         for fill in payload.get("fills") or []:
             ticker = fill.get("ticker")
             status = fill.get("status") or ""
-            if fill.get("ok") and not fill.get("rotate_sell"):
+            filled = bool(fill.get("filled")) if "filled" in fill else bool(fill.get("ok"))
+            working = bool(fill.get("working"))
+            if filled and not fill.get("rotate_sell"):
                 self.set_lock(ticker, is_crypto=bool(
                     "crypto" in str(fill.get("asset_type") or "").lower()
                     or str(ticker or "").upper() in KNOWN_CRYPTOS
@@ -16997,7 +17503,12 @@ class MarketAdvisorGUI(QMainWindow):
                 continue
             tag = "SCALE-IN " if fill.get("scale_in") else ""
             self.log_event(f"[{broker}] Execution [{ticker}]: {tag}{status}")
-            self.send_discord_alert(f"{'SCALE-IN' if fill.get('scale_in') else 'BUY'} {ticker}: {status}", is_trade=True)
+            kind = "BUY"
+            if fill.get("scale_in"):
+                kind = "SCALE-IN"
+            if working:
+                kind = f"{kind} WORKING"
+            self.send_discord_alert(f"{kind} {ticker}: {status}", is_trade=True)
             row = fill.get("table_row")
             if table is not None and row is not None and row < table.rowCount():
                 try:
@@ -17009,7 +17520,9 @@ class MarketAdvisorGUI(QMainWindow):
             f.get("rotate_sell") and f.get("ok") for f in (payload.get("fills") or [])
         )
         fill_ok = any(
-            f.get("ok") and not f.get("rotate_sell") for f in (payload.get("fills") or [])
+            (f.get("filled") if "filled" in f else f.get("ok"))
+            and not f.get("rotate_sell")
+            for f in (payload.get("fills") or [])
         )
         self.refresh_recent_trades()
         notes = payload.get("notes") or []
@@ -17045,9 +17558,6 @@ class MarketAdvisorGUI(QMainWindow):
         """Place sells on a worker thread."""
         offset = self.settings.get("limit_offset_pct", 0.1) / 100.0
         session = self._sync_equity_session_state()
-        use_ext = session["use_ext"]
-        market_hours = session["market_hours"]
-        allow_fractional = session["fractional_ok"]
         equity_open = session["equity_tradeable"]
         session_label = session.get("label") or "UNKNOWN"
         prior = self._cycle_broker
@@ -17059,6 +17569,10 @@ class MarketAdvisorGUI(QMainWindow):
                 ticker = item.get("ticker")
                 row_broker = item.get("broker") or self.cycle_broker_name
                 self._cycle_broker = row_broker
+                _flags = _auto_cycle.order_session_flags(row_broker, session)
+                use_ext = bool(_flags["use_ext"])
+                market_hours = str(_flags["market_hours"])
+                allow_fractional = bool(_flags["allow_fractional"])
                 asset_type = item.get("type", "")
                 is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
                 shares = item.get("shares") or 0.0
@@ -17806,7 +18320,7 @@ class MarketAdvisorGUI(QMainWindow):
         )
 
     def _maybe_regime_idle_coach(self, broker, engine, raw_buys):
-        """One [COACH] per ~1hr of zero raw BUY signals when regime blocks new entries."""
+        """One [COACH] per ~2hr of zero raw BUY signals when regime blocks new entries."""
         if not self._is_broker_auto_trading(broker):
             return
         now = time.time()
@@ -17848,7 +18362,7 @@ class MarketAdvisorGUI(QMainWindow):
             regime_reason=regime_reason if not dd_paused else "",
             dd_paused=dd_paused,
         )
-        self._coach_tip(tip_key, tip, cooldown_sec=1800)
+        self._coach_tip(tip_key, tip, cooldown_sec=3600)
 
     def _log_scan_buy_outcome(self, engine, results, buy_candidates, dropped=None):
         """
@@ -17869,7 +18383,12 @@ class MarketAdvisorGUI(QMainWindow):
                     f"{broker}/{engine}: {actionable} candidate(s) — {regime_n} need Advisor approve (regime caution)"
                 )
         else:
-            self.log_event(f"[AUTO] [{broker}] {engine} scored — {raw_buys} BUY signal(s)")
+            # Throttle empty-scan noise — once per broker/engine per 30m
+            self._throttled_log(
+                f"{broker}:{engine}:zero_buy_scan",
+                f"[AUTO] [{broker}] {engine} scored — {raw_buys} BUY signal(s)",
+                cooldown_sec=1800,
+            )
         if raw_buys > 0 and actionable == 0 and self._is_broker_auto_trading():
             visible, suppressed = self._throttle_scan_drops(
                 broker, engine, dropped or [], cooldown_sec=780,

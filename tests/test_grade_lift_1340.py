@@ -142,6 +142,7 @@ class TestEtLimitOffsetFraction(unittest.TestCase):
         et.client = MagicMock()
         et.client.preview_equity_order.return_value = {"PreviewOrderResponse": {"PreviewIds": {"previewId": 99}}}
         et.client.place_equity_order.return_value = {"PlaceOrderResponse": {"OrderIds": {"orderId": "OID1"}}}
+        et.confirm_order = MagicMock(return_value=(True, "FILLED"))
 
         # 0.5% buffer as fraction 0.005 → $100.50 (NOT $100 * 1.005/100)
         with patch("etrade_broker._extract_preview_id", return_value=99), patch(
@@ -150,6 +151,7 @@ class TestEtLimitOffsetFraction(unittest.TestCase):
             status, spent, oid = et.place_buy_order("SPY", "stock", 100.0, 200.0, 0.005, False)
 
         self.assertIn("LIMIT", status)
+        self.assertIn("Filled", status)
         place_xml = et.client.place_equity_order.call_args[0][1]
         self.assertIn("<limitPrice>100.50</limitPrice>", place_xml)
         self.assertNotIn("<limitPrice>1.01</limitPrice>", place_xml)
