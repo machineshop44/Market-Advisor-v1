@@ -696,11 +696,24 @@ def trade_lock_seconds(is_crypto=False):
     return int(CRYPTO_TRADE_LOCK_SEC if is_crypto else STOCK_TRADE_LOCK_SEC)
 
 
-def min_entry_edge_pct(broker_id, ticker=None, asset_type=""):
+def min_entry_edge_pct(broker_id, ticker=None, asset_type="", *, equity=None, settings=None):
     """Minimum expected edge for NEW discretionary buys/rotates: RT fees + buffer."""
-    return float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type)) + float(
-        MIN_ENTRY_EDGE_OVER_FEES_PCT
-    )
+    buff = float(MIN_ENTRY_EDGE_OVER_FEES_PCT)
+    try:
+        at = str(asset_type or "").lower()
+        tick = str(ticker or "").upper().replace("-USD", "")
+        is_c = "crypto" in at or tick in CRYPTO_TICKERS
+        if is_c and is_small_book(equity):
+            try:
+                extra = float(
+                    (settings or {}).get("micro_crypto_entry_edge_extra_pct", 0.0075) or 0.0075
+                )
+            except (TypeError, ValueError):
+                extra = 0.0075
+            buff += max(0.0, extra)
+    except Exception:
+        pass
+    return float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type)) + buff
 
 
 def net_roi_after_fees(gross_roi, broker_id, ticker=None, asset_type=""):
@@ -738,6 +751,8 @@ def new_entry_clears_fees_ok(
     *,
     is_crypto=False,
     asset_type="",
+    equity=None,
+    settings=None,
 ):
     """
     Block NEW discretionary buys whose estimated signal edge cannot clear
@@ -745,7 +760,9 @@ def new_entry_clears_fees_ok(
     their own gates.
     """
     atype = asset_type or ("cryptocurrency" if is_crypto else "stock")
-    need = min_entry_edge_pct(broker_id, ticker, atype)
+    need = min_entry_edge_pct(
+        broker_id, ticker, atype, equity=equity, settings=settings,
+    )
     edge = estimated_signal_edge_pct(score, is_crypto=bool(is_crypto))
     if edge + 1e-12 < need:
         return False, (
@@ -779,6 +796,7 @@ def crypto_new_entry_ok(
         )
     ok_fee, why_fee = new_entry_clears_fees_ok(
         broker_id, ticker, sc, is_crypto=True, asset_type="cryptocurrency",
+        equity=equity,
     )
     if not ok_fee:
         return False, why_fee

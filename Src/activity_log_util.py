@@ -203,8 +203,11 @@ def advisor_miss_park_spec(why: str) -> tuple[float, str] | None:
     if "insufficient_fund" in low or "insufficient balance" in low or "insufficient fund" in low:
         return (2.0 * 3600.0, "insufficient_fund")
     if "hours mismatch" in low or "market hours mismatch" in low:
-        # Premarket/RTH flag race — short park until session flags refresh.
-        return (10.0 * 60.0, "hours_mismatch")
+        # Align with buy_fail_ttl (≥30m) so Advisor doesn't re-propose into backoff.
+        return (30.0 * 60.0, "hours_mismatch")
+    if "stuck overnight" in low or "would be stuck overnight" in low or "session exit risk" in low:
+        # RH fractional overnight — park until REGULAR / fractional_ok.
+        return (3.0 * 3600.0, "overnight_frac")
     if "limit unfilled" in low or (
         "cancelled" in low and ("unfilled" in low or "queued" in low)
     ):

@@ -257,17 +257,85 @@ def may_complete_day_trade(
     return True, ""
 
 
-def snapshot(broker: Optional[str] = None, *, equity: float = 0, settings: Optional[dict] = None) -> dict:
+def may_open_equity_buy(
+    broker: str,
+    ticker: str,
+    *,
+    equity: float,
+    settings: Optional[dict] = None,
+    is_crypto: bool = False,
+) -> tuple[bool, str]:
+    """
+    Gate NEW discretionary equity entries when PDT slots are exhausted.
+    Crypto always allowed. When remaining day-trades is 0, block new equity
+    names so the desk is not forced into overnight risk without an exit slot.
+    Same-day re-entry of a counted day-trade name stays on rebuy_blocked.
+    """
+    if is_crypto:
+        return True, ""
+    if not pdt_applies(equity, settings):
+        return True, ""
     used = count_day_trades(broker)
+    cap = max_day_trades(settings)
+    if used < cap:
+        return True, ""
+    return (
+        False,
+        f"PDT entry guard — {used}/{cap} day trades used; "
+        f"no discretionary equity buys until tomorrow "
+        f"(equity ${float(equity):.0f})",
+    )
+
+
+# Optional broker-reported day-trade count (RH). Local journal remains fallback.
+_broker_dt_counts: dict[str, dict[str, Any]] = {}  # broker -> {count, source, ts}
+
+
+def set_broker_day_trade_count(broker: str, count: Optional[int], *, source: str = "broker") -> None:
+    global _broker_dt_counts
+    bn = str(broker or "")
+    if not bn:
+        return
+    if count is None:
+        _broker_dt_counts.pop(bn, None)
+        return
+    try:
+        n = max(0, int(count))
+    except (TypeError, ValueError):
+        return
+    _broker_dt_counts[bn] = {
+        "count": n,
+        "source": str(source or "broker"),
+        "ts": time.time(),
+    }
+
+
+def effective_day_trade_count(broker: Optional[str] = None) -> tuple[int, str]:
+    """Prefer fresh broker count when set; else local journal. Returns (count, source)."""
+    bn = str(broker or "")
+    entry = _broker_dt_counts.get(bn) if bn else None
+    if entry and (time.time() - float(entry.get("ts") or 0)) < 6 * 3600:
+        return int(entry.get("count") or 0), str(entry.get("source") or "broker")
+    return count_day_trades(broker), "local"
+
+
+def snapshot(broker: Optional[str] = None, *, equity: float = 0, settings: Optional[dict] = None) -> dict:
+    used, source = effective_day_trade_count(broker)
+    # Keep may_* gates on local journal for safety; chip can show broker overlay.
+    local_used = count_day_trades(broker)
+    gate_used = max(used, local_used) if source == "broker" else local_used
     cap = max_day_trades(settings)
     applies = pdt_applies(equity, settings)
     return {
         "enabled": bool((settings or {}).get("pdt_guard_enabled", True)),
         "applies": applies,
-        "day_trades": used,
+        "day_trades": gate_used,
         "max": cap,
-        "remaining": max(0, cap - used) if applies else None,
+        "remaining": max(0, cap - gate_used) if applies else None,
         "equity": float(equity or 0),
+        "source": source,
+        "local_day_trades": local_used,
+        "broker_day_trades": used if source == "broker" else None,
     }
 
 

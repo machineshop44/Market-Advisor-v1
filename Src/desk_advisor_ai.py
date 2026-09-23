@@ -613,12 +613,25 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
     if reasons_ok:
         brief_parts.append(reasons_ok[0])
     brief_parts.append(f"Posture {posture}. Desk will auto-apply if safety rails OK.")
-    verdict = VERDICT_APPROVE if score >= 55 else VERDICT_WAIT
+    # Autopilot bar: ≥70 clear approve; 55–69 wait for cloud/human (was ≥55).
+    if score >= 70:
+        verdict = VERDICT_APPROVE
+    elif score >= 55:
+        verdict = VERDICT_WAIT
+    else:
+        verdict = VERDICT_WAIT
     return _with_retry_after(
         {
             "verdict": verdict,
             "brief": " ".join(brief_parts)[:420],
-            "detail": "; ".join(reasons_ok) or "No hard blockers from local rules.",
+            "detail": (
+                "; ".join(reasons_ok)
+                or (
+                    f"Score {score:.0f} needs ≥70 for local auto-approve"
+                    if score < 70
+                    else "No hard blockers from local rules."
+                )
+            ),
             "source": "local",
             "ok": True,
             "retry_after_min": default_retry_after_min(

@@ -254,6 +254,10 @@ def load_settings():
         "use_limit_exits": True,
         "attach_protective_stops": True,
         "et_flatten_before_close": True,
+        "daily_loss_flatten": True,
+        "panic_halt_flatten": True,
+        "desk_focus_park_others_auto_under": 500.0,
+        "micro_crypto_entry_edge_extra_pct": 0.0075,
         "advisor_ask_before_apply": True,
         "advisor_ai_source": "local",
         "advisor_ai_enabled": True,
@@ -4911,8 +4915,15 @@ class MarketAdvisorGUI(QMainWindow):
                             f"DISARMING AUTO-TRADER ($-loss halt — not a DD pause)."
                         )
                         self.log_event(msg)
-                        self.send_discord_alert(msg, urgent=True, prefix="[RISK]")
-                        self._disarm_broker(broker_name)
+                        self.send_discord_alert(
+                            msg, urgent=True, prefix="[RISK]", broker=broker_name,
+                        )
+                        if bool(self.settings.get("daily_loss_flatten", True)):
+                            self._risk_flatten_then_disarm(
+                                [broker_name], reason="daily_loss",
+                            )
+                        else:
+                            self._disarm_broker(broker_name)
 
         if hasattr(self, 'home_master_pl_lbl'):
             cpl_str = format_money(abs(combined_pl))
@@ -5943,6 +5954,46 @@ class MarketAdvisorGUI(QMainWindow):
                     return False, why or "consecutive-loss pause"
             except Exception:
                 pass
+        # PDT rebuy cool-down + exhausted day-trade slots (same source as buy batch)
+        try:
+            import pdt_guard as pdt
+            ticker = str(prop.get("ticker") or "").replace("-USD", "").upper()
+            asset_l = str(prop.get("asset_type") or "").lower()
+            is_c = "crypto" in asset_l or ticker in KNOWN_CRYPTOS
+            if ticker and not is_c:
+                blocked_rb, why_rb = pdt.rebuy_blocked(broker_name, ticker)
+                if blocked_rb:
+                    return False, why_rb or "PDT re-entry cool-down"
+                try:
+                    eq, _, _ = self.get_effective_balances(broker_name, prefer_cache=True)
+                except Exception:
+                    eq = 0.0
+                ok_ent, why_ent = pdt.may_open_equity_buy(
+                    broker_name, ticker, equity=eq, settings=self.settings, is_crypto=False,
+                )
+                if not ok_ent:
+                    return False, why_ent or "PDT entry guard"
+                # Overnight / late session fractional exit risk (RH)
+                try:
+                    session = self.get_equity_session_info()
+                except Exception:
+                    session = {}
+                try:
+                    px = float(prop.get("price") or 0)
+                except (TypeError, ValueError):
+                    px = 0.0
+                if px > 0 and dollars > 0:
+                    proj = dollars / px
+                    defer = _auto_cycle.equity_buy_defer_reason(
+                        ticker, proj, px, prop.get("asset_type") or "stock", session,
+                        frac_ext_ineligible=getattr(self, "_frac_ext_ineligible", None),
+                        known_cryptos=KNOWN_CRYPTOS,
+                        broker_name=broker_name,
+                    )
+                    if defer:
+                        return False, defer
+        except Exception:
+            pass
         # Live BP vs ticket — stop multi-approve stampedes that exhaust cash.
         try:
             _eq, bp, _locked = self.get_effective_balances(broker_name, prefer_cache=True)
@@ -12909,10 +12960,135 @@ class MarketAdvisorGUI(QMainWindow):
             f"🚨 **PANIC HALT ALL** — auto-trader disarmed ({detail}). Queues cleared.",
             urgent=True,
             prefix="[RISK]",
+            broker="App",
         )
+        if bool(self.settings.get("panic_halt_flatten", True)):
+            self._risk_flatten_equities(
+                list(BROKER_NAMES), reason="panic_halt", already_disarmed=True,
+            )
         if hasattr(self, "home_heat_lbl"):
             self._refresh_portfolio_heat()
         return {"ok": True, "halted": halted}
+
+    def _risk_flatten_equity_rows(self, broker_names):
+        """Build sell-all equity rows for risk flatten (crypto left on TTP)."""
+        rows = []
+        for broker_name in broker_names or []:
+            holdings = []
+            try:
+                if self.paper_mode:
+                    book = self.sandbox_holdings.get(broker_name) or {}
+                    for t, pos in book.items():
+                        holdings.append({
+                            "ticker": t,
+                            "shares": float((pos or {}).get("shares") or 0),
+                            "type": (pos or {}).get("type") or "stock",
+                            "price": float((pos or {}).get("cost") or 0),
+                            "cost": float((pos or {}).get("cost") or 0),
+                        })
+                else:
+                    broker = self.brokers.get(broker_name)
+                    if broker and getattr(broker, "is_connected", False):
+                        holdings = list(broker.get_current_holdings() or [])
+            except Exception as e:
+                self.log_event(f"[RISK] Flatten holdings read failed [{broker_name}]: {e}")
+                holdings = []
+            for h in holdings:
+                if not isinstance(h, dict):
+                    continue
+                ticker = str(h.get("ticker") or "").replace("-USD", "").upper()
+                if not ticker:
+                    continue
+                asset_type = str(h.get("type") or "")
+                is_crypto = "crypto" in asset_type.lower() or ticker in KNOWN_CRYPTOS
+                if is_crypto:
+                    continue
+                try:
+                    shares = float(h.get("shares") or 0)
+                except (TypeError, ValueError):
+                    shares = 0.0
+                if shares <= 0:
+                    continue
+                try:
+                    price = float(h.get("price") or h.get("last") or 0)
+                except (TypeError, ValueError):
+                    price = 0.0
+                rows.append({
+                    "broker": broker_name,
+                    "ticker": ticker,
+                    "shares": shares,
+                    "price": price,
+                    "avg_cost": float(h.get("cost") or h.get("avg_cost") or 0),
+                    "type": asset_type or "stock",
+                    "sell_all": True,
+                    "action": "RISK FLATTEN",
+                    "reason": "RISK FLATTEN",
+                    "urgent": True,
+                })
+        return rows
+
+    def _risk_flatten_equities(self, broker_names, *, reason="", already_disarmed=False):
+        """Cancel working/protective where needed and market-flatten equities."""
+        rows = self._risk_flatten_equity_rows(broker_names)
+        if not rows:
+            self.log_event(f"[RISK] Flatten ({reason or 'risk'}): no equity holdings to exit.")
+            return
+        names = ", ".join(sorted({r["broker"] for r in rows}))
+        self.log_event(
+            f"[RISK] Flattening {len(rows)} equity position(s) on {names} "
+            f"({reason or 'risk'})…"
+        )
+        for r in rows:
+            try:
+                self._cancel_protective_stop(r["broker"], r["ticker"], r.get("type") or "")
+            except Exception:
+                pass
+        self.set_working_state(True, f"Risk flatten ({reason})…")
+        self.run_thread(
+            self._bg_execute_sell_batch,
+            lambda payload: self._on_risk_flatten_done(payload, reason=reason),
+            rows,
+        )
+
+    def _risk_flatten_then_disarm(self, broker_names, *, reason="daily_loss"):
+        """Disarm buys immediately, then flatten equities on those brokers."""
+        for name in broker_names or []:
+            try:
+                self._disarm_broker(name)
+            except Exception:
+                pass
+        self._risk_flatten_equities(broker_names, reason=reason, already_disarmed=True)
+
+    def _on_risk_flatten_done(self, payload, *, reason=""):
+        payload = payload or {}
+        for note in payload.get("notes") or []:
+            self.log_event(note)
+        n_ok = 0
+        fills = payload.get("fills") or []
+        for fill in fills:
+            st = str(fill.get("status") or "")
+            self.log_event(f"[RISK] [{fill.get('ticker')}] flatten: {st}")
+            if "Fail" not in st and "Skipped" not in st:
+                n_ok += 1
+        try:
+            self.send_discord_alert(
+                f"Risk flatten ({reason or 'risk'}) done — {n_ok}/{len(fills)} ok",
+                is_trade=True,
+                urgent=True,
+                prefix="[RISK]",
+                broker="App",
+            )
+        except Exception:
+            pass
+        self.set_working_state(False)
+        try:
+            self.refresh_recent_trades()
+        except Exception:
+            pass
+        try:
+            self.manual_portfolio_reload(and_score=False, force=True)
+        except Exception:
+            pass
 
     def _monitor_halt_from_http(self):
         """Companion / monitor POST /api/halt — marshal onto GUI thread."""
@@ -13519,7 +13695,10 @@ class MarketAdvisorGUI(QMainWindow):
 
         import desk_orchestration as do
         focus = self._desk_focus_broker()
-        if do.focus_parks_buys(broker_name, focus, self.settings):
+        combined_eq = float(self._launch_equity_total() or 0.0)
+        if do.focus_parks_buys(
+            broker_name, focus, self.settings, combined_equity=combined_eq,
+        ):
             out = (True, f"Desk focus on {focus} — buy engines parked here (autosizing unchanged)")
             store[broker_name] = (now, out[0], out[1])
             return out
@@ -16084,12 +16263,145 @@ class MarketAdvisorGUI(QMainWindow):
                 self._refresh_holdings_mismatch(assets)
             except Exception:
                 pass
+            try:
+                self._maybe_blotter_reconcile(norm)
+            except Exception:
+                pass
+            try:
+                self._maybe_sync_rh_pdt_count()
+            except Exception:
+                pass
             if getattr(self, "_boot_splash_waiting_holdings", False):
                 self._boot_splash_waiting_holdings = False
                 self._boot_splash_holdings_ok = True
                 self._check_boot_splash_ready()
 
         self.run_thread(_bg, _done)
+
+    def _maybe_blotter_reconcile(self, assets):
+        """Drop ghosts / clear stale stops / seed missing basis (throttled)."""
+        import blotter_reconcile as br
+        from scoring import list_protective_orders, clear_protective_order
+        now = time.time()
+        last = float(getattr(self, "_last_blotter_reconcile_at", 0.0) or 0.0)
+        if now - last < 120.0:
+            return
+        self._last_blotter_reconcile_at = now
+        bid_map = {"Robinhood": "ROBINHOOD", "Coinbase": "COINBASE", "E*TRADE": "ETRADE"}
+        try:
+            prot = list(list_protective_orders() or [])
+        except Exception:
+            prot = []
+        for broker_name in BROKER_NAMES:
+            broker_rows = [
+                a for a in (assets or [])
+                if isinstance(a, dict) and str(a.get("broker") or "") == broker_name
+            ]
+            held = br.holdings_ticker_set(broker_rows, broker=broker_name)
+            # Local cost-basis keys for this broker
+            local_ticks = []
+            try:
+                cache = (getattr(self, "cost_basis_cache", {}) or {}).get(broker_name) or {}
+                local_ticks = list(cache.keys())
+            except Exception:
+                local_ticks = []
+            ghosts = br.ghost_local_tickers(held, local_ticks)
+            for t in ghosts:
+                try:
+                    cache = self.cost_basis_cache.get(broker_name)
+                    if isinstance(cache, dict):
+                        cache.pop(t, None)
+                        cache.pop(f"{t}-USD", None)
+                except Exception:
+                    pass
+            bid = bid_map.get(broker_name, broker_name.upper())
+            stale = br.protective_stale_tickers(held, prot, broker_id=bid)
+            for t in stale:
+                try:
+                    clear_protective_order(bid, t)
+                    self._clear_protective_gap(broker_name, t)
+                except Exception:
+                    pass
+
+            def _has_basis(b, t):
+                try:
+                    import cost_basis as cb_mod
+                    return float(cb_mod.cache_lookup(self.cost_basis_cache, b, t) or 0) > 0
+                except Exception:
+                    return False
+
+            need = br.missing_basis_tickers(
+                broker_rows, has_basis_fn=_has_basis, broker=broker_name,
+            )
+            seeded = []
+            for row in need[:8]:
+                t = row.get("ticker")
+                px = float(row.get("price") or 0)
+                if not t or px <= 0:
+                    continue
+                try:
+                    book = self.cost_basis_cache.setdefault(broker_name, {})
+                    book[t] = float(px)
+                    seeded.append(t)
+                except Exception:
+                    pass
+            summary = br.format_reconcile_summary(
+                broker_name, ghosts=ghosts, stale_stops=stale, seeded_basis=seeded,
+            )
+            if summary:
+                self._throttled_log(
+                    f"{broker_name}:blotter_reconcile",
+                    summary,
+                    cooldown_sec=1800,
+                )
+
+    def _maybe_sync_rh_pdt_count(self):
+        """Prefer Robinhood day-trade count when the API exposes it."""
+        if self.paper_mode:
+            return
+        broker = self.brokers.get("Robinhood")
+        if not broker or not getattr(broker, "is_connected", False):
+            return
+        count = None
+        try:
+            # robin_stocks account profile occasionally includes day_trades_protection
+            r = getattr(broker, "r", None) or getattr(broker, "client", None)
+            fn = None
+            if r is not None:
+                fn = getattr(r, "load_account_profile", None) or getattr(
+                    getattr(r, "account", None), "load_account_profile", None
+                )
+            if callable(fn):
+                prof = fn()
+                if isinstance(prof, dict):
+                    for key in (
+                        "day_trades_protection",
+                        "remaining_day_trades",
+                        "day_trade_count",
+                        "day_trades",
+                    ):
+                        if key in prof and prof.get(key) is not None:
+                            try:
+                                raw = prof.get(key)
+                                if key == "remaining_day_trades":
+                                    # Convert remaining → used against our cap
+                                    rem = int(float(raw))
+                                    cap = int(self.settings.get("pdt_max_day_trades", 3) or 3)
+                                    count = max(0, cap - rem)
+                                else:
+                                    count = int(float(raw))
+                                break
+                            except (TypeError, ValueError):
+                                pass
+        except Exception:
+            count = None
+        if count is None:
+            return
+        try:
+            import pdt_guard as pdt
+            pdt.set_broker_day_trade_count("Robinhood", count, source="broker")
+        except Exception:
+            pass
 
     def _holdings_mark_value(self, assets, broker_name: str) -> float:
         total = 0.0
@@ -16458,7 +16770,6 @@ class MarketAdvisorGUI(QMainWindow):
         else:
             alloc_pct = self.settings.get("allocation_pct_stock", self.settings.get("allocation_pct", 5.0)) / 100.0
         broker_id = getattr(self.cycle_broker, "broker_id", None) or self.cycle_broker_name.upper()
-        knobs = posture_knobs_for_broker(self.cycle_broker_name, self.settings)
         eq = float(equity) if equity is not None else None
         if eq is None:
             try:
@@ -16471,6 +16782,9 @@ class MarketAdvisorGUI(QMainWindow):
         else:
             locked = self._locked_capital_value(self.cycle_broker_name)
             eq = _auto_cycle.effective_book_equity(eq, locked)
+        knobs = posture_knobs_for_broker(
+            self.cycle_broker_name, self.settings, equity=eq,
+        )
         min_dollars = effective_min_dollars(
             broker_id, eq, is_crypto, self.settings.get("min_trade_dollars", 5.0)
         )
@@ -17535,23 +17849,34 @@ class MarketAdvisorGUI(QMainWindow):
         runner = self.run_cycle_thread if auto_mode else self.run_thread
         rank = bool(buy_candidates is None and auto_mode)
         advisor_gate = auto_mode and bool(self.settings.get("advisor_ask_before_apply", True))
+        # Focus fast-path removed for micro books — Advisor rails must still run
+        # (plan 1.42.35: no advisor_gate=False bypass when exclusive focus park is on).
         if advisor_gate and auto_mode:
-            focus = self._desk_focus_broker()
-            if (
-                focus
-                and str(self.cycle_broker_name) == str(focus)
-                and bool(self.settings.get("advisor_focus_auto_apply", True))
-            ):
+            try:
                 import desk_orchestration as do
-                from scoring import new_entry_clears_fees_ok
-                pool = filtered or []
-                if do.focus_advisor_auto_clear(
-                    pool,
-                    self.cycle_broker_name,
-                    fee_clear_fn=new_entry_clears_fees_ok,
-                    known_cryptos=KNOWN_CRYPTOS,
-                ) and not any(bool(c.get("regime_caution")) for c in pool if isinstance(c, dict)):
-                    advisor_gate = False
+                focus = self._desk_focus_broker()
+                combined_eq = float(self._launch_equity_total() or 0.0)
+                park_on = do.focus_parks_buys(
+                    "Robinhood", focus, self.settings, combined_equity=combined_eq,
+                ) if focus else False
+                # Only allow focus clear-path when NOT in exclusive small-book park mode
+                if (
+                    focus
+                    and str(self.cycle_broker_name) == str(focus)
+                    and bool(self.settings.get("advisor_focus_auto_apply", True))
+                    and not park_on
+                ):
+                    from scoring import new_entry_clears_fees_ok
+                    pool = filtered or []
+                    if do.focus_advisor_auto_clear(
+                        pool,
+                        self.cycle_broker_name,
+                        fee_clear_fn=new_entry_clears_fees_ok,
+                        known_cryptos=KNOWN_CRYPTOS,
+                    ) and not any(bool(c.get("regime_caution")) for c in pool if isinstance(c, dict)):
+                        advisor_gate = False
+            except Exception:
+                pass
         # Pass advisor_gate positionally — run_thread only accepts unlock_queue_on_error=
         # as a keyword; advisor_gate=... raised TypeError on the UI thread and killed the app.
         try:
@@ -18174,6 +18499,26 @@ class MarketAdvisorGUI(QMainWindow):
                         self._log_decision(
                             broker=broker_name, ticker=ticker, action="SKIP",
                             score=cand_score, reason=f"pdt_rebuy:{why_rb}",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=False, regime_ok=True,
+                        )
+                        continue
+                    ok_ent, why_ent = pdt.may_open_equity_buy(
+                        broker_name, ticker,
+                        equity=float(equity or 0),
+                        settings=self.settings,
+                        is_crypto=False,
+                    )
+                    if not ok_ent:
+                        self._throttled_buy_skip_note(
+                            notes, broker_name, "pdt_entry_cap",
+                            f"[{broker_name}] PDT entry skip [{ticker}]: {why_ent}",
+                            cooldown_sec=900,
+                        )
+                        execute_skips.append(f"{ticker}: PDT entry guard")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason=f"pdt_entry:{why_ent}",
                             posture=posture, open_count=open_count, max_open=max_positions,
                             is_crypto=False, regime_ok=True,
                         )

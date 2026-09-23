@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.34"
+__version__ = "1.42.35"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Stop-repair vs sell race; RTH frac buys; CB stop quote grid; EOD Discord tag"
+    "Grade recovery: flatten-on-risk, blotter reconcile, focus park, Advisor bar"
 )
 
 

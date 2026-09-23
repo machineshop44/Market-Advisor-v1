@@ -236,17 +236,35 @@ def resolve_focus_broker(
     return candidates[0][1]
 
 
-def focus_parks_buys(broker_name: str, focus_broker: str | None, settings: dict | None) -> bool:
+def focus_parks_buys(
+    broker_name: str,
+    focus_broker: str | None,
+    settings: dict | None,
+    *,
+    combined_equity: float | None = None,
+) -> bool:
     """
     True when non-focus broker buy engines should rest.
 
-    Default OFF: focus only speeds scans on the primary (interval multiplier).
-    Exclusive parking starved E*TRADE/Coinbase whenever Robinhood was focus.
-    Set desk_focus_park_others True to rest non-focus buys again.
+    Exclusive park when:
+      - desk_focus_park_others True (manual), or
+      - combined equity under desk_focus_park_others_auto_under (default $500)
+    Focus only speeds scans otherwise (default for larger books).
     """
-    if not bool((settings or {}).get("desk_focus_park_others", False)):
-        return False
     if focus_mode(settings) == "off" or not focus_broker:
+        return False
+    park = bool((settings or {}).get("desk_focus_park_others", False))
+    if not park and combined_equity is not None:
+        try:
+            from blotter_reconcile import small_book_focus_park_active
+            park = small_book_focus_park_active(combined_equity, settings)
+        except Exception:
+            try:
+                under = float((settings or {}).get("desk_focus_park_others_auto_under", 500) or 500)
+                park = under > 0 and float(combined_equity) > 0 and float(combined_equity) < under
+            except (TypeError, ValueError):
+                park = False
+    if not park:
         return False
     return str(broker_name or "") != str(focus_broker)
 
