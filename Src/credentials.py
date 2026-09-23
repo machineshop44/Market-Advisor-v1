@@ -88,6 +88,75 @@ def clear_advisor_api_key() -> bool:
     return _set(KEYRING_AI, "api_key", "")
 
 
+_AI_PROVIDER_KEYS = ("gemini", "groq", "openrouter", "openai", "xai")
+
+
+def _normalize_ai_provider(provider: str | None) -> str:
+    p = str(provider or "").strip().lower()
+    if p == "grok":
+        return "xai"
+    return p if p in _AI_PROVIDER_KEYS else ""
+
+
+def store_advisor_api_key_for_provider(provider: str, value: str) -> bool:
+    p = _normalize_ai_provider(provider)
+    if not p:
+        return False
+    return _set(KEYRING_AI, f"api_key_{p}", value or "")
+
+
+def load_advisor_api_key_for_provider(provider: str) -> str:
+    p = _normalize_ai_provider(provider)
+    if not p:
+        return ""
+    return _get(KEYRING_AI, f"api_key_{p}")
+
+
+def resolve_advisor_api_key_for_provider(
+    provider: str, settings: dict | None = None,
+) -> str:
+    p = _normalize_ai_provider(provider)
+    if not p:
+        return ""
+    key = load_advisor_api_key_for_provider(p)
+    if key:
+        return key
+    key = str((settings or {}).get(f"advisor_ai_api_key_{p}") or "").strip()
+    if key:
+        return key
+    # Legacy shared key only for the preferred source
+    src = str((settings or {}).get("advisor_ai_source") or "").strip().lower()
+    if src == "grok":
+        src = "xai"
+    if src == p:
+        return resolve_advisor_api_key(settings)
+    return ""
+
+
+def persist_advisor_api_key_for_provider(
+    provider: str, api_key: str, settings: dict | None = None,
+) -> bool:
+    p = _normalize_ai_provider(provider)
+    if not p:
+        return False
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        if settings is not None:
+            settings[f"advisor_ai_api_key_{p}"] = ""
+        return True
+    ok = store_advisor_api_key_for_provider(p, api_key)
+    if settings is not None:
+        settings[f"advisor_ai_api_key_{p}"] = api_key
+        # Keep legacy slot in sync when this is the preferred provider
+        src = str(settings.get("advisor_ai_source") or "").strip().lower()
+        if src == "grok":
+            src = "xai"
+        if src == p:
+            settings["advisor_ai_api_key"] = api_key
+            store_advisor_api_key(api_key)
+    return ok
+
+
 def store_monitor_pass(value: str) -> bool:
     return _set(KEYRING_APP, "monitor_pass", value or "")
 
@@ -304,6 +373,12 @@ def migrate_settings_secrets(settings: dict) -> bool:
         if store_advisor_api_key(ai_key):
             settings["advisor_ai_api_key"] = ""
             dirty = True
+    for p in _AI_PROVIDER_KEYS:
+        pk = str(settings.get(f"advisor_ai_api_key_{p}") or "").strip()
+        if pk:
+            if store_advisor_api_key_for_provider(p, pk):
+                settings[f"advisor_ai_api_key_{p}"] = ""
+                dirty = True
     cb_key = str(settings.get("cb_api_key") or "").strip()
     if cb_key:
         if store_cb_api_key(cb_key):
@@ -335,6 +410,10 @@ def hydrate_settings_secrets(settings: dict) -> None:
     ai = load_advisor_api_key()
     if ai:
         settings["advisor_ai_api_key"] = ai
+    for p in _AI_PROVIDER_KEYS:
+        pk = load_advisor_api_key_for_provider(p)
+        if pk:
+            settings[f"advisor_ai_api_key_{p}"] = pk
     cb_key = load_cb_api_key()
     if cb_key:
         settings["cb_api_key"] = cb_key
@@ -367,6 +446,12 @@ def scrub_settings_for_disk(settings: dict) -> dict:
         out.pop("advisor_ai_api_key", None)
     elif not str(out.get("advisor_ai_api_key") or "").strip():
         out.pop("advisor_ai_api_key", None)
+    for p in _AI_PROVIDER_KEYS:
+        sk = f"advisor_ai_api_key_{p}"
+        if load_advisor_api_key_for_provider(p):
+            out.pop(sk, None)
+        elif not str(out.get(sk) or "").strip():
+            out.pop(sk, None)
     if load_cb_api_key():
         out.pop("cb_api_key", None)
     elif not str(out.get("cb_api_key") or "").strip():

@@ -20,7 +20,8 @@ _LOG_PATTERNS: list[tuple[str, str, str, str]] = [
     # ranked_then_stop handled specially in scan_log_snags (needs Buy batch done check)
     (r"0 actionable", SEV_INFO, "zero_actionable", "Signals found but none affordable for book size"),
     (r"unaffordable", SEV_INFO, "unaffordable", "Ticker unaffordable at current buying power"),
-    (r"pausing new buys", SEV_WARN, "dd_pause_log", "Drawdown guard paused new buys"),
+    # DD Discord already fires from [RISK][DD] — keep log snag local/INFO only
+    (r"pausing new buys", SEV_INFO, "dd_pause_log", "Drawdown guard paused new buys"),
     (r"reauth|verifier required|token expired", SEV_CRITICAL, "reauth_log", "Broker needs manual re-authentication"),
     (r"publish_monitor_status failed", SEV_WARN, "monitor_publish_fail", "Companion status push failing"),
     (r"ui build error", SEV_CRITICAL, "ui_build_error", "UI thread error — app may be unstable"),
@@ -85,7 +86,7 @@ def scan_log_snags(log_lines: list | None, *, seen_codes: set | None = None) -> 
                         break
                 out.append(_snag(
                     "ranked_then_stop",
-                    SEV_WARN,
+                    SEV_INFO,
                     "Buys ranked — watch for silent stop after this line",
                     broker=broker,
                     hint=ln[-180:],
@@ -136,12 +137,14 @@ def scan_status_snags(status: dict | None) -> list[dict]:
             continue
         armed = bool(b.get("armed"))
         if b.get("reauth_needed"):
-            out.append(_snag(
-                "reauth", SEV_CRITICAL,
-                f"{name} needs re-authentication.",
-                broker=name,
-                hint="Open Settings and reconnect the broker.",
-            ))
+            # Stale flag race: connected+armed after reconnect must not CRITICAL Discord.
+            if not (b.get("connected") and armed):
+                out.append(_snag(
+                    "reauth", SEV_CRITICAL,
+                    f"{name} needs re-authentication.",
+                    broker=name,
+                    hint="Open Settings and reconnect the broker.",
+                ))
         if not b.get("connected") and armed:
             out.append(_snag(
                 "armed_offline", SEV_CRITICAL,
@@ -149,9 +152,10 @@ def scan_status_snags(status: dict | None) -> list[dict]:
                 broker=name,
             ))
         if b.get("dd_pause"):
+            # [RISK][DD] Discord already covers this — keep status snag INFO for companion.
             reason = str(b.get("dd_reason") or "drawdown")
             out.append(_snag(
-                "dd_pause", SEV_WARN,
+                "dd_pause", SEV_INFO,
                 f"{name} drawdown pause — new buys blocked ({reason}).",
                 broker=name,
             ))
@@ -170,7 +174,8 @@ def scan_status_snags(status: dict | None) -> list[dict]:
             ))
 
     et = s.get("etrade") or {}
-    if et.get("reauth_needed"):
+    et_bro = (s.get("brokers") or {}).get("E*TRADE") or {}
+    if et.get("reauth_needed") and not (isinstance(et_bro, dict) and et_bro.get("connected")):
         out.append(_snag("etrade_reauth", SEV_CRITICAL, "E*TRADE needs OAuth reauth.", broker="E*TRADE"))
     naked = int(et.get("naked_equity") or et.get("et_naked") or 0)
     if naked > 0:
@@ -192,7 +197,7 @@ def scan_status_snags(status: dict | None) -> list[dict]:
     heat = s.get("portfolio_heat") or {}
     if heat.get("dd_paused"):
         out.append(_snag(
-            "portfolio_dd_pause", SEV_WARN,
+            "portfolio_dd_pause", SEV_INFO,
             "Portfolio heat shows drawdown pause active.",
         ))
 
@@ -224,11 +229,17 @@ def scan_status_snags(status: dict | None) -> list[dict]:
     oc = s.get("overnight_scorecard") or {}
     grade = str(oc.get("grade") or "").upper()
     if grade in ("D", "F"):
-        out.append(_snag(
-            "overnight_grade_low", SEV_WARN,
-            f"Overnight scorecard grade {grade} — review risks before arming.",
-            hint=str(oc.get("tip") or "")[:120],
-        ))
+        # Only nag before arming — when live/armed, missing_stops / reauth already cover it.
+        any_armed = any(
+            isinstance(b, dict) and b.get("armed")
+            for b in (s.get("brokers") or {}).values()
+        )
+        if not any_armed:
+            out.append(_snag(
+                "overnight_grade_low", SEV_WARN,
+                f"Overnight scorecard grade {grade} — review risks before arming.",
+                hint=str(oc.get("tip") or "")[:120],
+            ))
 
     return out
 
@@ -238,6 +249,23 @@ def scan_snags(status: dict | None) -> dict:
     s = status or {}
     status_snags = scan_status_snags(s)
     log_snags = scan_log_snags(s.get("recent_log"))
+    # Drop stale log reauth when no broker currently needs it (post-reconnect race).
+    any_reauth = False
+    for _name, b in (s.get("brokers") or {}).items():
+        if not isinstance(b, dict):
+            continue
+        if b.get("reauth_needed") and not (b.get("connected") and b.get("armed")):
+            any_reauth = True
+            break
+    et = s.get("etrade") or {}
+    et_bro = (s.get("brokers") or {}).get("E*TRADE") or (s.get("brokers") or {}).get("ETRADE") or {}
+    if et.get("reauth_needed") and not (
+        isinstance(et_bro, dict) and et_bro.get("connected")
+    ):
+        any_reauth = True
+    if not any_reauth:
+        log_snags = [x for x in log_snags if x.get("code") != "reauth_log"]
+
     merged: list[dict] = []
     seen: set[str] = set()
     for item in status_snags + log_snags:
@@ -282,7 +310,8 @@ def scan_snags(status: dict | None) -> dict:
 
 
 def snag_alert_key(snag: dict) -> str:
-    return f"{snag.get('code')}|{snag.get('broker')}|{snag.get('message', '')[:60]}"
+    # Sticky identity without message text so -8.3% vs -8.0% does not re-fire Discord.
+    return f"{snag.get('code')}|{snag.get('broker') or ''}"
 
 
 def new_snags_for_alert(
@@ -304,3 +333,15 @@ def new_snags_for_alert(
         if key not in prev:
             out.append(snag)
     return out
+
+
+def current_snag_alert_keys(report: dict | None) -> set:
+    """Keys for currently-active snags (WARN+). Drop cleared snags so a later re-break can alert."""
+    rank = {SEV_CRITICAL: 0, SEV_WARN: 1, SEV_INFO: 2}
+    keys = set()
+    for snag in (report or {}).get("snags") or []:
+        sev = str(snag.get("severity") or SEV_INFO)
+        if rank.get(sev, 9) > rank[SEV_WARN]:
+            continue
+        keys.add(snag_alert_key(snag))
+    return keys

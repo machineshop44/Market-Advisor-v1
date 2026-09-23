@@ -227,22 +227,33 @@ class TestCycleBookExtract(unittest.TestCase):
         )
 
     def test_equity_buy_defer_rh_only(self):
-        sess = {"label": "REGULAR", "fractional_ok": True, "equity_tradeable": True}
-        # Sub-1 share would be stuck overnight on RH
+        # REGULAR / fractional_ok: allow fractionals — same-day exit is available
+        rth = {"label": "REGULAR", "fractional_ok": True, "equity_tradeable": True}
+        self.assertIsNone(
+            ac.equity_buy_defer_reason(
+                "ACHR", 0.4, 50.0, "stock", rth, broker_name="Robinhood",
+            )
+        )
+        # Overnight (no fractional sells): defer sub-1 RH equity buys
+        overnight = {
+            "label": "OVERNIGHT",
+            "fractional_ok": False,
+            "equity_tradeable": True,
+        }
         why = ac.equity_buy_defer_reason(
-            "SMCI", 0.4, 50.0, "stock", sess, broker_name="Robinhood",
+            "SMCI", 0.4, 50.0, "stock", overnight, broker_name="Robinhood",
         )
         self.assertIsNotNone(why)
         self.assertIn("overnight", why.lower())
         # E*TRADE must not inherit RH overnight fractional sell rules
         self.assertIsNone(
             ac.equity_buy_defer_reason(
-                "SMCI", 0.4, 50.0, "stock", sess, broker_name="E*TRADE",
+                "SMCI", 0.4, 50.0, "stock", overnight, broker_name="E*TRADE",
             )
         )
         self.assertIsNone(
             ac.equity_buy_defer_reason(
-                "SMCI", 0.4, 50.0, "stock", sess, broker_name="Coinbase",
+                "SMCI", 0.4, 50.0, "stock", overnight, broker_name="Coinbase",
             )
         )
 
@@ -261,7 +272,8 @@ class TestCycleBookExtract(unittest.TestCase):
         self.assertFalse(rh["allow_fractional"])
         self.assertTrue(et["allow_fractional"])
         self.assertTrue(cb["allow_fractional"])
-        self.assertTrue(et["use_ext"])
+        # ET equity XML stays REGULAR until extended hours are proven — use_ext off
+        self.assertFalse(et["use_ext"])
         self.assertFalse(cb["use_ext"])
 
         overnight = {

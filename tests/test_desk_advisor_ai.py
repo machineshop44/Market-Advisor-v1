@@ -167,28 +167,76 @@ def test_research_pack_shape_and_prompt():
     assert pack.get("ticker") == "ZZZTEST"
     assert "notes" in pack
     prompt = dai._proposal_prompt(prop, {"buying_power": 24.0}, research=pack)
-    assert "research" in prompt
-    assert "research pack" in prompt.lower() or "Use the research block" in prompt
+    assert "app_research_pack" in prompt or "research" in prompt
     assert "ZZZTEST" in prompt
+    assert "retry_after_min" in prompt
+    live = dai._proposal_prompt(
+        prop, {"buying_power": 24.0}, research=pack, live_research=True,
+    )
+    assert "web_search" in live and "x_search" in live
+    assert "retry_after_min" in live
 
 
-def test_ai_budget_blocks_after_cap(monkeypatch):
-    dai._ai_call_times.clear()
-    dai._ai_day_key = ""
-    dai._ai_day_count = 0
-    settings = {"advisor_ai_max_per_minute": 2, "advisor_ai_max_per_day": 3}
-    assert dai._ai_budget_ok(settings)[0] is True
-    dai._ai_budget_record()
-    dai._ai_budget_record()
-    ok, why = dai._ai_budget_ok(settings)
+def test_extract_responses_text():
+    import desk_advisor_ai as dai
+
+    raw = {
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": '{"verdict":"skip","retry_after_min":45}'}],
+            }
+        ]
+    }
+    assert "skip" in dai._extract_responses_text(raw)
+    assert dai._extract_responses_text({"output_text": "hello"}) == "hello"
+
+
+def test_xai_budget_defaults_lift_gemini_caps():
+    import desk_advisor_ai as dai
+
+    dai.reset_ai_budgets()
+    ok, _ = dai._ai_budget_ok({
+        "advisor_ai_source": "xai",
+    }, provider="xai")
+    assert ok is True
+    assert dai.budget_defaults_for_source("xai") == (20, 400)
+    dai.reset_ai_budgets()
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_max_per_minute_gemini": 2,
+        "advisor_ai_max_per_day_gemini": 3,
+    }
+    assert dai._ai_budget_ok(settings, provider="gemini")[0] is True
+    dai._ai_budget_record("gemini")
+    dai._ai_budget_record("gemini")
+    ok, why = dai._ai_budget_ok(settings, provider="gemini")
     assert ok is False
     assert "per-minute" in why
-    dai._ai_call_times.clear()
-    dai._ai_budget_record()  # day count now 3
-    ok2, why2 = dai._ai_budget_ok(settings)
+    dai._budget_slot("gemini")["times"].clear()
+    dai._ai_budget_record("gemini")  # day count now 3
+    ok2, why2 = dai._ai_budget_ok(settings, provider="gemini")
     assert ok2 is False
     assert "daily" in why2
 
+
+def test_model_defaults_are_per_provider():
+    assert dai._model({}, provider="gemini") == dai._DEFAULT_GEMINI_MODEL
+    assert dai._model({"advisor_ai_model": "gemini-3-flash-preview"}, provider="groq") == (
+        dai._DEFAULT_GROQ_MODEL
+    )
+    assert dai._model({"advisor_ai_model": "gemini-3-flash-preview"}, provider="openai") == (
+        dai._DEFAULT_OPENAI_MODEL
+    )
+    assert dai._model(
+        {"advisor_ai_model_openai": "gpt-4o"}, provider="openai"
+    ) == "gpt-4o"
+    assert dai._DEFAULT_GROQ_MODEL == "llama-3.1-8b-instant"
+    assert ":free" in dai._DEFAULT_OPENROUTER_MODEL
+    assert "llama-3.1-8b-instant" in dai._openai_compatible_model_chain("groq")
+    assert any(
+        x.endswith(":free") for x in dai._openai_compatible_model_chain("openrouter")
+    )
 
 def test_local_when_clear_skips_cloud(monkeypatch):
     called = {"n": 0}
@@ -219,10 +267,93 @@ def test_local_when_clear_skips_cloud(monkeypatch):
     assert "cloud skipped" in str(out.get("detail") or "")
 
 
+def test_regime_caution_skips_cloud_even_at_high_score(monkeypatch):
+    """High-score regime_caution used to burn Gemini/Groq then local-skip."""
+    called = {"n": 0}
+
+    def boom(*_a, **_k):
+        called["n"] += 1
+        raise AssertionError("cloud should not be called for regime caution")
+
+    monkeypatch.setattr(dai, "_call_gemini", boom)
+    monkeypatch.setattr(dai, "_call_openai", boom)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key": "fake-key",
+        "advisor_ai_local_when_clear": False,  # even with clear-skip off
+        "allow_buys_when_regime_blocked": False,
+    }
+    prop = {
+        "ticker": "PLUG",
+        "broker": "Robinhood",
+        "dollars": 25.0,
+        "price": 16.5,
+        "score": 116.0,
+        "engine": "PENNY",
+        "asset_type": "stock",
+        "regime_caution": True,
+    }
+    ctx = {
+        "buying_power": 200.0,
+        "allow_buys_when_regime_blocked": False,
+        "blockers": [
+            {"code": "regime_equity", "message": "SPY sources disagree — blocked"}
+        ],
+    }
+    out = dai.analyze_proposal(prop, ctx, settings)
+    assert called["n"] == 0
+    assert out["verdict"] == "skip"
+    assert "regime" in str(out.get("brief") or "").lower()
+    assert "cloud skipped" in str(out.get("detail") or "")
+
+
+def test_crypto_ignores_spy_regime_blocker():
+    prop = {
+        "ticker": "SOL",
+        "broker": "Robinhood",
+        "dollars": 20.0,
+        "price": 150.0,
+        "score": 80.0,
+        "engine": "CRYPTO",
+        "asset_type": "Crypto",
+    }
+    ctx = {
+        "buying_power": 200.0,
+        "allow_buys_when_regime_blocked": False,
+        "blockers": [
+            {"code": "regime_equity", "message": "SPY sources disagree — blocked"},
+        ],
+    }
+    out = dai.local_analyze_proposal(prop, ctx)
+    assert out["verdict"] != "skip" or "SPY" not in str(out.get("brief") or "")
+
+
+def test_equity_ignores_btc_regime_blocker():
+    prop = {
+        "ticker": "PLUG",
+        "broker": "Robinhood",
+        "dollars": 20.0,
+        "price": 16.0,
+        "score": 80.0,
+        "engine": "PENNY",
+        "asset_type": "Penny Stock",
+    }
+    ctx = {
+        "buying_power": 200.0,
+        "blockers": [
+            {"code": "regime_crypto", "message": "BTC-USD 1H Downtrend"},
+        ],
+    }
+    out = dai.local_analyze_proposal(prop, ctx)
+    brief = str(out.get("brief") or "")
+    assert "BTC" not in brief or out["verdict"] != "skip"
+
+
 def test_budget_exhausted_falls_back_local(monkeypatch):
-    dai._ai_call_times.clear()
-    dai._ai_day_key = time.strftime("%Y-%m-%d")
-    dai._ai_day_count = 99
+    dai.reset_ai_budgets()
+    slot = dai._budget_slot("gemini")
+    slot["day_key"] = time.strftime("%Y-%m-%d")
+    slot["day_count"] = 99
 
     def boom(*_a, **_k):
         raise AssertionError("cloud should not be called")
@@ -232,8 +363,9 @@ def test_budget_exhausted_falls_back_local(monkeypatch):
         "advisor_ai_source": "gemini",
         "advisor_ai_api_key": "fake-key",
         "advisor_ai_local_when_clear": False,
-        "advisor_ai_max_per_day": 5,
-        "advisor_ai_max_per_minute": 4,
+        "advisor_ai_max_per_day_gemini": 5,
+        "advisor_ai_max_per_minute_gemini": 4,
+        "advisor_ai_failover_enabled": False,
     }
     prop = {
         "ticker": "TLT",
@@ -246,4 +378,117 @@ def test_budget_exhausted_falls_back_local(monkeypatch):
     }
     out = dai.analyze_proposal(prop, {"buying_power": 100.0}, settings)
     assert out["source"] == "local_fallback"
-    assert "daily AI budget" in str(out.get("error") or out.get("detail") or "")
+    blob = str(out.get("error") or "") + " " + str(out.get("detail") or "")
+    assert "daily" in blob and "budget" in blob
+
+
+def test_failover_skips_failed_provider(monkeypatch):
+    dai.reset_ai_budgets()
+    calls = []
+
+    def fail_gemini(*_a, **_k):
+        calls.append("gemini")
+        raise RuntimeError("gemini down")
+
+    def ok_openai(*_a, **_k):
+        calls.append("openai")
+        return '{"verdict":"wait","brief":"ok via openai","detail":"failover","retry_after_min":10}'
+
+    monkeypatch.setattr(dai, "_call_gemini", fail_gemini)
+    monkeypatch.setattr(dai, "_call_openai", ok_openai)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key_gemini": "g-key",
+        "advisor_ai_api_key_openai": "o-key",
+        "advisor_ai_failover_enabled": True,
+        "advisor_ai_failover_order": "gemini,openai",
+        "advisor_ai_local_when_clear": False,
+    }
+    prop = {
+        "ticker": "SPY",
+        "broker": "E*TRADE",
+        "dollars": 50.0,
+        "price": 400.0,
+        "score": 70.0,
+        "engine": "CORE",
+        "asset_type": "stock",
+    }
+    out = dai.analyze_proposal(prop, {"buying_power": 200.0}, settings)
+    assert calls == ["gemini", "openai"]
+    assert out["source"] == "openai"
+    assert out["ok"] is True
+    assert "failover" in str(out.get("detail") or "")
+
+
+def test_cloud_provider_chain_free_first():
+    s = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key_gemini": "g",
+        "advisor_ai_api_key_groq": "q",
+        "advisor_ai_api_key_openrouter": "r",
+        "advisor_ai_failover_enabled": True,
+    }
+    assert dai.cloud_provider_chain(s) == ["gemini", "groq", "openrouter"]
+    assert dai.budget_defaults_for_source("groq") == (20, 400)
+    assert dai._model({"advisor_ai_source": "groq"}, provider="groq") == dai._DEFAULT_GROQ_MODEL
+    assert "free" in dai._model({}, provider="openrouter")
+
+
+def test_all_providers_exhausted_local(monkeypatch):
+    dai.reset_ai_budgets()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(dai, "_call_gemini", boom)
+    monkeypatch.setattr(dai, "_call_openai", boom)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key_gemini": "g",
+        "advisor_ai_api_key_openai": "o",
+        "advisor_ai_failover_order": "gemini,openai",
+        "advisor_ai_local_when_clear": False,
+    }
+    prop = {
+        "ticker": "QQQ",
+        "broker": "E*TRADE",
+        "dollars": 40.0,
+        "price": 350.0,
+        "score": 68.0,
+        "engine": "CORE",
+        "asset_type": "stock",
+    }
+    out = dai.analyze_proposal(prop, {"buying_power": 100.0}, settings)
+    assert out["source"] == "local_fallback"
+    assert "gemini" in str(out.get("error") or "")
+    assert "openai" in str(out.get("error") or "")
+def test_connection_reports_every_keyed_provider(monkeypatch):
+    calls = []
+
+    def ok_gemini(*_a, **_k):
+        calls.append("gemini")
+        return '{"verdict":"wait","brief":"gemini ok","detail":"t"}'
+
+    def fail_openai(*_a, **_k):
+        calls.append("openai")
+        raise RuntimeError("openai bad key")
+
+    monkeypatch.setattr(dai, "_call_gemini", ok_gemini)
+    monkeypatch.setattr(dai, "_call_openai", fail_openai)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key_gemini": "g",
+        "advisor_ai_api_key_openai": "o",
+        "advisor_ai_failover_order": "gemini,openai",
+        "advisor_ai_failover_enabled": True,
+    }
+    res = dai.test_connection(settings)
+    assert calls == ["gemini", "openai"]
+    assert res["ok"] is True
+    assert res["all_ok"] is False
+    assert len(res["results"]) == 2
+    assert res["results"][0]["ok"] is True
+    assert res["results"][1]["ok"] is False
+    assert "1/2" in res["message"]
+    assert "[OK] gemini" in res["message"]
+    assert "[FAIL] openai" in res["message"]

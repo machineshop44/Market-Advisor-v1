@@ -184,10 +184,13 @@ def ensure_tls_material(
     if CERT_FILE.is_file() and KEY_FILE.is_file() and not force_rotate:
         try:
             pem = CERT_FILE.read_bytes()
-            fp = read_fingerprint() or fingerprint_from_pem(pem)
-            if not fp:
-                fp = fingerprint_from_pem(pem)
+            # Always derive pin from the live cert — never trust a stale fingerprint.txt
+            # (QR/API pin must match the handshake or Companion looks offline until restart).
+            fp = fingerprint_from_pem(pem)
+            try:
                 FINGERPRINT_FILE.write_text(fp + "\n", encoding="utf-8")
+            except Exception:
+                pass
             return CERT_FILE, KEY_FILE, fp
         except Exception:
             pass

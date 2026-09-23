@@ -91,14 +91,26 @@ class TestMarketRegimeFailClosed(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("DO NOT BUY", why)
 
-    def test_sources_disagree_fail_closed(self):
+    def test_sources_disagree_yahoo_up_allows(self):
+        """Yahoo 1H up + broker flicker down must not lock out a green session."""
         import scoring
         with patch("scoring._yahoo_regime_vote", return_value=(True, True, 100.0, "yahoo 1H")), \
              patch("scoring._broker_regime_vote", return_value=(True, False, "broker live vs yahoo EMA")), \
              patch("scoring.save_state"):
             ok, why = scoring.market_regime_ok(is_crypto=False)
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+        self.assertTrue(scoring._regime_last_good.get("SPY", {}).get("ok"))
+
+    def test_sources_disagree_yahoo_down_blocks(self):
+        import scoring
+        with patch("scoring._yahoo_regime_vote", return_value=(True, False, 100.0, "yahoo 1H")), \
+             patch("scoring._broker_regime_vote", return_value=(True, True, "broker short-trend")), \
+             patch("scoring.save_state"):
+            ok, why = scoring.market_regime_ok(is_crypto=False)
         self.assertFalse(ok)
         self.assertIn("disagree", why.lower())
+        self.assertFalse(scoring._regime_last_good.get("SPY", {}).get("ok"))
 
 
 class TestBtcProxyRegime(unittest.TestCase):
@@ -132,17 +144,17 @@ class TestBtcProxyRegime(unittest.TestCase):
         mreg.assert_called_once_with(is_crypto=False)
         self.assertEqual(why, "spy ok")
 
-    def test_entry_regime_growth_skips_spy_gate(self):
+    def test_entry_regime_growth_keeps_spy_gate(self):
         import scoring
         with patch("scoring.market_regime_ok", return_value=(False, "DO NOT BUY (Regime: SPY 1H Downtrend)")) as mreg:
             ok, why = scoring.entry_regime_ok(
                 is_crypto=False, posture="growth", ticker="AAPL",
             )
-        self.assertTrue(ok)
-        mreg.assert_not_called()
-        self.assertEqual(why, "")
+        self.assertFalse(ok)
+        mreg.assert_called_once_with(is_crypto=False)
+        self.assertIn("SPY", why)
 
-    def test_evaluate_opportunity_growth_skips_spy_gate(self):
+    def test_evaluate_opportunity_growth_respects_spy_gate(self):
         import scoring
         with patch("scoring.fetch_current_price", return_value=100.0), \
              patch("scoring.market_regime_ok", return_value=(False, "DO NOT BUY (Regime: SPY 1H Downtrend)")) as mreg, \
@@ -153,9 +165,8 @@ class TestBtcProxyRegime(unittest.TestCase):
                 (True, None, 50.0, True),  # micro bullish, rsi, volume
             ]
             action = scoring.evaluate_opportunity("AAPL", posture="growth")
-        self.assertIn("BUY", action)
-        self.assertNotIn("DO NOT BUY", action)
-        mreg.assert_not_called()
+        self.assertIn("DO NOT BUY", action)
+        mreg.assert_called()
 
     def test_small_book_prefers_breakouts(self):
         import scoring

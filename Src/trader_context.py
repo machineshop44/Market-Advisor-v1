@@ -146,12 +146,29 @@ def build_trader_context(
             "message": f"{broker_name} auto-trader disarmed",
         })
 
+    consec_paused = False
+    consec_why = ""
+    if bool(s.get("consecutive_loss_guard", True)):
+        try:
+            import loss_streak as ls
+            consec_paused, consec_why = ls.buys_paused(broker_name)
+            if consec_paused:
+                blockers.append({
+                    "code": "consecutive_loss",
+                    "message": consec_why or "consecutive-loss pause",
+                })
+        except Exception:
+            consec_paused = False
+
     regime_blocks_entry = bool(
         (supports_equities and regime_equity_ok is False and equity_regime_required(posture))
         or (supports_crypto and regime_crypto_ok is False and crypto_regime_required(posture))
     )
     hard_block = any(
-        b["code"] in ("halt", "offline", "reauth", "dd_pause", "low_bp", "fully_deployed")
+        b["code"] in (
+            "halt", "offline", "reauth", "dd_pause", "low_bp", "fully_deployed",
+            "consecutive_loss",
+        )
         for b in blockers
     )
     can_buy = (
@@ -159,6 +176,7 @@ def build_trader_context(
         and not halted
         and not reauth_needed
         and not dd_paused
+        and not consec_paused
         and not hard_block
     )
     auto_ready = bool(can_buy and armed and not regime_blocks_entry)
@@ -240,7 +258,7 @@ def _regime_reason_short(reason: str) -> str:
 def format_regime_chip(ctx: dict | None) -> tuple[str, str, str]:
     """
     Desk-wide regime strip for Home: (label, tooltip, css_color).
-    Growth/aggressive may skip SPY — show skipped state when gate not required.
+    Growth keeps SPY 1H gate (small-book safety); aggressive may skip when profile says so.
     """
     ctx = ctx or {}
     regime = ctx.get("regime") or {}
@@ -280,7 +298,7 @@ def format_regime_chip(ctx: dict | None) -> tuple[str, str, str]:
     label = "Regime: " + " · ".join(parts)
     tip = " · ".join(tips) if tips else label
     if blocked:
-        tip += " · Advisor can propose past regime when you approve"
+        tip += " · Enable allow_buys_when_regime_blocked in Settings to bypass"
     color = "#C62828" if blocked else ("#2E7D32" if parts else "#555")
     return label, tip, color
 

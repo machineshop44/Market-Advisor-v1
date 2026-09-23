@@ -16,15 +16,17 @@ def test_scan_halt_critical():
     assert any(s["code"] == "panic_halt" for s in r["snags"])
 
 
-def test_scan_dd_pause_warn():
+def test_scan_dd_pause_info_not_discord_spam():
+    # DD Discord already fires from [RISK][DD] — status snag stays INFO.
     r = dw.scan_snags({
         "brokers": {
             "Robinhood": {"dd_pause": True, "dd_reason": "peak -22%", "connected": True},
         },
         "recent_log": [],
     })
-    assert r["status"] == "warn"
-    assert any(s["code"] == "dd_pause" for s in r["snags"])
+    assert r["status"] == "info"
+    snag = next(s for s in r["snags"] if s["code"] == "dd_pause")
+    assert snag["severity"] == "info"
 
 
 def test_scan_log_thread_error():

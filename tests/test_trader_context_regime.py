@@ -31,7 +31,7 @@ class TestTraderContextRegime(unittest.TestCase):
         self.assertTrue(ctx.get("regime_blocks_entry"))
         self.assertFalse(ctx.get("auto_ready"))
 
-    def test_auto_ready_true_when_growth_skips_spy(self):
+    def test_auto_ready_true_when_growth_spy_ok(self):
         with patch(
             "trader_context.entry_regime_ok",
             return_value=(True, ""),
@@ -47,13 +47,14 @@ class TestTraderContextRegime(unittest.TestCase):
         self.assertFalse(ctx.get("regime_blocks_entry"))
         self.assertTrue(ctx.get("auto_ready"))
 
-    def test_format_regime_chip_growth_skipped(self):
+    def test_format_regime_chip_growth_shows_spy(self):
         label, tip, color = format_regime_chip({
             "posture": "growth",
             "regime": {"equity_ok": False, "equity_reason": "blocked", "crypto_ok": True},
         })
-        self.assertIn("SPY skipped", label)
-        self.assertIn("#2E7D32", color)
+        self.assertIn("SPY", label)
+        self.assertNotIn("SPY skipped", label)
+        self.assertIn("#C62828", color)
 
     def test_digest_shows_regime_flag(self):
         digest = format_trader_digest({

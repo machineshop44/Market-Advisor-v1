@@ -53,15 +53,26 @@ class TestBrokerParityMatrix(unittest.TestCase):
                 self.assertTrue(flags["allow_fractional"], broker)
 
     def test_buy_defer_matrix(self):
-        sess = {"label": "REGULAR", "fractional_ok": True}
+        # Gate applies on overnight RH only — REGULAR must not block fractionals.
+        overnight = {
+            "label": "OVERNIGHT",
+            "fractional_ok": False,
+            "equity_tradeable": True,
+        }
         for broker, applies in PARITY_MATRIX["rh_overnight_frac_buy_defer"].items():
             why = ac.equity_buy_defer_reason(
-                "TEST", 0.25, 40.0, "stock", sess, broker_name=broker,
+                "TEST", 0.25, 40.0, "stock", overnight, broker_name=broker,
             )
             if applies:
                 self.assertIsNotNone(why, broker)
             else:
                 self.assertIsNone(why, broker)
+        rth = {"label": "REGULAR", "fractional_ok": True, "equity_tradeable": True}
+        self.assertIsNone(
+            ac.equity_buy_defer_reason(
+                "ACHR", 0.25, 40.0, "stock", rth, broker_name="Robinhood",
+            )
+        )
 
 
 class TestSilentExceptLongLived(unittest.TestCase):

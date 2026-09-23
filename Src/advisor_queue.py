@@ -18,6 +18,8 @@ QUEUE_FILE = os.path.join(_SRC_DIR, "advisor_queue.json")
 DECISIONS_FILE = os.path.join(_SRC_DIR, "advisor_decisions.jsonl")
 DEFAULT_TTL_SEC = 45 * 60  # 45 minutes
 WAIT_TTL_SEC = 12 * 60  # AI "wait" should not rot in the queue
+# After reject / AI skip, do not re-propose the same broker+ticker (SOUN thrash).
+REJECT_REPROPOSE_COOLDOWN_SEC = 20 * 60
 _DECISIONS_MAX_LINES = 500
 _lock = threading.Lock()
 _decisions_lock = threading.Lock()
@@ -25,17 +27,19 @@ _decisions_lock = threading.Lock()
 
 def _load() -> dict[str, Any]:
     if not os.path.exists(QUEUE_FILE):
-        return {"proposals": []}
+        return {"proposals": [], "repropose_cooldown": {}}
     try:
         with open(QUEUE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"proposals": []}
+            return {"proposals": [], "repropose_cooldown": {}}
         if not isinstance(data.get("proposals"), list):
             data["proposals"] = []
+        if not isinstance(data.get("repropose_cooldown"), dict):
+            data["repropose_cooldown"] = {}
         return data
     except Exception:
-        return {"proposals": []}
+        return {"proposals": [], "repropose_cooldown": {}}
 
 
 def _save(data: dict[str, Any]) -> None:
@@ -49,6 +53,115 @@ def _save(data: dict[str, Any]) -> None:
             print(f"Advisor queue save error: {e}")
         except Exception:
             pass
+
+
+def _cooldown_key(broker: str, ticker: str) -> str:
+    return f"{str(broker or '').strip()}|{str(ticker or '').replace('-USD', '').upper().strip()}"
+
+
+def _prune_cooldowns(data: dict[str, Any], *, now: float | None = None) -> None:
+    now = float(now if now is not None else time.time())
+    store = data.get("repropose_cooldown")
+    if not isinstance(store, dict):
+        data["repropose_cooldown"] = {}
+        return
+    dead = [k for k, v in store.items() if not isinstance(v, dict) or float(v.get("until") or 0) <= now]
+    for k in dead:
+        store.pop(k, None)
+
+
+def set_repropose_cooldown(
+    broker: str,
+    ticker: str,
+    *,
+    seconds: float | None = None,
+    reason: str = "",
+    verdict: str = "",
+    now: float | None = None,
+) -> float:
+    """
+    Block re-proposing broker+ticker until now+seconds.
+    Returns until-timestamp (0 if skipped).
+    """
+    broker_s = str(broker or "").strip()
+    tick = str(ticker or "").replace("-USD", "").upper().strip()
+    if not broker_s or not tick:
+        return 0.0
+    try:
+        sec = float(seconds if seconds is not None else REJECT_REPROPOSE_COOLDOWN_SEC)
+    except (TypeError, ValueError):
+        sec = float(REJECT_REPROPOSE_COOLDOWN_SEC)
+    if sec <= 0:
+        return 0.0
+    ts_now = float(now if now is not None else time.time())
+    until = ts_now + sec
+    with _lock:
+        data = _load()
+        _prune_cooldowns(data, now=ts_now)
+        store = data.setdefault("repropose_cooldown", {})
+        store[_cooldown_key(broker_s, tick)] = {
+            "until": until,
+            "reason": str(reason or "")[:120],
+            "verdict": str(verdict or "").strip().lower()[:40],
+            "set_at": ts_now,
+        }
+        _save(data)
+    return until
+
+
+def clear_repropose_cooldown(broker: str, ticker: str) -> None:
+    broker_s = str(broker or "").strip()
+    tick = str(ticker or "").replace("-USD", "").upper().strip()
+    if not broker_s or not tick:
+        return
+    with _lock:
+        data = _load()
+        store = data.get("repropose_cooldown")
+        if isinstance(store, dict):
+            store.pop(_cooldown_key(broker_s, tick), None)
+            _save(data)
+
+
+def repropose_cooldown_remaining(
+    broker: str,
+    ticker: str,
+    *,
+    now: float | None = None,
+) -> float:
+    """Seconds left before broker+ticker may be proposed again (0 = clear)."""
+    broker_s = str(broker or "").strip()
+    tick = str(ticker or "").replace("-USD", "").upper().strip()
+    if not broker_s or not tick:
+        return 0.0
+    ts_now = float(now if now is not None else time.time())
+    with _lock:
+        data = _load()
+        _prune_cooldowns(data, now=ts_now)
+        store = data.get("repropose_cooldown") or {}
+        entry = store.get(_cooldown_key(broker_s, tick))
+        if not isinstance(entry, dict):
+            return 0.0
+        until = float(entry.get("until") or 0)
+        rem = until - ts_now
+        if rem <= 0:
+            store.pop(_cooldown_key(broker_s, tick), None)
+            _save(data)
+            return 0.0
+        return rem
+
+
+def repropose_blocked(
+    broker: str,
+    ticker: str,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """True when a recent reject/skip should block a fresh propose."""
+    rem = repropose_cooldown_remaining(broker, ticker, now=now)
+    if rem <= 0:
+        return False, ""
+    mins = max(1, int((rem + 59) // 60))
+    return True, f"re-ask cooldown ~{mins}m after prior reject/skip"
 
 
 def expire_stale(now: float | None = None) -> int:
@@ -183,9 +296,20 @@ def patch_ai(proposal_id: str, ai: dict) -> dict | None:
                 p["ai_source"] = str(ai.get("source") or "")
                 p["ai_error"] = str(ai.get("error") or "")[:200]
                 p["ai_at"] = float(time.time())
+                try:
+                    from desk_advisor_ai import clamp_retry_after_min
+                    p["ai_retry_after_min"] = int(
+                        clamp_retry_after_min(
+                            ai.get("retry_after_min"),
+                            verdict=str(p.get("ai_verdict") or ""),
+                        )
+                    )
+                except Exception:
+                    p["ai_retry_after_min"] = 0
                 # Wait verdicts should not rot in the queue for beginners
                 if str(p.get("ai_verdict") or "").lower() == "wait":
-                    p["expires_at"] = time.time() + float(WAIT_TTL_SEC)
+                    wait_mins = float(p.get("ai_retry_after_min") or 0) or (WAIT_TTL_SEC / 60.0)
+                    p["expires_at"] = time.time() + max(60.0, wait_mins * 60.0)
                 _save(data)
                 return dict(p)
     return None
@@ -215,8 +339,13 @@ def propose(
     reason: str = "entry",
     ttl_sec: int = DEFAULT_TTL_SEC,
     regime_caution: bool = False,
+    honor_cooldown: bool = True,
 ) -> dict | None:
-    """Create or refresh a pending proposal for broker+ticker."""
+    """Create or refresh a pending proposal for broker+ticker.
+
+    honor_cooldown: when True (default), a recent reject/skip blocks a *new*
+    proposal. An already-pending row is still refreshed (price/size).
+    """
     broker_s = str(broker or "").strip()
     tick = str(ticker or "").replace("-USD", "").upper().strip()
     if not broker_s or not tick:
@@ -230,20 +359,32 @@ def propose(
             if not isinstance(p, dict):
                 continue
             if (
-                str(p.get("status") or "") == "pending"
-                and str(p.get("broker") or "") == broker_s
+                str(p.get("broker") or "") == broker_s
                 and str(p.get("ticker") or "").upper() == tick
             ):
-                p["price"] = float(price or 0)
-                p["dollars"] = float(dollars or 0)
-                p["score"] = float(score or 0)
-                p["engine"] = str(engine or "")
-                p["reason"] = str(reason or "entry")
-                p["regime_caution"] = bool(regime_caution)
-                p["updated_at"] = now
-                p["expires_at"] = now + float(ttl_sec or DEFAULT_TTL_SEC)
-                _save(data)
-                return dict(p)
+                st = str(p.get("status") or "")
+                # In-flight apply: do not spawn a duplicate that re-briefs / re-applies.
+                if st == "executing":
+                    return None
+                if st == "pending":
+                    p["price"] = float(price or 0)
+                    p["dollars"] = float(dollars or 0)
+                    p["score"] = float(score or 0)
+                    p["engine"] = str(engine or "")
+                    p["reason"] = str(reason or "entry")
+                    p["regime_caution"] = bool(regime_caution)
+                    p["updated_at"] = now
+                    p["expires_at"] = now + float(ttl_sec or DEFAULT_TTL_SEC)
+                    out = dict(p)
+                    out["_refreshed"] = True
+                    _save(data)
+                    return out
+        if honor_cooldown:
+            _prune_cooldowns(data, now=now)
+            store = data.get("repropose_cooldown") or {}
+            entry = store.get(_cooldown_key(broker_s, tick))
+            if isinstance(entry, dict) and float(entry.get("until") or 0) > now:
+                return None
         prop = {
             "id": uuid.uuid4().hex[:12],
             "broker": broker_s,
@@ -268,7 +409,9 @@ def propose(
         proposals.append(prop)
         data["proposals"] = proposals[-80:]
         _save(data)
-        return prop
+        out = dict(prop)
+        out["_refreshed"] = False
+        return out
 
 
 def _set_status(proposal_id: str, status: str, *, from_statuses=None) -> dict | None:
@@ -276,6 +419,7 @@ def _set_status(proposal_id: str, status: str, *, from_statuses=None) -> dict | 
     if not pid:
         return None
     allowed = set(from_statuses or ("pending",))
+    touched = None
     with _lock:
         data = _load()
         for p in data.get("proposals") or []:
@@ -288,8 +432,27 @@ def _set_status(proposal_id: str, status: str, *, from_statuses=None) -> dict | 
                 else:
                     p["updated_at"] = time.time()
                 _save(data)
-                return dict(p)
-    return None
+                touched = dict(p)
+                break
+    if not touched:
+        return None
+    # Cool down re-asks after reject; clear on approve so a later setup can fire.
+    try:
+        if status == "rejected":
+            set_repropose_cooldown(
+                touched.get("broker") or "",
+                touched.get("ticker") or "",
+                reason="rejected",
+                verdict=str(touched.get("ai_verdict") or "reject"),
+            )
+        elif status == "approved":
+            clear_repropose_cooldown(
+                touched.get("broker") or "",
+                touched.get("ticker") or "",
+            )
+    except Exception:
+        pass
+    return touched
 
 
 def approve(proposal_id: str) -> dict | None:
@@ -313,6 +476,7 @@ def complete(proposal_id: str, ok: bool) -> dict | None:
 
 
 def reject_all() -> int:
+    touched: list[tuple[str, str]] = []
     with _lock:
         data = _load()
         n = 0
@@ -320,10 +484,16 @@ def reject_all() -> int:
             if isinstance(p, dict) and str(p.get("status") or "") in ("pending", "executing"):
                 p["status"] = "rejected"
                 p["resolved_at"] = time.time()
+                touched.append((str(p.get("broker") or ""), str(p.get("ticker") or "")))
                 n += 1
         if n:
             _save(data)
-        return n
+    for broker, tick in touched:
+        try:
+            set_repropose_cooldown(broker, tick, reason="reject_all", verdict="reject")
+        except Exception:
+            pass
+    return n
 
 
 def monitor_payload(limit: int = 5) -> dict:

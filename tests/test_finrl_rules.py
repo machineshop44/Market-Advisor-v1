@@ -79,12 +79,15 @@ class TestCryptoHoldBias(unittest.TestCase):
 
     def test_thin_ticket_needs_strong_score(self):
         import scoring
-        # Score passes floor but not thin-ticket bar
+        # Score passes floor but not thin-ticket / fee bar ($5 notional)
         ok, why = scoring.crypto_new_entry_ok(
             "ROBINHOOD", "SOL", score=60.0, notional=5.0, skip_turbulence=True
         )
         self.assertFalse(ok)
-        self.assertIn("Thin", why)
+        self.assertTrue(
+            "Thin" in why or "Fee gate" in why,
+            f"expected Thin or Fee gate block, got: {why!r}",
+        )
 
     def test_strong_thin_ticket_clears_when_edge_ok(self):
         import scoring

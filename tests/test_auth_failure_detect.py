@@ -39,6 +39,7 @@ class TestManualAuthFailureDetect(unittest.TestCase):
                 k in note
                 for k in (
                     "arm", "midnight", "reauth", "fee", "crypto", "etrade", "et ",
+                    "pdt", "loss", "portfolio", "session",
                 )
             ),
             f"VERSION_NOTE should describe ship themes: {VERSION_NOTE!r}",

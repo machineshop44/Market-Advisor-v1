@@ -732,9 +732,10 @@ class RobinhoodAdapter(BaseBroker):
             print(f"Robinhood get_crypto_positions error: {e}")
         return assets
 
-    def get_live_price(self, ticker, allow_yahoo_fallback=True):
+    def get_live_price(self, ticker, allow_yahoo_fallback=True, *, is_crypto=False):
         clean = str(ticker).replace("-USD", "").upper()
-        if clean in KNOWN_CRYPTOS:
+        use_crypto = bool(is_crypto) or clean in KNOWN_CRYPTOS or is_known_crypto(clean)
+        if use_crypto:
             try:
                 q = r.crypto.get_crypto_quote(clean)
                 if isinstance(q, dict):
@@ -1063,7 +1064,16 @@ class RobinhoodAdapter(BaseBroker):
             except Exception as e:
                 return f"Skipped: RH crypto quote unavailable for {ticker} ({e})", 0.0, None
             try:
-                res = r.order_buy_crypto_by_quantity(ticker, safe_qty_str)
+                res = None
+                for _attempt in range(2):
+                    res = r.order_buy_crypto_by_quantity(ticker, safe_qty_str)
+                    if isinstance(res, dict) and "id" in res:
+                        break
+                    if res is not None:
+                        break
+                    # RH occasionally returns None on first hit — one quick retry
+                    if _attempt == 0:
+                        time.sleep(0.45)
                 if isinstance(res, dict) and 'id' in res:
                     oid = res['id']
                     conf, state = self.confirm_order(oid, is_crypto=True, timeout_sec=20)
@@ -1183,7 +1193,17 @@ class RobinhoodAdapter(BaseBroker):
         return f"Fail: {res}", 0.0, None
 
     def _rh_cancel_unfilled(self, oid, state, *, is_crypto=False):
-        """Cancel resting order; only claim cancelled when cancel_order succeeds."""
+        """
+        After confirm timeout: crypto still cancels (GTC can lock BP).
+        Equity leaves the order working — cancelling EXT 'queued' limits floods
+        Robinhood emails and makes Advisor re-fire the same ticket.
+        """
+        if not is_crypto:
+            return (
+                f"Buy submitted pending fill ({state}; left working)",
+                0.0,
+                oid,
+            )
         ok_c, c_st = False, "no_id"
         try:
             ok_c, c_st = self.cancel_order(oid, is_crypto=is_crypto)
@@ -1192,7 +1212,7 @@ class RobinhoodAdapter(BaseBroker):
         if ok_c:
             return f"Skipped: Limit unfilled ({state}) — cancelled", 0.0, None
         return (
-            f"Fail: Limit unfilled ({state}); cancel failed ({c_st})",
+            f"Buy submitted pending fill ({state}; left working)",
             0.0,
             oid,
         )
@@ -1279,7 +1299,15 @@ class RobinhoodAdapter(BaseBroker):
                 return f"Skipped: Dust below RH min ({min_qty} {ticker})", None
             safe_qty_str = format(float(valid_qty_dec), f".{decimals}f")
             try:
-                res = r.order_sell_crypto_by_quantity(ticker, safe_qty_str)
+                res = None
+                for _attempt in range(2):
+                    res = r.order_sell_crypto_by_quantity(ticker, safe_qty_str)
+                    if isinstance(res, dict) and "id" in res:
+                        break
+                    if res is not None:
+                        break
+                    if _attempt == 0:
+                        time.sleep(0.45)
                 if isinstance(res, dict) and 'id' in res:
                     oid = res['id']
                     conf, state = self.confirm_order(oid, is_crypto=True)
@@ -1312,6 +1340,38 @@ class RobinhoodAdapter(BaseBroker):
                 or "instrument" in e and "none" in e
             )
 
+        # Overnight / late AH: fractionals blocked. Peel whole-share floor so mixed
+        # lots (e.g. 2.99 ACHR) still exit risk instead of no-op skip spam every cycle.
+        peel_partial = False
+        if not allow_fractional and not self._qty_is_whole_shares(shares_val):
+            try:
+                whole = int(
+                    Decimal(str(shares_val)).to_integral_value(rounding=ROUND_DOWN)
+                )
+            except Exception:
+                whole = 0
+            if whole >= 1:
+                try:
+                    peel_partial = float(shares_val) - float(whole) > 1e-6
+                except Exception:
+                    peel_partial = True
+                shares_val = float(whole)
+            else:
+                return (
+                    "Skipped: Overnight/late session — RH blocks fractional equity sells "
+                    "(OK again in extended ~7am ET or regular hours; after-hours "
+                    "fractionals end ~7:30pm ET).",
+                    None,
+                )
+
+        def _peel_tag(msg: str) -> str:
+            if not peel_partial:
+                return msg
+            # Mark partial so GUI keeps basis/TTP on the leftover fractional.
+            if "Sell-All" in msg:
+                return msg.replace("Sell-All", "Sell-All partial peel", 1)
+            return f"partial peel {msg}"
+
         # Whole-share-only path. offset<=0 → market; else limit with cancel→market on timeout.
         if self._qty_is_whole_shares(shares_val):
             qty_to_sell = int(Decimal(str(shares_val)).to_integral_value())
@@ -1326,7 +1386,7 @@ class RobinhoodAdapter(BaseBroker):
                     conf, state = self.confirm_order(oid, is_crypto=False) if oid else (False, "unknown")
                     tag = "Filled" if conf else f"Pending/{state}"
                     suffix = f" {why_tag}" if why_tag else ""
-                    return f"{all_tag} market{suffix} {tag} ({qty_to_sell})", oid
+                    return _peel_tag(f"{all_tag} market{suffix} {tag} ({qty_to_sell})"), oid
                 return None, res_m
 
             if float(offset_pct or 0) <= 0:
@@ -1356,7 +1416,7 @@ class RobinhoodAdapter(BaseBroker):
                         oid, is_crypto=False, timeout_sec=45,
                     ) if oid else (False, "unknown")
                     if conf:
-                        return f"{all_tag} Filled ({qty_to_sell})", oid
+                        return _peel_tag(f"{all_tag} Filled ({qty_to_sell})"), oid
                     # Unfilled / timed out — cancel and market so disaster/exit rails don't stall
                     if oid:
                         try:
@@ -1844,7 +1904,7 @@ class CoinbaseAdapter(BaseBroker):
             pass
         return assets
 
-    def get_live_price(self, ticker, allow_yahoo_fallback=True):
+    def get_live_price(self, ticker, allow_yahoo_fallback=True, *, is_crypto=False):
         clean = str(ticker).replace("-USD", "").upper()
         # Hard block equity/ETF symbols — Coinbase has no SPY-USD etc (stops 404 spam)
         equity_block = {
@@ -1853,7 +1913,8 @@ class CoinbaseAdapter(BaseBroker):
             "SPCX", "NFLX", "GOOG", "GOOGL", "INTC", "BAC", "F", "GE", "DIS",
             "AMC", "SMCI", "GME", "MULN", "FFIE", "NIO", "RIVN", "LCID", "SOFI",
         }
-        if clean in equity_block or clean.endswith("Q") and len(clean) >= 4:
+        # is_crypto=True bypasses equity block for shared ticker codes traded as crypto
+        if not is_crypto and (clean in equity_block or clean.endswith("Q") and len(clean) >= 4):
             return 0.0
 
         if self.is_connected and self.client:
@@ -2030,7 +2091,8 @@ class CoinbaseAdapter(BaseBroker):
                             None,
                         )
                     return (
-                        f"Fail: Limit unfilled ({state}); cancel failed ({cancel_st})",
+                        f"Coinbase Buy submitted pending fill "
+                        f"({kind} {trade_dollars:.2f}; {state}; left working)",
                         0.0,
                         oid,
                     )
@@ -2197,16 +2259,29 @@ class CoinbaseAdapter(BaseBroker):
                 return False, None, "invalid qty/entry/stop"
             limits = self._get_product_limits(clean)
             inc = float(limits.get("base_increment", 0.00000001))
+            quote_inc = float(limits.get("quote_increment", 0.01) or 0.01)
             d_inc = Decimal(str(inc))
+            d_q = Decimal(str(quote_inc))
+            if d_q <= 0:
+                d_q = Decimal("0.01")
             decimals = abs(d_inc.as_tuple().exponent)
             valid = (Decimal(str(qty)) / d_inc).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_inc
             if float(valid) <= 0:
                 return False, None, "qty below CB increment"
-            stop_price = entry * (1.0 - stop_d)
-            limit_price = stop_price * 0.995
-            px_dec = 2 if entry >= 1.0 else 6
-            stop_s = f"{stop_price:.{px_dec}f}"
-            limit_s = f"{limit_price:.{px_dec}f}"
+            # Snap stop/limit to quote_increment — raw float round caused
+            # PREVIEW_INVALID_STOP_PRICE_PRECISION on sub-$1 alts (FET etc.).
+            stop_raw = Decimal(str(entry)) * (Decimal("1") - Decimal(str(stop_d)))
+            limit_raw = stop_raw * Decimal("0.995")
+            stop_dec = (stop_raw / d_q).to_integral_value(rounding=ROUND_DOWN) * d_q
+            limit_dec = (limit_raw / d_q).to_integral_value(rounding=ROUND_DOWN) * d_q
+            if stop_dec <= 0:
+                return False, None, "stop price rounded to 0"
+            if limit_dec <= 0 or limit_dec >= stop_dec:
+                limit_dec = stop_dec - d_q
+            if limit_dec <= 0:
+                return False, None, "limit price rounded to 0"
+            stop_s = format(stop_dec, "f")
+            limit_s = format(limit_dec, "f")
             size_s = format(float(valid), f".{decimals}f")
             client_order_id = f"prot-{int(time.time() * 1000)}"
             res = self._cb_call(

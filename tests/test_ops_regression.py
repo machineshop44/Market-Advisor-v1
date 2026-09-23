@@ -69,9 +69,12 @@ class TestSellFailBackoff(unittest.TestCase):
         )
         self.assertTrue(already2)
         self.assertIsNone(note2)
-        # TTL expiry clears skip
-        self.assertFalse(
+        # Empty RH responses use ≥2h TTL (stored on entry)
+        self.assertTrue(
             alu.sell_fail_should_skip(store, "Robinhood", "BONK", now=3_000.0, ttl_sec=1800)
+        )
+        self.assertFalse(
+            alu.sell_fail_should_skip(store, "Robinhood", "BONK", now=1_000.0 + 7201, ttl_sec=1800)
         )
 
     def test_reason_change_relogs(self):

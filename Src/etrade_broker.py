@@ -448,7 +448,8 @@ class ETradeAdapter(BaseBroker):
             return float(row[1])
         return 0.0
 
-    def get_live_price(self, ticker, allow_yahoo_fallback=True):
+    def get_live_price(self, ticker, allow_yahoo_fallback=True, *, is_crypto=False):
+        # is_crypto ignored — E*TRADE is equities-only
         clean = str(ticker).upper().replace("-USD", "")
         cached = self._cached_quote(clean)
         if cached > 0:
@@ -636,10 +637,12 @@ class ETradeAdapter(BaseBroker):
                         0.0,
                         order_id,
                     )
+                # E*TRADE often 400s cancel while still PENDING — leave as working,
+                # do not look like a hard fail (BP stays reserved via working_orders).
                 return (
                     f"E*TRADE Buy submitted pending fill "
-                    f"({price_type} {qty} {sym}; {state}; cancel failed: {cancel_st})",
-                    spent,
+                    f"({price_type} {qty} {sym}; {state}; left working)",
+                    0.0,
                     order_id,
                 )
             # MARKET not confirmed — do not book spent/BP as filled (working-order honesty).
@@ -718,6 +721,37 @@ class ETradeAdapter(BaseBroker):
             )
             preview = self.client.preview_equity_order(self.account_id_key, preview_xml)
             preview_id = _extract_preview_id(preview)
+            if preview_id is None and sell_all:
+                # EOD flatten: stale share count often causes preview 400 — refresh live qty once.
+                try:
+                    sym = str(ticker).replace("-USD", "").upper()
+                    for h in self.get_current_holdings() or []:
+                        if str(h.get("ticker") or "").upper() == sym:
+                            live = float(h.get("shares") or 0)
+                            if live > 0 and abs(live - qty) > 1e-6:
+                                qty = round_fractional_qty(live) if allow_fractional else float(
+                                    math.floor(live)
+                                )
+                                if qty < 1.0:
+                                    price_type = "MARKET"
+                                    limit_price = None
+                                    market_session = "REGULAR"
+                                preview_xml = build_equity_order_xml(
+                                    client_order_id=client_order_id,
+                                    symbol=ticker,
+                                    order_action="SELL",
+                                    quantity=qty,
+                                    price_type=price_type,
+                                    limit_price=limit_price,
+                                    market_session=market_session,
+                                )
+                                preview = self.client.preview_equity_order(
+                                    self.account_id_key, preview_xml
+                                )
+                                preview_id = _extract_preview_id(preview)
+                            break
+                except Exception:
+                    pass
             if preview_id is None:
                 return f"Preview failed: {preview}", None
             place_xml = build_equity_order_xml(
@@ -757,7 +791,7 @@ class ETradeAdapter(BaseBroker):
                     )
                 return (
                     f"E*TRADE {label} submitted pending fill "
-                    f"({price_type} {qty} {sym}; {state}; cancel failed: {cancel_st})",
+                    f"({price_type} {qty} {sym}; {state}; left working)",
                     order_id,
                 )
             return (
@@ -793,7 +827,8 @@ class ETradeAdapter(BaseBroker):
                     return False, "REJECTED"
             except Exception as e:
                 return False, str(e)
-            time.sleep(1.0)
+            # 2s after first miss — list_orders every 1s was ~20–25 calls per ticket.
+            time.sleep(2.0)
         return False, "PENDING"
 
     def cancel_order(self, order_id, is_crypto=False):
@@ -801,11 +836,29 @@ class ETradeAdapter(BaseBroker):
             return False, "crypto unsupported"
         if not self.client or not self.account_id_key:
             return False, "not connected"
+        oid = str(order_id or "").strip()
+        if not oid:
+            return False, "no order id"
+        st = self._order_status_from_list(oid)
+        if st and _order_status_not_cancellable(st):
+            return True, f"already {st.lower()}"
         try:
             self.client.cancel_order(self.account_id_key, order_id)
             return True, "cancelled"
         except Exception as e:
+            st2 = self._order_status_from_list(oid)
+            if st2 and _order_status_not_cancellable(st2):
+                return True, f"already {st2.lower()}"
             return False, str(e)
+
+    def _order_status_from_list(self, order_id):
+        if not self.client or not self.account_id_key:
+            return ""
+        try:
+            data = self.client.list_orders(self.account_id_key, status=None)
+            return _order_status(data, order_id) or ""
+        except Exception:
+            return ""
 
     def position_is_dust(self, ticker, shares, price, asset_type=""):
         try:
@@ -1044,6 +1097,29 @@ def _extract_etrade_order_fee(data, order_id):
         elif isinstance(node, list):
             stack.extend(node)
     return None
+
+
+def _order_status_not_cancellable(status: str) -> bool:
+    st = str(status or "").upper()
+    if not st:
+        return False
+    if "FILL" in st or st in ("EXECUTED", "DONE_TRADE_EXECUTED"):
+        return True
+    return any(x in st for x in ("CANCEL", "REJECT", "EXPIRED"))
+
+
+def _order_status(data, order_id):
+    oid = str(order_id)
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if str(node.get("orderId") or node.get("order_id") or "") == oid:
+                return str(node.get("orderStatus") or node.get("status") or "").upper()
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return ""
 
 
 def _order_filled(data, order_id):

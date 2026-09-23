@@ -168,7 +168,7 @@ def coach_tip_for_scan_drops(broker, engine, dropped) -> tuple[str, str]:
     tips = {
         "regime": (
             f"{broker}/{engine}: BUY signals blocked by SPY/BTC regime — "
-            f"Growth posture skips SPY; Advisor can propose overrides when enabled."
+            f"Growth keeps SPY/BTC gates for small books; Advisor can propose overrides."
         ),
         "fee_gate": (
             f"{broker}/{engine}: candidates failed fee/edge gate — "
@@ -467,6 +467,8 @@ def rh_equity_sell_defer_reason(
         px = float(price or 0)
     except (TypeError, ValueError):
         px = 0.0
+    # Pure fractional (<1): defer overnight. Mixed lots (e.g. 2.99) proceed so the
+    # broker can peel the whole-share floor and leave the remainder for ~7am.
     if 0 < shares < 1.0:
         if px > 0 and (shares * px) < 1.00:
             return "fractional notional under $1"
@@ -1156,7 +1158,7 @@ def etrade_bp_label(bp: float, *, environment: str, min_trade_dollars: float = 5
 def sell_status_should_backoff(status: str) -> bool:
     """
     True when a sell result should enter fail-backoff (suppress repeat attempts).
-    Covers dust/min skips and OTC/delisted API blocks — not transient deferrals.
+    Covers dust/min skips, overnight frac blocks, quote gaps, and API fails.
     """
     st = str(status or "")
     if "Fail" in st:
@@ -1164,7 +1166,26 @@ def sell_status_should_backoff(status: str) -> bool:
     if "Skipped" not in st:
         return False
     low = st.lower()
-    if any(k in low for k in ("dust", "min", "too small", "otc", "delisted", "cannot trade", "no tradeable")):
+    if any(
+        k in low
+        for k in (
+            "dust",
+            "min",
+            "too small",
+            "otc",
+            "delisted",
+            "cannot trade",
+            "no tradeable",
+            "overnight",
+            "late session",
+            "fractional",
+            "hours mismatch",
+            "market hours mismatch",
+            "no rh crypto quote",
+            "soft-dead",
+            "api gap",
+        )
+    ):
         return True
     return False
 
@@ -1189,6 +1210,16 @@ def buy_status_should_backoff(status: str) -> bool:
         "too many requests",
         "temporar",
         "service unavailable",
+        # RH crypto empty/None — today's FET/AVAX thrash; do not rotate into same name next pulse
+        "empty response",
+        "returned empty",
+        "auth expired",
+        "api unavailable",
+        # Extended/RTH flag race — do not hammer LCID every 30s
+        "hours mismatch",
+        "market hours mismatch",
+        "invalid product_id",
+        "product_id",
     )
     return any(n in low for n in needles)
 
@@ -1197,15 +1228,105 @@ def buy_order_is_working_unfilled(status: str) -> bool:
     """True when broker accepted the order but it is not confirmed filled yet."""
     st = str(status or "")
     low = st.lower()
-    if "fail" in low or "skip" in low:
+    if "skip" in low and "cancel" in low:
+        return False
+    # Hard fails only — "left working" / pending fill must stay working.
+    if "fail" in low and "left working" not in low and "pending fill" not in low:
         return False
     if "filled" in low and "pending fill" not in low:
         return False
     return (
         "pending fill" in low
+        or "left working" in low
         or ("submitted" in low and "filled" not in low)
         or "pending/" in low
     )
+
+
+def sold_qty_from_sell_status(status: str, fallback: float = 0.0) -> float:
+    """Parse trailing (qty) from RH/ET sell status; else fallback."""
+    import re
+    st = str(status or "")
+    m = re.search(r"\(([0-9]+(?:\.[0-9]+)?)\)\s*$", st)
+    if m:
+        try:
+            return float(m.group(1))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(fallback or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def sell_status_is_partial_peel(status: str, requested: float, sold: float) -> bool:
+    """True when overnight peel sold whole floor but left a fractional remainder."""
+    st = str(status or "").lower()
+    if "partial peel" in st:
+        return True
+    try:
+        req = float(requested or 0)
+        got = float(sold or 0)
+    except (TypeError, ValueError):
+        return False
+    return req > 0 and got > 0 and (req - got) > 1e-4
+
+
+def equity_session_size_mult(now_et=None, *, settings=None) -> tuple[float, str]:
+    """
+    Time-of-day equity ticket curve (joint-audit P1/P2).
+      - First 30m RTH (9:30–10:00 ET): half-size
+      - Last 30m RTH (15:30–16:00 ET): no new equity entries (mult=0)
+      - Else: full size
+    Crypto callers should ignore this (24/7).
+    """
+    s = settings or {}
+    if not bool(s.get("session_size_curve_enabled", True)):
+        return 1.0, ""
+    try:
+        if now_et is None:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        sod = int(now_et.hour) * 3600 + int(now_et.minute) * 60 + int(now_et.second)
+    except Exception:
+        return 1.0, ""
+    open_s = 9 * 3600 + 30 * 60
+    close_s = 16 * 3600
+    if sod < open_s or sod >= close_s:
+        return 1.0, ""  # extended/overnight handled by session gates elsewhere
+    if sod < open_s + 30 * 60:
+        return 0.5, "open half-size (first 30m RTH)"
+    if sod >= close_s - 30 * 60:
+        return 0.0, "last 30m RTH — no new equity entries"
+    return 1.0, ""
+
+
+def interleave_tasks_by_broker(queue: list) -> list:
+    """
+    Round-robin by broker so one venue's PORTFOLIO/XML work cannot starve others
+    (lightweight per-broker fairness — joint-audit P1).
+    """
+    if not queue or len(queue) < 2:
+        return list(queue or [])
+    buckets: dict = {}
+    order = []
+    for item in queue:
+        try:
+            broker = item[0]
+        except (TypeError, IndexError):
+            broker = "?"
+        if broker not in buckets:
+            order.append(broker)
+            buckets[broker] = []
+        buckets[broker].append(item)
+    out = []
+    while any(buckets.values()):
+        for b in order:
+            if buckets.get(b):
+                out.append(buckets[b].pop(0))
+    return out
 
 
 def locked_broker_entry(raw) -> tuple[float, int]:
@@ -1518,10 +1639,13 @@ def equity_buy_defer_reason(
     broker_name: str = "Robinhood",
 ) -> Optional[str]:
     """
-    Defer equity BUY when the resulting position could not be sold overnight
-    (mirror of rh_equity_sell_defer_reason on projected size).
+    Defer equity BUY when the resulting position could not be sold in the
+    *current* session (mirror of rh_equity_sell_defer_reason on projected size).
 
     Robinhood-only: RH blocks fractional equity sells overnight / late extended.
+    During REGULAR (fractional_ok) allow fractionals — desk can exit same day.
+    Do NOT always simulate overnight; that wrongly blocked RTH buys (e.g. ACHR).
+
     E*TRADE supports fractional equities and is not subject to that RH session rule —
     applying it there blocked live ET buys (e.g. SMCI) that sized under 1 share.
     """
@@ -1530,29 +1654,20 @@ def equity_buy_defer_reason(
         return None
     if "COINBASE" in bn or bn == "CB":
         return None
-    overnight = {
-        "label": "OVERNIGHT",
-        "market_hours": "all_day_hours",
-        "use_ext": True,
-        "fractional_ok": False,
-        "equity_tradeable": True,
-    }
+    sess = dict(session or {})
+    # Same-day exit OK — do not defer on a hypothetical overnight hold.
+    if sess.get("fractional_ok") or str(sess.get("label") or "").upper() == "REGULAR":
+        return None
     why = rh_equity_sell_defer_reason(
-        ticker, projected_shares, price, asset_type, overnight,
+        ticker, projected_shares, price, asset_type, sess,
         frac_ext_ineligible=frac_ext_ineligible,
         known_cryptos=known_cryptos,
     )
     if why:
-        return f"would be stuck overnight — {why}"
-    ext = dict(session or {})
-    if ext.get("label") == "EXTENDED" and not ext.get("fractional_ok"):
-        why2 = rh_equity_sell_defer_reason(
-            ticker, projected_shares, price, asset_type, ext,
-            frac_ext_ineligible=frac_ext_ineligible,
-            known_cryptos=known_cryptos,
-        )
-        if why2:
-            return f"extended session exit risk — {why2}"
+        label = str(sess.get("label") or "session").upper()
+        if label == "OVERNIGHT":
+            return f"would be stuck overnight — {why}"
+        return f"session exit risk — {why}"
     return None
 
 

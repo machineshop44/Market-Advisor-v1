@@ -663,7 +663,7 @@ def uses_btc_regime(ticker=None, is_crypto=False):
 
 
 def equity_regime_required(posture=None):
-    """Growth skips SPY 1H gate for small-book equities; others keep broad market filter."""
+    """True when posture keeps the SPY 1H equity gate (Growth/Balanced/Safer: on)."""
     return bool(get_risk_posture_profile(posture).get("require_equity_regime", True))
 
 
@@ -1236,12 +1236,21 @@ def register_regime_brokers(robinhood=None, coinbase=None, etrade=None):
         _regime_et = etrade
 
 
-def _safe_ticker(ticker):
+def _safe_ticker(ticker, *, force_crypto=False):
     """Ensures raw crypto tickers get the required suffix for Yahoo Finance data."""
-    clean = str(ticker).upper()
-    if clean in CRYPTO_TICKERS and not clean.endswith("-USD"):
+    raw = str(ticker or "").upper().strip()
+    if raw.endswith("-USD"):
+        return raw
+    clean = raw.replace("-USD", "")
+    if force_crypto or clean in CRYPTO_TICKERS:
         return f"{clean}-USD"
     return ticker
+
+
+def _crypto_yf_symbol(ticker):
+    """Always *-USD for crypto evaluation (movers may not be in CRYPTO_TICKERS)."""
+    clean = str(ticker or "").upper().replace("-USD", "").strip()
+    return f"{clean}-USD" if clean else ""
 
 
 def _auto_detect_sales(broker_id):
@@ -1322,7 +1331,12 @@ def _loss_streak_block(broker_id):
 
 
 def _local_day_key():
-    return datetime.now().strftime("%Y-%m-%d")
+    """America/New_York calendar day — match PDT / session clock (not PC local)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
 
 
 def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
@@ -1353,6 +1367,7 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
         _equity_dd[broker_id] = {
             "day": "", "day_open": 0.0, "peak": 0.0,
             "pause_until": 0.0, "pause_reason": "", "peak_dd_streak": 0,
+            "dd_episode_active": False,
         }
     st = _equity_dd[broker_id]
     today = _local_day_key()
@@ -1361,6 +1376,7 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
         st["day_open"] = eq
         st["peak"] = max(eq, float(st.get("peak") or 0.0))
         st["peak_dd_streak"] = 0
+        st["dd_episode_active"] = False
         # New day clears prior pause unless still in the future from yesterday
         if float(st.get("pause_until") or 0) < time.time():
             st["pause_reason"] = ""
@@ -1388,12 +1404,25 @@ def update_equity_drawdown(broker_id, equity, posture=None, settings=None):
             return False, ""
     else:
         st["peak_dd_streak"] = 0
+        # Recovered enough — allow a fresh Discord episode if DD trips again later.
+        if day_dd > -day_pct * 0.5 and peak_dd > -peak_pct * 0.5:
+            st["dd_episode_active"] = False
 
     if triggered and float(st.get("pause_until") or 0) < now:
         st["pause_until"] = now + pause_min * 60
         st["pause_reason"] = triggered
+        # Seamless renew while still underwater must not re-Discord every pause window.
+        renewing = bool(st.get("dd_episode_active"))
+        st["dd_episode_active"] = True
         save_state(force=True)
+        if renewing:
+            return False, ""
         return True, triggered
+    # Already paused (or just expired mid-cycle): keep reason sticky while still underwater
+    # so the next buy pulse sees the block after update_equity_drawdown re-arms pause.
+    if triggered and float(st.get("pause_until") or 0) >= now:
+        st["pause_reason"] = triggered
+        st["dd_episode_active"] = True
 
     save_state(force=False)
     return False, ""
@@ -2837,9 +2866,10 @@ def market_regime_ok(is_crypto=False):
          else broker hourly ring / short lookback
       3) Last-good cache — last clear verdict within REGIME_LAST_GOOD_TTL
 
-    Consensus: Yahoo+broker agree → that verdict; disagree → block (conservative).
-    Yahoo alone OK if bars valid; broker alone OK if enough history; else last-good;
-    else fail-closed. Never fail-open on total blackout.
+    Consensus: Yahoo+broker agree → that verdict.
+    Disagree: trust Yahoo 1H bars (broker short-lookback flickers in extended/overnight);
+    only hard-block disagree when Yahoo votes down. Yahoo alone / broker alone / last-good
+    as before. Never fail-open on total blackout.
     Returns (ok: bool, reason: str).
     """
     cache_key = bool(is_crypto)
@@ -2861,8 +2891,12 @@ def market_regime_ok(is_crypto=False):
         elif (not y_ok) and (not b_ok):
             _store_regime_last_good(proxy, False, "yahoo+broker")
             out = (False, f"DO NOT BUY (Regime: {proxy} 1H Downtrend)")
+        elif y_ok and (not b_ok):
+            # Yahoo 1H up + broker flicker down (common after hours) → allow
+            _store_regime_last_good(proxy, True, "yahoo-prefer-disagree")
+            out = (True, "")
         else:
-            # Disagree → fail closed; stamp last-good blocked so TTL cannot re-allow
+            # Yahoo 1H down + broker up → still block (don't chase broker noise)
             _store_regime_last_good(proxy, False, "disagree")
             out = (False, f"DO NOT BUY (Regime: {proxy} sources disagree — blocked)")
         _market_regime_result_cache[cache_key] = (now, out)
@@ -3713,7 +3747,11 @@ def pick_rotation_funding(
 
         held_m = holding_held_minutes(broker_id, t, now=tnow)
         min_hold = float(params["min_hold_crypto_min"] if is_c else params["min_hold_equity_min"])
-        if held_m is not None and held_m < min_hold:
+        # Unknown entry age (seeded basis / restart) → treat as fresh so we do not
+        # opportunity-rotate a 17m AVAX hold that never got a buy timestamp.
+        if held_m is None:
+            held_m = 0.0
+        if held_m < min_hold:
             continue
 
         if is_ttp_armed_holding(
@@ -3952,7 +3990,9 @@ def evaluate_crypto_opportunity(
     equity=None,
 ):
     broker_id = _normalize_broker_id(broker_id)
-    current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
+    base = str(ticker or "").upper().replace("-USD", "").strip()
+    yf_sym = _crypto_yf_symbol(base)
+    current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(yf_sym)
     if current_price <= 0: return "DO NOT BUY (Awaiting Price)"
 
     # Turbulence pause (all postures) + Safer/Balanced BTC regime gate
@@ -3963,14 +4003,14 @@ def evaluate_crypto_opportunity(
         ok, reason = market_regime_ok(is_crypto=True)
         if not ok: return reason
 
-    allowed, reason = _check_hysteresis(ticker, current_price, is_crypto=True, broker_id=broker_id)
+    allowed, reason = _check_hysteresis(base, current_price, is_crypto=True, broker_id=broker_id)
     if not allowed: return reason
 
-    _, macro_uptrend, _, _ = _get_trend_data(ticker, interval="60m", period="5d")
+    _, macro_uptrend, _, _ = _get_trend_data(yf_sym, interval="60m", period="5d")
     if not macro_uptrend:
         return "DO NOT BUY (1H Macro Downtrend)"
 
-    micro_bullish, _, rsi, has_volume = _get_trend_data(ticker, interval="5m", period="1d")
+    micro_bullish, _, rsi, has_volume = _get_trend_data(yf_sym, interval="5m", period="1d")
 
     if rsi is None: return "DO NOT BUY (Calculating RSI...)"
     if rsi >= RSI_CEILING: return f"DO NOT BUY (RSI Overbought: {rsi:.1f})"
@@ -3980,7 +4020,7 @@ def evaluate_crypto_opportunity(
     if micro_bullish:
         # Hold bias: weak scores stay HOLD — prefer no-trade vs OW-fee churn
         try:
-            sc = float(buy_rank_score(ticker, is_crypto=True))
+            sc = float(buy_rank_score(base, is_crypto=True))
         except Exception:
             sc = 0.0
         if sc < min_score:

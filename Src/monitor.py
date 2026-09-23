@@ -194,13 +194,20 @@ def _auth_lockout_remaining(ip: str) -> int:
         return 0
 
 
+def _auth_header_present(handler) -> bool:
+    try:
+        return bool((handler.headers.get("Authorization") or "").strip())
+    except Exception:
+        return False
+
+
 def _auth_register_failure(ip: str):
     now = time.time()
     with _auth_fail_lock:
         info = _auth_failures.get(ip) or {"fails": [], "locked_until": 0}
         fails = [t for t in (info.get("fails") or []) if now - t < _AUTH_WINDOW_SEC]
         fails.append(now)
-        locked_until = 0
+        locked_until = float(info.get("locked_until") or 0)
         if len(fails) >= _AUTH_MAX_FAILS:
             locked_until = now + _AUTH_LOCK_SEC
             fails = []
@@ -216,6 +223,21 @@ def clear_auth_lockouts():
     """Clear all client IP auth failure / lockout state (GUI / local only)."""
     with _auth_fail_lock:
         _auth_failures.clear()
+
+
+def auth_lockout_snapshot() -> list[dict]:
+    """Active lockouts for desk diagnostics (no secrets)."""
+    now = time.time()
+    out = []
+    with _auth_fail_lock:
+        for ip, info in list(_auth_failures.items()):
+            until = float((info or {}).get("locked_until") or 0)
+            if until > now:
+                out.append({
+                    "ip": str(ip),
+                    "seconds_left": int(until - now),
+                })
+    return out
 
 
 def is_running() -> bool:
@@ -265,6 +287,7 @@ def describe_runtime() -> dict:
         "has_auth": bool(_auth_user),
         "fingerprint": _cert_fingerprint or "",
         "thread_alive": bool(_thread is not None and _thread.is_alive()),
+        "auth_lockouts": auth_lockout_snapshot() if alive else [],
     }
 
 
@@ -303,18 +326,23 @@ def _check_agent_auth(handler) -> bool:
         _auth_register_success(ip)
         return True
     if _cursor_agent_enabled and _cursor_agent_token:
-        if _auth_user or _auth_required:
+        if (_auth_user or _auth_required) and _auth_header_present(handler):
             _auth_register_failure(ip)
         return False
     if not _auth_user and not _auth_required:
         return True
-    if _auth_user or _auth_required:
+    if (_auth_user or _auth_required) and _auth_header_present(handler):
         _auth_register_failure(ip)
     return False
 
 
 def _check_auth(handler) -> bool:
-    """Return True if request is allowed. Records lockouts on failure when auth is set."""
+    """Return True if request is allowed. Wrong passwords count toward lockout.
+
+    Missing Authorization (Chrome's first 401 challenge, port scanners, bare GETs)
+    must NOT count — otherwise phone+tablet+browser sharing one public IP get
+    locked for 15m and only an app restart clears it.
+    """
     ip = _client_ip(handler)
     if _auth_is_locked(ip):
         return False
@@ -323,7 +351,8 @@ def _check_auth(handler) -> bool:
     if _credentials_ok(handler):
         _auth_register_success(ip)
         return True
-    _auth_register_failure(ip)
+    if _auth_header_present(handler):
+        _auth_register_failure(ip)
     return False
 
 

@@ -62,6 +62,28 @@ def test_claim_then_complete(tmp_path, monkeypatch):
     assert aq.list_pending() == []
 
 
+def test_propose_while_executing_does_not_duplicate(tmp_path, monkeypatch):
+    """Race: claim→executing must not spawn a fresh prop that re-briefs/re-applies."""
+    qfile = tmp_path / "advisor_queue.json"
+    monkeypatch.setattr(aq, "QUEUE_FILE", str(qfile))
+    prop = aq.propose(
+        broker="Coinbase", ticker="XLM", price=0.4, dollars=19.0, score=96.0, engine="CRYPTO",
+    )
+    assert prop and not prop.get("_refreshed")
+    aq.claim(prop["id"])
+    dup = aq.propose(
+        broker="Coinbase", ticker="XLM", price=0.41, dollars=19.0, score=97.0, engine="CRYPTO",
+    )
+    assert dup is None
+    aq.complete(prop["id"], ok=False)
+    refreshed = aq.propose(
+        broker="Coinbase", ticker="XLM", price=0.42, dollars=19.0, score=97.0, engine="CRYPTO",
+    )
+    assert refreshed and refreshed.get("_refreshed") is True
+    assert refreshed.get("id") == prop["id"]
+    assert float(refreshed.get("price") or 0) == 0.42
+
+
 def test_reject_while_executing(tmp_path, monkeypatch):
     qfile = tmp_path / "advisor_queue.json"
     monkeypatch.setattr(aq, "QUEUE_FILE", str(qfile))
@@ -70,6 +92,87 @@ def test_reject_while_executing(tmp_path, monkeypatch):
     rejected = aq.reject(prop["id"])
     assert rejected and rejected.get("status") == "rejected"
     assert aq.complete(prop["id"], ok=True) is None
+
+
+def test_reject_sets_repropose_cooldown(tmp_path, monkeypatch):
+    qfile = tmp_path / "advisor_queue.json"
+    monkeypatch.setattr(aq, "QUEUE_FILE", str(qfile))
+    prop = aq.propose(broker="Robinhood", ticker="SOUN", price=18.0, dollars=18.0, score=95.0)
+    aq.reject(prop["id"])
+    blocked, why = aq.repropose_blocked("Robinhood", "SOUN")
+    assert blocked
+    assert "cooldown" in why.lower()
+    assert aq.propose(broker="Robinhood", ticker="SOUN", price=18.0, dollars=18.0, score=95.0) is None
+    # Other tickers still ok
+    other = aq.propose(broker="Robinhood", ticker="PLTR", price=40.0, dollars=20.0, score=90.0)
+    assert other and other.get("ticker") == "PLTR"
+
+
+def test_ai_retry_after_overrides_cooldown(tmp_path, monkeypatch):
+    qfile = tmp_path / "advisor_queue.json"
+    monkeypatch.setattr(aq, "QUEUE_FILE", str(qfile))
+    prop = aq.propose(broker="Robinhood", ticker="SOUN", price=18.0, dollars=18.0, score=95.0)
+    aq.reject(prop["id"])
+    aq.set_repropose_cooldown(
+        "Robinhood", "SOUN", seconds=45 * 60, reason="ai_skip", verdict="skip",
+    )
+    rem = aq.repropose_cooldown_remaining("Robinhood", "SOUN")
+    assert rem > 40 * 60
+    aq.clear_repropose_cooldown("Robinhood", "SOUN")
+    assert aq.repropose_cooldown_remaining("Robinhood", "SOUN") == 0
+
+
+def test_local_skip_includes_retry_after_min_for_regime():
+    import desk_advisor_ai as dai
+
+    prop = {
+        "ticker": "SOUN",
+        "broker": "Robinhood",
+        "dollars": 18.0,
+        "price": 18.0,
+        "score": 95.0,
+        "engine": "PENNY",
+        "asset_type": "stock",
+        "regime_caution": True,
+    }
+    ctx = {
+        "buying_power": 70.0,
+        "equity": 70.0,
+        "posture": "growth",
+        "blockers": [{"code": "regime_equity", "message": "Regime: SPY 1H Downtrend"}],
+        "allow_buys_when_regime_blocked": False,
+    }
+    out = dai.local_analyze_proposal(prop, ctx)
+    assert out["verdict"] == "skip"
+    assert int(out.get("retry_after_min") or 0) >= 30
+
+
+def test_clamp_retry_after_min():
+    import desk_advisor_ai as dai
+
+    assert dai.clamp_retry_after_min(45, verdict="skip") == 45
+    assert dai.clamp_retry_after_min(0, verdict="skip") == 20
+    assert dai.clamp_retry_after_min(999, verdict="skip") == 180
+    assert dai.clamp_retry_after_min(3, verdict="wait") == 5
+    assert dai.clamp_retry_after_min(10, verdict="approve") == 0
+
+
+def test_xai_source_alias_and_default_model():
+    import desk_advisor_ai as dai
+
+    assert dai.resolve_ai_source({"advisor_ai_source": "grok"}) == "xai"
+    assert dai.resolve_ai_source({"advisor_ai_source": "xai"}) == "xai"
+    assert dai._provider({"advisor_ai_source": "xai"}) == "xai"
+    assert dai._model({"advisor_ai_source": "xai"}) == dai._DEFAULT_XAI_MODEL
+
+
+def test_buy_status_backoff_includes_empty_response():
+    import auto_cycle as ac
+
+    assert ac.buy_status_should_backoff(
+        "Skipped: RH rejected small/invalid crypto size (RH crypto buy FET returned empty response (None))"
+    )
+    assert not ac.buy_status_should_backoff("Skipped: Below RH crypto floor ($5 < $10)")
 
 
 def test_posture_for_broker_override():

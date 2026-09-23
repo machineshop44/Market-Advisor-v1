@@ -154,6 +154,88 @@ def explain_no_buys_after_rank(
     return line
 
 
+def sell_fail_ttl_for_status(status, *, default_ttl=1800) -> int:
+    """Backoff length by fail class — session-stale should not park a sell for 30m."""
+    low = str(status or "").lower()
+    if "empty response" in low or "returned empty" in low:
+        return max(int(default_ttl or 1800), 7200)  # ≥2h RH crypto empty
+    # Ghost / sync lag positions: hammering every 30m burns log + API.
+    if "insufficient_fund" in low or "insufficient balance" in low:
+        return max(int(default_ttl or 1800), 6 * 3600)  # ≥6h
+    # Overnight / no-quote / soft-dead — wait for a real session/API recovery.
+    if any(
+        k in low
+        for k in (
+            "overnight",
+            "late session",
+            "fractional equity sell",
+            "blocks fractional",
+            "no rh crypto quote",
+            "soft-dead",
+            "api gap",
+        )
+    ):
+        return max(int(default_ttl or 1800), 2 * 3600)  # ≥2h
+    # Premarket→RTH flag race: was 90s and still thrashed every portfolio pulse.
+    if "hours mismatch" in low or "market hours mismatch" in low:
+        return max(int(default_ttl or 1800), 30 * 60)  # ≥30m
+    return int(default_ttl or 1800)
+
+
+def sell_is_ghost_insufficient(status) -> bool:
+    """True when broker says we cannot sell what the book thinks we hold."""
+    low = str(status or "").lower()
+    return "insufficient_fund" in low or "insufficient balance" in low
+
+
+def advisor_miss_park_spec(why: str) -> tuple[float, str] | None:
+    """
+    Hard execute-miss classes that must not bounce pending→re-apply.
+    Returns (cooldown_sec, reason_tag) or None to restore pending.
+    """
+    low = str(why or "").lower()
+    if not low:
+        return None
+    if "consecutive-loss" in low:
+        return (45.0 * 60.0, "consecutive_loss")
+    if "empty response" in low or "returned empty" in low:
+        return (2.0 * 3600.0, "empty_response")
+    if "insufficient_fund" in low or "insufficient balance" in low or "insufficient fund" in low:
+        return (2.0 * 3600.0, "insufficient_fund")
+    if "hours mismatch" in low or "market hours mismatch" in low:
+        # Premarket/RTH flag race — short park until session flags refresh.
+        return (10.0 * 60.0, "hours_mismatch")
+    if "limit unfilled" in low or (
+        "cancelled" in low and ("unfilled" in low or "queued" in low)
+    ):
+        # Place→cancel→re-approve thrash (RH EXT queued) — stop email spam.
+        return (20.0 * 60.0, "limit_unfilled")
+    if "invalid product_id" in low or "product_id" in low:
+        # Advisor buy routed to wrong broker mid-cycle.
+        return (30.0 * 60.0, "broker_route")
+    if "left working" in low or "pending fill" in low:
+        # Working order already reserved BP — do not re-fire.
+        return (15.0 * 60.0, "left_working")
+    if any(
+        bit in low
+        for bit in (
+            "below rh crypto",
+            "below cb min",
+            "dust",
+            "too small",
+            "rejected small",
+            "invalid crypto size",
+            "ticket size too small",
+        )
+    ):
+        return (60.0 * 60.0, "size_floor")
+    if "buying power" in low or "insufficient sandbox" in low or "insufficient cash" in low:
+        return (30.0 * 60.0, "no_bp")
+    if "daily rotate cap" in low or "rotate cap" in low:
+        return (30.0 * 60.0, "rotate_cap")
+    return None
+
+
 def sell_fail_should_skip(store, broker, ticker, *, now=None, ttl_sec=1800):
     """True when this ticker already failed loudly and reason unchanged within TTL."""
     import time
@@ -164,7 +246,8 @@ def sell_fail_should_skip(store, broker, ticker, *, now=None, ttl_sec=1800):
         return False
     ts_now = float(now if now is not None else time.time())
     age = ts_now - float(entry.get("ts") or 0)
-    if age >= float(ttl_sec or 1800):
+    entry_ttl = float(entry.get("ttl_sec") or ttl_sec or 1800)
+    if age >= entry_ttl:
         store.pop(key, None)
         return False
     return True
@@ -180,6 +263,7 @@ def record_sell_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec
         raise TypeError("store must be a dict")
     key = (str(broker), str(ticker).upper())
     reason = str(status or "Fail")[:180]
+    use_ttl = sell_fail_ttl_for_status(reason, default_ttl=ttl_sec)
     prev = store.get(key)
     if prev and prev.get("reason") != reason:
         store.pop(key, None)
@@ -187,12 +271,21 @@ def record_sell_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec
     if prev and prev.get("reason") == reason:
         return True, None
     ts_now = float(now if now is not None else time.time())
-    store[key] = {"reason": reason, "ts": ts_now}
+    store[key] = {"reason": reason, "ts": ts_now, "ttl_sec": int(use_ttl)}
     note = (
         f"[{broker}] Sell FAIL [{ticker}]: {reason} — backing off retries "
-        f"(~{int(ttl_sec or 1800) // 60}m TTL or until reason changes)"
+        f"(~{int(use_ttl) // 60}m TTL or until reason changes)"
     )
     return False, note
+
+
+def buy_fail_ttl_for_status(status, *, default_ttl=900) -> int:
+    low = str(status or "").lower()
+    if "hours mismatch" in low or "market hours mismatch" in low:
+        return max(int(default_ttl or 900), 30 * 60)
+    if "empty response" in low or "returned empty" in low:
+        return max(int(default_ttl or 900), 2 * 3600)
+    return int(default_ttl or 900)
 
 
 def buy_fail_should_skip(store, broker, ticker, *, now=None, ttl_sec=900):
@@ -205,7 +298,8 @@ def buy_fail_should_skip(store, broker, ticker, *, now=None, ttl_sec=900):
         return False
     ts_now = float(now if now is not None else time.time())
     age = ts_now - float(entry.get("ts") or 0)
-    if age >= float(ttl_sec or 900):
+    entry_ttl = float(entry.get("ttl_sec") or ttl_sec or 900)
+    if age >= entry_ttl:
         store.pop(key, None)
         return False
     return True
@@ -218,6 +312,7 @@ def record_buy_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec=
         raise TypeError("store must be a dict")
     key = (str(broker), str(ticker).upper())
     reason = str(status or "Fail")[:180]
+    use_ttl = buy_fail_ttl_for_status(reason, default_ttl=ttl_sec)
     prev = store.get(key)
     if prev and prev.get("reason") != reason:
         store.pop(key, None)
@@ -225,9 +320,9 @@ def record_buy_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec=
     if prev and prev.get("reason") == reason:
         return True, None
     ts_now = float(now if now is not None else time.time())
-    store[key] = {"reason": reason, "ts": ts_now}
+    store[key] = {"reason": reason, "ts": ts_now, "ttl_sec": int(use_ttl)}
     note = (
         f"[{broker}] Buy FAIL [{ticker}]: {reason} — backing off retries "
-        f"(~{int(ttl_sec or 900) // 60}m TTL or until reason changes)"
+        f"(~{int(use_ttl) // 60}m TTL or until reason changes)"
     )
     return False, note
