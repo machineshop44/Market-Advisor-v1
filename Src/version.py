@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.35"
+__version__ = "1.42.36"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Grade recovery: flatten-on-risk, blotter reconcile, focus park, Advisor bar"
+    "Settings UI for flatten/focus park; grade recovery 1.42.35 pack"
 )
 
 

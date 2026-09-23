@@ -6606,6 +6606,18 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["desk_preferred_primary"] = str(
                 self.desk_preferred_primary_combo.currentData() or "E*TRADE"
             )
+        if hasattr(self, "desk_focus_park_others_chk"):
+            self.settings["desk_focus_park_others"] = bool(
+                self.desk_focus_park_others_chk.isChecked()
+            )
+        if hasattr(self, "desk_focus_park_auto_spin"):
+            self.settings["desk_focus_park_others_auto_under"] = float(
+                self.desk_focus_park_auto_spin.value()
+            )
+        if hasattr(self, "micro_crypto_edge_spin"):
+            self.settings["micro_crypto_entry_edge_extra_pct"] = float(
+                self.micro_crypto_edge_spin.value()
+            ) / 100.0
         if hasattr(self, "capital_park_micro_chk"):
             self.settings["capital_park_micro_crypto"] = bool(
                 self.capital_park_micro_chk.isChecked()
@@ -10445,8 +10457,8 @@ class MarketAdvisorGUI(QMainWindow):
         self.desk_focus_mode_combo.setCurrentIndex(max(0, fi))
         self.desk_focus_mode_combo.setToolTip(
             "Auto picks a focus broker by deployable BP and speeds its scans (2×). "
-            "Other brokers still buy unless desk_focus_park_others is enabled. "
-            "Sizing still autosized from live BP."
+            "Other brokers still buy unless 'Park non-focus' is on, or combined equity "
+            "is under Auto-park $ (default 500). Sizing still autosized from live BP."
         )
         focus_row.addWidget(self.desk_focus_mode_combo)
         focus_row.addWidget(QLabel("Broker:"))
@@ -10459,6 +10471,49 @@ class MarketAdvisorGUI(QMainWindow):
             self.desk_focus_broker_combo.setCurrentIndex(bi)
         focus_row.addWidget(self.desk_focus_broker_combo)
         advisor_outer.addLayout(focus_row)
+
+        focus_park_row = QHBoxLayout()
+        self.desk_focus_park_others_chk = QCheckBox("Park non-focus buy engines")
+        self.desk_focus_park_others_chk.setChecked(
+            bool(self.settings.get("desk_focus_park_others", False))
+        )
+        self.desk_focus_park_others_chk.setToolTip(
+            "Always rest buy engines on non-focus brokers (PORTFOLIO sells still run). "
+            "Off = only speed up the focus broker's scans."
+        )
+        focus_park_row.addWidget(self.desk_focus_park_others_chk)
+        focus_park_row.addWidget(QLabel("Auto-park under combined $"))
+        self.desk_focus_park_auto_spin = QDoubleSpinBox()
+        self.desk_focus_park_auto_spin.setRange(0.0, 5000.0)
+        self.desk_focus_park_auto_spin.setSingleStep(50.0)
+        self.desk_focus_park_auto_spin.setValue(
+            float(self.settings.get("desk_focus_park_others_auto_under", 500.0) or 500.0)
+        )
+        self.desk_focus_park_auto_spin.setToolTip(
+            "When combined equity is under this $ (default 500), auto exclusive-park "
+            "non-focus buys even if 'Park non-focus' is unchecked. 0 = disable auto."
+        )
+        focus_park_row.addWidget(self.desk_focus_park_auto_spin)
+        focus_park_row.addWidget(QLabel("Micro crypto fee extra %"))
+        self.micro_crypto_edge_spin = QDoubleSpinBox()
+        self.micro_crypto_edge_spin.setRange(0.0, 2.0)
+        self.micro_crypto_edge_spin.setSingleStep(0.05)
+        self.micro_crypto_edge_spin.setDecimals(2)
+        # Stored as fraction; UI shows percent points (0.75 = 0.75%)
+        try:
+            extra_frac = float(
+                self.settings.get("micro_crypto_entry_edge_extra_pct", 0.0075) or 0.0075
+            )
+        except (TypeError, ValueError):
+            extra_frac = 0.0075
+        self.micro_crypto_edge_spin.setValue(extra_frac * 100.0)
+        self.micro_crypto_edge_spin.setToolTip(
+            "Extra entry-edge buffer (percent points) on small books for Coinbase / RH crypto "
+            "so thin tickets clear fees. Default 0.75%."
+        )
+        focus_park_row.addWidget(self.micro_crypto_edge_spin)
+        focus_park_row.addStretch()
+        advisor_outer.addLayout(focus_park_row)
 
         pref_row = QHBoxLayout()
         pref_row.addWidget(QLabel("Preferred primary:"))
@@ -11199,11 +11254,18 @@ class MarketAdvisorGUI(QMainWindow):
         self.et_flatten_close_chk = QCheckBox("Flatten E*TRADE equities before close")
         self.et_flatten_close_chk.setChecked(bool(self.settings.get("et_flatten_before_close", True)))
         self.et_flatten_close_chk.setToolTip(
-            "Optional. At ~15:59 ET pre-close: market-sell ET equity holdings so you are not "
-            "naked overnight if the app is off or midnight reauth fails. OFF by default — "
-            "RH uses resting protective stops instead; crypto is 24/7."
+            "At ~15:50 ET pre-close: market-sell ET equity holdings so you are not "
+            "naked overnight if the app is off or midnight reauth fails. "
+            "RH uses resting protective stops; crypto is 24/7."
         )
         eod_opts.addWidget(self.et_flatten_close_chk)
+        self.panic_halt_flatten_chk = QCheckBox("Panic Halt also flattens equities")
+        self.panic_halt_flatten_chk.setChecked(bool(self.settings.get("panic_halt_flatten", True)))
+        self.panic_halt_flatten_chk.setToolTip(
+            "When Panic Halt All fires: disarm all brokers, then market-flatten equity "
+            "holdings (crypto stays on software TTP). Off = disarm only."
+        )
+        eod_opts.addWidget(self.panic_halt_flatten_chk)
         eod_opts.addStretch()
         form_layout.addLayout(eod_opts)
 
@@ -11246,6 +11308,16 @@ class MarketAdvisorGUI(QMainWindow):
         loss_box.addWidget(self.loss_spin)
         loss_box.addStretch()
         form_layout.addLayout(loss_box)
+
+        self.daily_loss_flatten_chk = QCheckBox(
+            "Max daily $-loss also flattens equities (then disarms)"
+        )
+        self.daily_loss_flatten_chk.setChecked(bool(self.settings.get("daily_loss_flatten", True)))
+        self.daily_loss_flatten_chk.setToolTip(
+            "When the $ loss limit trips: cancel protective stops, market-flatten equities "
+            "on that broker, then disarm. Crypto stays on TTP. Off = disarm only (old behavior)."
+        )
+        form_layout.addWidget(self.daily_loss_flatten_chk)
 
         # Peer day-trader rails (small BP): PDT + consecutive-loss pause + session size curve
         self.pdt_guard_chk = QCheckBox(
@@ -20918,6 +20990,10 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["attach_protective_stops"] = bool(self.attach_stops_chk.isChecked())
         if hasattr(self, "et_flatten_close_chk"):
             self.settings["et_flatten_before_close"] = bool(self.et_flatten_close_chk.isChecked())
+        if hasattr(self, "panic_halt_flatten_chk"):
+            self.settings["panic_halt_flatten"] = bool(self.panic_halt_flatten_chk.isChecked())
+        if hasattr(self, "daily_loss_flatten_chk"):
+            self.settings["daily_loss_flatten"] = bool(self.daily_loss_flatten_chk.isChecked())
         self.settings["daily_profit_target"] = self.profit_spin.value()
         self.settings["daily_loss_limit"] = self.loss_spin.value()
         if hasattr(self, "pdt_guard_chk"):
