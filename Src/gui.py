@@ -2580,17 +2580,47 @@ class MarketAdvisorGUI(QMainWindow):
             prev_rows = list((self._holdings_cache_by_broker or {}).get(broker_name) or [])
             if live_rows:
                 self._holdings_cache_by_broker[broker_name] = live_rows
+                if not hasattr(self, "_holdings_empty_streak"):
+                    self._holdings_empty_streak = {}
+                self._holdings_empty_streak[broker_name] = 0
+                if not hasattr(self, "_holdings_empty_since"):
+                    self._holdings_empty_since = {}
+                self._holdings_empty_since.pop(broker_name, None)
             elif not prev_rows:
                 self._holdings_cache_by_broker[broker_name] = []
             else:
-                # Connected but empty list — keep prior rows for Portfolio / BP repair
-                assets = [dict(a, stale=True) for a in prev_rows if isinstance(a, dict)]
-                self._throttled_log(
-                    f"{broker_name}:holdings_empty_keep_cache",
-                    f"[{broker_name}] Holdings API returned empty — keeping "
-                    f"{len(prev_rows)} cached row(s) (API lag)",
-                    cooldown_sec=90,
-                )
+                # Connected but empty — keep prior rows briefly, then accept empty
+                # so ghosts don't feed flatten / open-count / blotter forever.
+                if not hasattr(self, "_holdings_empty_streak"):
+                    self._holdings_empty_streak = {}
+                if not hasattr(self, "_holdings_empty_since"):
+                    self._holdings_empty_since = {}
+                streak = int(self._holdings_empty_streak.get(broker_name) or 0) + 1
+                self._holdings_empty_streak[broker_name] = streak
+                since = float(self._holdings_empty_since.get(broker_name) or 0.0)
+                if since <= 0:
+                    self._holdings_empty_since[broker_name] = time.time()
+                    since = self._holdings_empty_since[broker_name]
+                age = time.time() - since
+                if streak >= 3 or age >= 180.0:
+                    self._holdings_cache_by_broker[broker_name] = []
+                    assets = []
+                    self._throttled_log(
+                        f"{broker_name}:holdings_empty_accept",
+                        f"[{broker_name}] Holdings empty ×{streak} "
+                        f"(~{int(age)}s) — accepting flat book (cleared "
+                        f"{len(prev_rows)} stale row(s))",
+                        cooldown_sec=120,
+                    )
+                else:
+                    assets = [dict(a, stale=True) for a in prev_rows if isinstance(a, dict)]
+                    self._throttled_log(
+                        f"{broker_name}:holdings_empty_keep_cache",
+                        f"[{broker_name}] Holdings API returned empty — keeping "
+                        f"{len(prev_rows)} cached row(s) (API lag, "
+                        f"streak {streak}/3)",
+                        cooldown_sec=90,
+                    )
         except Exception:
             pass
         # Prefer sane broker avg (RH cost_basis / CB portfolio breakdown); else
@@ -3325,8 +3355,8 @@ class MarketAdvisorGUI(QMainWindow):
                 )
                 if not ok_pdt:
                     return f"Skipped: {why_pdt}"
-            except Exception:
-                pass
+            except Exception as e:
+                return f"Skipped: PDT check failed ({e})"
         if broker_name == "E*TRADE":
             ok, why = _auto_cycle.etrade_equity_session_ok(
                 sess, broker=self.brokers.get("E*TRADE"),
@@ -3582,14 +3612,13 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             pass
 
-        # Prefer explicit broker tag (EOD/ET alerts must not inherit CB/RH cycle name).
-        tag_override = str(broker).strip() if broker else ""
+        # Prefer explicit broker tag. Never inherit cycle name when omitted —
+        # EOD/risk/Advisor alerts were mis-tagged [Coinbase] mid-CB cycle.
+        tag_override = str(broker).strip() if broker else "App"
 
         def _post():
             try:
-                tag = tag_override or (
-                    self.cycle_broker_name if self._cycle_broker else "App"
-                )
+                tag = tag_override or "App"
                 body = {"username": "MarketAdvisor"}
                 pfx = f"{prefix} " if prefix else ""
                 # @here on REAUTH so Discord mobile buzzes even when the companion is closed.
@@ -4895,7 +4924,9 @@ class MarketAdvisorGUI(QMainWindow):
                 if target_profit > 0 and pl_val >= target_profit:
                     msg = f"🎯 **[{broker_name}] Day Profit Target Reached!** Target: {format_currency(target_profit)} | Gain: {format_currency(pl_val)}. Disarming Auto-Trader."
                     self.log_event(msg)
-                    self.send_discord_alert(msg, urgent=True, prefix="[RISK]")
+                    self.send_discord_alert(
+                        msg, urgent=True, prefix="[RISK]", broker=broker_name,
+                    )
                     self._disarm_broker(broker_name)
 
                 loss_limit = self.settings.get("daily_loss_limit", 0.0)
@@ -6392,6 +6423,8 @@ class MarketAdvisorGUI(QMainWindow):
                             self.send_discord_alert(
                                 f"**Advisor AI** {tick}: {verdict.upper()} — {brief}",
                                 is_trade=False,
+                                prefix="[ADVISOR]",
+                                broker=broker_name,
                             )
                         except Exception:
                             pass
@@ -14657,7 +14690,7 @@ class MarketAdvisorGUI(QMainWindow):
                     reauth_needed=getattr(self, "_broker_manual_auth_needed", {}),
                     session_label=session_label,
                     et_equity_count=et_count,
-                    et_flatten_enabled=bool(self.settings.get("et_flatten_before_close", False)),
+                    et_flatten_enabled=bool(self.settings.get("et_flatten_before_close", True)),
                     auto_armed=any(self.auto_trade_enabled.values()),
                 )
                 self._last_overnight_scorecard = oc
@@ -16406,10 +16439,18 @@ class MarketAdvisorGUI(QMainWindow):
                 broker_rows, has_basis_fn=_has_basis, broker=broker_name,
             )
             seeded = []
+            missing_no_broker = []
             for row in need[:8]:
                 t = row.get("ticker")
-                px = float(row.get("price") or 0)
-                if not t or px <= 0:
+                # Only seed from broker-reported avg — never invent live mark as cost.
+                try:
+                    px = float(row.get("broker_cost") or 0)
+                except (TypeError, ValueError):
+                    px = 0.0
+                if not t:
+                    continue
+                if px <= 0:
+                    missing_no_broker.append(str(t))
                     continue
                 try:
                     book = self.cost_basis_cache.setdefault(broker_name, {})
@@ -16417,6 +16458,13 @@ class MarketAdvisorGUI(QMainWindow):
                     seeded.append(t)
                 except Exception:
                     pass
+            if missing_no_broker:
+                self._throttled_log(
+                    f"{broker_name}:basis_missing",
+                    f"[{broker_name}] Missing cost basis (no broker avg — not "
+                    f"inventing mark): {', '.join(missing_no_broker[:6])}",
+                    cooldown_sec=1800,
+                )
             summary = br.format_reconcile_summary(
                 broker_name, ghosts=ghosts, stale_stops=stale, seeded_basis=seeded,
             )
@@ -16447,14 +16495,17 @@ class MarketAdvisorGUI(QMainWindow):
                 prof = fn()
                 if isinstance(prof, dict):
                     for key in (
-                        "day_trades_protection",
-                        "remaining_day_trades",
                         "day_trade_count",
                         "day_trades",
+                        "remaining_day_trades",
+                        "day_trades_protection",
                     ):
                         if key in prof and prof.get(key) is not None:
                             try:
                                 raw = prof.get(key)
+                                # RH day_trades_protection is often a bool flag — skip.
+                                if isinstance(raw, bool):
+                                    continue
                                 if key == "remaining_day_trades":
                                     # Convert remaining → used against our cap
                                     rem = int(float(raw))
@@ -17325,12 +17376,12 @@ class MarketAdvisorGUI(QMainWindow):
                 self.log_event(warn)
                 try:
                     self.send_discord_alert(
-                        warn, urgent=True, prefix="EOD", broker="E*TRADE",
+                        warn, urgent=True, prefix="[EOD]", broker="E*TRADE",
                     )
                 except Exception:
                     pass
 
-                if bool(self.settings.get("et_flatten_before_close", False)):
+                if bool(self.settings.get("et_flatten_before_close", True)):
                     if et_armed:
                         flatten_rows.extend(et_equity_rows)
                     else:
@@ -17449,7 +17500,7 @@ class MarketAdvisorGUI(QMainWindow):
                 f"EOD ET flatten done — {n_ok}/{len(payload.get('fills') or [])} ok",
                 is_trade=True,
                 urgent=True,
-                prefix="EOD",
+                prefix="[EOD]",
                 broker="E*TRADE",
             )
         except Exception:
@@ -17945,6 +17996,8 @@ class MarketAdvisorGUI(QMainWindow):
                         self.cycle_broker_name,
                         fee_clear_fn=new_entry_clears_fees_ok,
                         known_cryptos=KNOWN_CRYPTOS,
+                        equity=combined_eq,
+                        settings=self.settings,
                     ) and not any(bool(c.get("regime_caution")) for c in pool if isinstance(c, dict)):
                         advisor_gate = False
             except Exception:
@@ -18641,7 +18694,8 @@ class MarketAdvisorGUI(QMainWindow):
             # Hard regime re-check at execute (scan may have been earlier when sources agreed).
             # Advisor approve = deliberate human override of SPY/BTC gate (same as Settings toggle).
             allow_regime_override = bool(self.settings.get("allow_buys_when_regime_blocked", False))
-            if c.get("_advisor_approved"):
+            # Human/manual Approve may override; AI auto-apply must not force regime through.
+            if c.get("_advisor_approved") and not c.get("_advisor_ai_auto"):
                 allow_regime_override = True
             regime_ok, regime_why = entry_regime_ok(
                 is_crypto=is_crypto, posture=posture, allow_when_blocked=allow_regime_override,
@@ -18694,7 +18748,7 @@ class MarketAdvisorGUI(QMainWindow):
                     continue
                 ok_ce, why_ce = crypto_new_entry_ok(
                     broker_id, ticker, score=cand_score, notional=None, skip_turbulence=True,
-                    equity=equity,
+                    equity=equity, settings=self.settings,
                 )
                 if not ok_ce:
                     notes.append(f"[{broker_name}] Hold bias skip [{ticker}]: {why_ce}")
@@ -18717,7 +18771,10 @@ class MarketAdvisorGUI(QMainWindow):
             if tu not in held and ((not is_crypto) or micro_book):
                 ok_fe, why_fe = new_entry_clears_fees_ok(
                     broker_id, ticker, cand_score,
-                    is_crypto=is_crypto, asset_type=asset_type or ("cryptocurrency" if is_crypto else "stock"),
+                    is_crypto=is_crypto,
+                    asset_type=asset_type or ("cryptocurrency" if is_crypto else "stock"),
+                    equity=equity,
+                    settings=self.settings,
                 )
                 if not ok_fe:
                     self._throttled_buy_skip_note(
@@ -18797,6 +18854,18 @@ class MarketAdvisorGUI(QMainWindow):
                     size_frac=scale_frac if scale_in else 1.0,
                     return_detail=True, ticker=ticker,
                 )
+                # Advisor-approved notional is a hard cap (human/AI already sized).
+                if c.get("_advisor_approved") and c.get("_advisor_dollars") is not None:
+                    try:
+                        adv_cap = float(c.get("_advisor_dollars") or 0)
+                        if adv_cap > 0 and float(row_dollars or 0) > adv_cap + 1e-9:
+                            row_dollars = round(adv_cap, 2)
+                            notes.append(
+                                f"[{broker_name}] Advisor dollars cap [{ticker}]: "
+                                f"${row_dollars:.2f}"
+                            )
+                    except (TypeError, ValueError):
+                        pass
                 # Time-of-day equity size curve (open half-size / last-30m block)
                 if not is_crypto and row_dollars > 0:
                     try:
@@ -18887,6 +18956,25 @@ class MarketAdvisorGUI(QMainWindow):
                                 if bumped + 1e-9 < float(row_dollars):
                                     row_dollars = bumped
                     except Exception:
+                        pass
+                # Re-apply Advisor dollars hard cap after session/frac/ET bumps.
+                if c.get("_advisor_approved") and c.get("_advisor_dollars") is not None:
+                    try:
+                        adv_cap = float(c.get("_advisor_dollars") or 0)
+                        if adv_cap > 0 and float(row_dollars or 0) > adv_cap + 1e-9:
+                            row_dollars = round(adv_cap, 2)
+                            notes.append(
+                                f"[{broker_name}] Advisor dollars re-cap [{ticker}]: "
+                                f"${row_dollars:.2f}"
+                            )
+                        elif adv_cap > 0 and float(row_dollars or 0) <= 0:
+                            notes.append(
+                                f"[{broker_name}] Advisor skip [{ticker}]: "
+                                f"live size $0 (approved ${adv_cap:.2f})"
+                            )
+                            execute_skips.append(f"{ticker}: advisor size 0")
+                            break
+                    except (TypeError, ValueError):
                         pass
                 # RH overnight / late-extended fractional exit risk only (not E*TRADE).
                 if (
@@ -18981,7 +19069,7 @@ class MarketAdvisorGUI(QMainWindow):
                 if is_crypto and (not scale_in):
                     ok_thin, why_thin = crypto_new_entry_ok(
                         broker_id, ticker, score=cand_score, notional=row_dollars,
-                        skip_turbulence=True, equity=equity,
+                        skip_turbulence=True, equity=equity, settings=self.settings,
                     )
                     if not ok_thin:
                         notes.append(f"[{broker_name}] Thin-ticket skip [{ticker}]: {why_thin}")

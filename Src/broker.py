@@ -1940,13 +1940,23 @@ class CoinbaseAdapter(BaseBroker):
     def _get_product_limits(self, ticker):
         """
         Return dict with base_increment, base_min_size, quote_min_size for a CB product.
-        Cached per ticker.
+        Cached per ticker with a short TTL so quote_increment cannot stick forever.
         """
         clean = str(ticker).replace("-USD", "").upper()
         if not hasattr(self, "_product_limits_cache"):
             self._product_limits_cache = {}
-        if clean in self._product_limits_cache:
-            return self._product_limits_cache[clean]
+        hit = self._product_limits_cache.get(clean)
+        if isinstance(hit, tuple) and len(hit) == 2:
+            cached_at, cached_limits = hit
+            try:
+                age = time.time() - float(cached_at or 0)
+            except (TypeError, ValueError):
+                age = 1e9
+            if age < 900.0 and isinstance(cached_limits, dict):
+                return dict(cached_limits)
+        elif isinstance(hit, dict):
+            # Legacy untimed cache entry — refresh below
+            pass
 
         limits = {
             "base_increment": 0.00000001,
@@ -1954,6 +1964,7 @@ class CoinbaseAdapter(BaseBroker):
             "quote_min_size": 1.0,
             "quote_increment": 0.01,
         }
+        fetched = False
         if self.is_connected and self.client:
             try:
                 data = self._cb_payload(
@@ -1975,13 +1986,17 @@ class CoinbaseAdapter(BaseBroker):
                         continue
                     if key == "min_market_funds" and val > 0:
                         limits["quote_min_size"] = max(limits["quote_min_size"], val)
+                        fetched = True
                     elif val > 0:
                         limits[key] = val
+                        fetched = True
             except Exception:
-                pass
+                fetched = False
         if limits["base_min_size"] <= 0:
             limits["base_min_size"] = limits["base_increment"]
-        self._product_limits_cache[clean] = limits
+        # Only cache successful product fetches — never pin defaults forever.
+        if fetched:
+            self._product_limits_cache[clean] = (time.time(), dict(limits))
         return limits
 
     def position_is_dust(self, ticker, shares, price, asset_type=""):

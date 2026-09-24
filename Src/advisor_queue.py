@@ -374,6 +374,8 @@ def propose(
                     p["reason"] = str(reason or "entry")
                     p["regime_caution"] = bool(regime_caution)
                     p["updated_at"] = now
+                    # Refresh TTL on each re-propose so live pending rows don't rot
+                    # mid-brief; expire_stale still drops truly abandoned names.
                     p["expires_at"] = now + float(ttl_sec or DEFAULT_TTL_SEC)
                     out = dict(p)
                     out["_refreshed"] = True

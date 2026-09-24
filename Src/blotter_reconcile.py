@@ -18,8 +18,11 @@ def holdings_ticker_set(holdings: Iterable[dict] | None, *, broker: str = "") ->
     for h in holdings or []:
         if not isinstance(h, dict):
             continue
-        if bn and str(h.get("broker") or h.get("broker_name") or "") not in ("", bn):
-            if str(h.get("broker") or "") != bn:
+        row_b = str(h.get("broker") or h.get("broker_name") or "")
+        if bn:
+            # Require matching broker tag when filtering — skip untagged rows
+            # so one broker's ghosts are not kept as "held" for another.
+            if row_b != bn:
                 continue
         t = _norm_ticker(h.get("ticker"))
         if not t:
@@ -83,8 +86,9 @@ def missing_basis_tickers(
     broker: str = "",
 ) -> list[dict]:
     """
-    Holdings lacking cost basis. has_basis_fn(broker, ticker) -> bool.
-    Returns [{ticker, shares, price}, ...].
+    Holdings lacking local cost basis. has_basis_fn(broker, ticker) -> bool.
+    Returns [{ticker, shares, broker_cost}, ...] — broker_cost is ONLY a
+    broker-reported avg (never live mark / price). Callers must not invent cost.
     """
     need: list[dict] = []
     for h in holdings or []:
@@ -105,11 +109,27 @@ def missing_basis_tickers(
             shares = 0.0
         if shares <= 0:
             continue
-        try:
-            px = float(h.get("price") or h.get("live_price") or h.get("cost") or 0)
-        except (TypeError, ValueError):
-            px = 0.0
-        need.append({"broker": b, "ticker": t, "shares": shares, "price": px})
+        # Prefer explicit avg_cost / cost — never price / live_price / mark.
+        broker_cost = 0.0
+        for key in ("avg_cost", "average_cost", "cost", "average_buy_price", "avg_buy_price"):
+            raw = h.get(key)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                broker_cost = val
+                break
+        need.append({
+            "broker": b,
+            "ticker": t,
+            "shares": shares,
+            "broker_cost": broker_cost,
+            # legacy key kept as alias of broker_cost only (never mark)
+            "price": broker_cost,
+        })
     return need
 
 
@@ -142,7 +162,8 @@ def small_book_focus_park_active(
     """True when micro combined equity should exclusive-park non-focus buys."""
     s = settings or {}
     try:
-        under = float(s.get("desk_focus_park_others_auto_under", 500.0) or 500.0)
+        raw_under = s.get("desk_focus_park_others_auto_under", 500.0)
+        under = float(500.0 if raw_under is None else raw_under)
     except (TypeError, ValueError):
         under = 500.0
     if under <= 0:
@@ -154,4 +175,7 @@ def small_book_focus_park_active(
     # Manual exclusive park always wins
     if bool(s.get("desk_focus_park_others", False)):
         return True
-    return eq > 0 and eq < under
+    # Unknown/zero equity: park (fail closed) — balance glitch must not spray non-focus.
+    if eq <= 0:
+        return True
+    return eq < under

@@ -55,8 +55,14 @@ def save() -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(_streak, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            import logging
+            logging.getLogger(__name__).warning(
+                "loss_streak save failed (%s): %s", path, e
+            )
+        except Exception:
+            pass
 
 
 def record_exit_result(broker: str, *, was_loss: bool, now: Optional[float] = None) -> None:

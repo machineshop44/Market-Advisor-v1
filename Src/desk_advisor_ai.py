@@ -423,6 +423,13 @@ def build_research_pack(proposal: dict, context: dict | None = None) -> dict:
     is_crypto = "crypto" in str(proposal.get("asset_type") or "").lower() or bool(
         proposal.get("is_crypto")
     )
+    if not is_crypto:
+        try:
+            from crypto_symbols import KNOWN_CRYPTOS
+            if tick in KNOWN_CRYPTOS:
+                is_crypto = True
+        except Exception:
+            pass
     yahoo = f"{tick}-USD" if is_crypto else tick
     pack: dict[str, Any] = {
         "ticker": tick,
@@ -538,10 +545,16 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
     allow_regime = bool(ctx.get("allow_buys_when_regime_blocked"))
     asset_l = str(proposal.get("asset_type") or "").lower()
     engine_l = str(proposal.get("engine") or "").lower()
+    try:
+        from crypto_symbols import KNOWN_CRYPTOS as _KNOWN_CRYPTOS
+    except Exception:
+        _KNOWN_CRYPTOS = frozenset(
+            {"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "DOT", "AVAX", "LINK"}
+        )
     is_crypto_prop = (
         "crypto" in asset_l
         or engine_l == "crypto"
-        or tick in ("BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "DOT", "AVAX", "LINK")
+        or tick in _KNOWN_CRYPTOS
     )
 
     if regime_caution and not allow_regime:

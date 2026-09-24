@@ -44,6 +44,11 @@ def load(force: bool = False) -> None:
     except Exception:
         _orders = {}
     _loaded = True
+    # Drop stale rows on every cold load so BP reserve cannot stick across restarts.
+    try:
+        expire_stale()
+    except Exception:
+        pass
 
 
 def save() -> None:
@@ -53,8 +58,14 @@ def save() -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(_orders, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            import logging
+            logging.getLogger(__name__).warning(
+                "working_orders save failed (%s): %s", path, e
+            )
+        except Exception:
+            pass
 
 
 def _key(broker: str, order_id: str) -> str:
@@ -143,11 +154,11 @@ def open_notional(broker: Optional[str] = None) -> float:
     return total
 
 
-def expire_stale(*, ttl_sec: float = 7200.0, now: Optional[float] = None) -> int:
-    """Drop working orders older than ttl (default 2h) so BP reserve cannot stick forever."""
+def expire_stale(*, ttl_sec: float = 28800.0, now: Optional[float] = None) -> int:
+    """Drop working orders older than ttl (default 8h) so BP reserve cannot stick forever."""
     load()
     ts_now = float(now if now is not None else time.time())
-    ttl = max(300.0, float(ttl_sec or 7200.0))
+    ttl = max(300.0, float(ttl_sec or 28800.0))
     dead = []
     for k, v in list(_orders.items()):
         try:

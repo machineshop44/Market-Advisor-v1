@@ -14,11 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.36"
+__version__ = "1.42.37"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Settings UI for flatten/focus park; grade recovery 1.42.35 pack"
+    "Grok audit 1.42.37: advisor $ cap, park eq=0, no mark-as-cost, "
+    "propose TTL, CB limits TTL, Discord broker default"
 )
 
 

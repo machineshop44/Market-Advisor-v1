@@ -75,12 +75,12 @@ def load(force: bool = False) -> None:
     _loaded = True
 
 
-def save() -> None:
+def save(*, now: Optional[float] = None) -> None:
     load()
     path = _state_path()
     # Drop expired rebuy blocks before write
-    now = time.time()
-    dead = [k for k, until in list(_rebuy_until.items()) if float(until or 0) <= now]
+    ts_now = float(now if now is not None else time.time())
+    dead = [k for k, until in list(_rebuy_until.items()) if float(until or 0) <= ts_now]
     for k in dead:
         _rebuy_until.pop(k, None)
     try:
@@ -95,8 +95,14 @@ def save() -> None:
                 f,
                 indent=2,
             )
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            import logging
+            logging.getLogger(__name__).warning(
+                "pdt_guard save failed (%s): %s", path, e
+            )
+        except Exception:
+            pass
 
 
 def _bk(broker: str, ticker: str) -> str:
@@ -216,7 +222,10 @@ def pdt_applies(equity: float, settings: Optional[dict] = None) -> bool:
         eq = float(equity or 0)
     except (TypeError, ValueError):
         eq = 0.0
-    return eq > 0 and eq < thresh
+    # Unknown/zero equity: still apply (fail closed) — balance glitch must not open PDT.
+    if eq <= 0:
+        return True
+    return eq < thresh
 
 
 def max_day_trades(settings: Optional[dict] = None) -> int:
@@ -225,6 +234,15 @@ def max_day_trades(settings: Optional[dict] = None) -> int:
         return max(0, int(s.get("pdt_max_day_trades", DEFAULT_MAX_DAY_TRADES) or DEFAULT_MAX_DAY_TRADES))
     except (TypeError, ValueError):
         return DEFAULT_MAX_DAY_TRADES
+
+
+def _gate_day_trade_count(broker: Optional[str] = None) -> int:
+    """Local journal max'd with broker overlay so chip and gates agree."""
+    used, source = effective_day_trade_count(broker)
+    local_used = count_day_trades(broker)
+    if source == "broker":
+        return max(used, local_used)
+    return local_used
 
 
 def may_complete_day_trade(
@@ -245,7 +263,7 @@ def may_complete_day_trade(
         return True, ""
     if not pdt_applies(equity, settings):
         return True, ""
-    used = count_day_trades(broker)
+    used = _gate_day_trade_count(broker)
     cap = max_day_trades(settings)
     if used >= cap:
         return (
@@ -275,7 +293,7 @@ def may_open_equity_buy(
         return True, ""
     if not pdt_applies(equity, settings):
         return True, ""
-    used = count_day_trades(broker)
+    used = _gate_day_trade_count(broker)
     cap = max_day_trades(settings)
     if used < cap:
         return True, ""
@@ -352,11 +370,17 @@ def note_day_trade_rebuy_block(
     """Block re-buying this equity until now+minutes. Returns until-ts."""
     load()
     key = _bk(broker, ticker)
-    until = float(ts or time.time()) + max(5.0, float(minutes or 90.0)) * 60.0
+    base = float(ts if ts is not None else time.time())
+    until = base + max(5.0, float(minutes or 90.0)) * 60.0
     prev = float(_rebuy_until.get(key) or 0)
     _rebuy_until[key] = max(prev, until)
-    save()
-    return _rebuy_until[key]
+    # Pass the same clock used for `until` so save() does not prune a block
+    # that is still live in the caller's timeline (tests + clock skew).
+    try:
+        save(now=base)
+    except Exception:
+        pass
+    return float(_rebuy_until.get(key) or until)
 
 
 def rebuy_blocked(

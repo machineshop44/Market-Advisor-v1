@@ -261,7 +261,9 @@ def focus_parks_buys(
         except Exception:
             try:
                 under = float((settings or {}).get("desk_focus_park_others_auto_under", 500) or 500)
-                park = under > 0 and float(combined_equity) > 0 and float(combined_equity) < under
+                eq = float(combined_equity or 0)
+                # eq<=0: fail-closed park (same as small_book_focus_park_active)
+                park = under > 0 and (eq <= 0 or eq < under)
             except (TypeError, ValueError):
                 park = False
     if not park:
@@ -301,12 +303,26 @@ def next_desk_action(
     *,
     focus_broker: str | None = None,
     settings: dict | None = None,
+    combined_equity: float | None = None,
 ) -> str:
     """One-line actionable next step for Home command center."""
     if not by_broker:
         return "Arm auto-trader and refresh balances."
     focus = focus_broker or resolve_focus_broker(by_broker, settings or {"desk_focus_mode": "auto"})
     parts: list[str] = []
+    total_eq = combined_equity
+    if total_eq is None:
+        try:
+            total_eq = 0.0
+            for ctx in by_broker.values():
+                if not isinstance(ctx, dict):
+                    continue
+                for key in ("equity", "portfolio_value", "p_val"):
+                    if ctx.get(key) is not None:
+                        total_eq = float(total_eq or 0) + float(ctx.get(key) or 0)
+                        break
+        except (TypeError, ValueError):
+            total_eq = None
     for name, ctx in by_broker.items():
         if not isinstance(ctx, dict):
             continue
@@ -323,7 +339,9 @@ def next_desk_action(
             parts.append(f"{name} low BP — deposit or exit to fund")
         elif blockers:
             parts.append(f"{name}: {(blockers[0] or {}).get('message') or code}")
-    if focus and focus_parks_buys("Robinhood", focus, settings or {}):
+    if focus and focus_parks_buys(
+        "Robinhood", focus, settings or {}, combined_equity=total_eq,
+    ):
         # only mention focus when exclusive park is on and multi-broker
         buyable = [n for n, c in by_broker.items() if c.get("can_place_new_buy")]
         if len(buyable) == 1 and buyable[0] == focus:
@@ -356,7 +374,24 @@ def format_profit_command_center(
     nwr = s.get("net_win_rate")
     closed = int(s.get("net_wins") or 0) + int(s.get("net_losses") or 0)
     wr = f"{float(nwr) * 100:.0f}%" if nwr is not None and closed > 0 else "—"
-    action = next_desk_action(by_broker, focus_broker=focus_broker, settings=settings)
+    combined_eq = None
+    try:
+        combined_eq = 0.0
+        for ctx in (by_broker or {}).values():
+            if not isinstance(ctx, dict):
+                continue
+            for key in ("equity", "portfolio_value", "p_val"):
+                if ctx.get(key) is not None:
+                    combined_eq = float(combined_eq or 0) + float(ctx.get(key) or 0)
+                    break
+    except (TypeError, ValueError):
+        combined_eq = None
+    action = next_desk_action(
+        by_broker,
+        focus_broker=focus_broker,
+        settings=settings,
+        combined_equity=combined_eq,
+    )
     focus_txt = f" · Focus {focus_broker}" if focus_broker else ""
     line = (
         f"7d net {_m(net)} · WR {wr} · fee {drag:.1f}%"
@@ -632,10 +667,13 @@ def focus_advisor_auto_clear(
     *,
     fee_clear_fn,
     known_cryptos: set[str] | None = None,
+    equity: float | None = None,
+    settings: dict | None = None,
 ) -> bool:
     """
     True when every candidate clears the fee gate — required for focus fast-path.
-    fee_clear_fn(broker, ticker, score, is_crypto, asset_type) -> (ok, why)
+    fee_clear_fn(broker, ticker, score, is_crypto, asset_type, equity=, settings=)
+    -> (ok, why)
     """
     if not candidates:
         return False
@@ -658,10 +696,18 @@ def focus_advisor_auto_clear(
             score = float(c.get("score") or 0.0)
         except (TypeError, ValueError):
             score = 0.0
-        ok, _why = fee_clear_fn(
-            broker_name, ticker, score=score,
-            is_crypto=is_crypto, asset_type=asset_type,
-        )
+        try:
+            ok, _why = fee_clear_fn(
+                broker_name, ticker, score=score,
+                is_crypto=is_crypto, asset_type=asset_type,
+                equity=equity, settings=settings,
+            )
+        except TypeError:
+            # Older callables without equity=/settings=
+            ok, _why = fee_clear_fn(
+                broker_name, ticker, score=score,
+                is_crypto=is_crypto, asset_type=asset_type,
+            )
         if not ok:
             return False
     return True

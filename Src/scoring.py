@@ -774,6 +774,7 @@ def new_entry_clears_fees_ok(
 
 def crypto_new_entry_ok(
     broker_id, ticker, score=0.0, notional=None, *, skip_turbulence=False, equity=None,
+    settings=None,
 ):
     """
     FinRL hold-bias for NEW crypto buys (not scale-in / not protective).
@@ -796,11 +797,13 @@ def crypto_new_entry_ok(
         )
     ok_fee, why_fee = new_entry_clears_fees_ok(
         broker_id, ticker, sc, is_crypto=True, asset_type="cryptocurrency",
-        equity=equity,
+        equity=equity, settings=settings,
     )
     if not ok_fee:
         return False, why_fee
-    need = min_entry_edge_pct(broker_id, ticker, "cryptocurrency")
+    need = min_entry_edge_pct(
+        broker_id, ticker, "cryptocurrency", equity=equity, settings=settings,
+    )
     edge = estimated_signal_edge_pct(sc, is_crypto=True)
     floor = broker_min_notional(broker_id, is_crypto=True)
     try:
