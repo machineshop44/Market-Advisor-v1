@@ -361,3 +361,39 @@ def resolve_discord_broker_tag(
         if cb in _DISCORD_BROKER_NAMES:
             return cb
     return "App"
+
+
+def discord_broker_from_fills(fills, *, default: str = "App") -> str:
+    """Single broker if all fills agree; else default (usually App)."""
+    names: list[str] = []
+    for f in fills or []:
+        if not isinstance(f, dict):
+            continue
+        b = str(f.get("broker") or "").strip()
+        if b and b not in names:
+            names.append(b)
+    if len(names) == 1:
+        return names[0]
+    return default
+
+
+def eod_flatten_discord_label(fills) -> tuple[str, str]:
+    """
+    Return (broker_tag, message_prefix) for EOD flatten Discord.
+    Mixed RH+ET batches must not be tagged E*TRADE only.
+    """
+    names: list[str] = []
+    for f in fills or []:
+        if not isinstance(f, dict):
+            continue
+        b = str(f.get("broker") or "").strip()
+        if b and b not in names:
+            names.append(b)
+    if not names:
+        return "App", "EOD flatten"
+    if len(names) == 1:
+        short = {"Robinhood": "RH", "E*TRADE": "ET", "Coinbase": "CB"}.get(
+            names[0], names[0]
+        )
+        return names[0], f"EOD {short} flatten"
+    return "App", "EOD multi-broker flatten"

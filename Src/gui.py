@@ -6731,14 +6731,19 @@ class MarketAdvisorGUI(QMainWindow):
                 self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
                 return
             lines = [f"**Desk watchdog** ({report.get('status', '?').upper()})"]
+            snag_brokers = []
             for s in new_items[:4]:
-                b = f" [{s.get('broker')}]" if s.get("broker") else ""
+                bname = str(s.get("broker") or "").strip()
+                if bname and bname not in snag_brokers:
+                    snag_brokers.append(bname)
+                b = f" [{bname}]" if bname else ""
                 lines.append(f"• {s.get('severity', '').upper()}{b}: {s.get('message')}")
+            wd_broker = snag_brokers[0] if len(snag_brokers) == 1 else "App"
             self.send_discord_alert(
                 "\n".join(lines),
                 urgent=any(s.get("severity") == dw.SEV_CRITICAL for s in new_items),
                 prefix="[WATCHDOG]",
-                broker="App",
+                broker=wd_broker,
             )
             # Track currently-active WARN+ only (drop cleared snags).
             self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
@@ -7304,6 +7309,7 @@ class MarketAdvisorGUI(QMainWindow):
         if prev != label:
             self._last_equity_session_label = label
             self._sell_defer_log = {}
+            self._frac_buy_defer_log = {}
             if label == "REGULAR":
                 # Extended-hours ineligible list only applies outside regular hours
                 self._frac_ext_ineligible = set()
@@ -13015,6 +13021,7 @@ class MarketAdvisorGUI(QMainWindow):
                     f"✅ [{broker_name}] Auto-Trader **re-armed** after reconnect.",
                     urgent=False,
                     prefix="[ARM]",
+                    broker=broker_name,
                 )
             self._set_engine_banner(f"🤖 ⚡ {broker_name} re-armed — spinning up…")
             QTimer.singleShot(0, self.director_tick)
@@ -13200,12 +13207,14 @@ class MarketAdvisorGUI(QMainWindow):
             if "Fail" not in st and "Skipped" not in st:
                 n_ok += 1
         try:
+            from activity_log_util import discord_broker_from_fills
+            tag = discord_broker_from_fills(fills, default="App")
             self.send_discord_alert(
                 f"Risk flatten ({reason or 'risk'}) done — {n_ok}/{len(fills)} ok",
                 is_trade=True,
                 urgent=True,
                 prefix="[RISK]",
-                broker="App",
+                broker=tag,
             )
         except Exception:
             pass
@@ -17538,12 +17547,15 @@ class MarketAdvisorGUI(QMainWindow):
             if "Fail" not in st and "Skipped" not in st:
                 n_ok += 1
         try:
+            from activity_log_util import eod_flatten_discord_label
+            fills = payload.get("fills") or []
+            tag, label = eod_flatten_discord_label(fills)
             self.send_discord_alert(
-                f"EOD ET flatten done — {n_ok}/{len(payload.get('fills') or [])} ok",
+                f"{label} done — {n_ok}/{len(fills)} ok",
                 is_trade=True,
                 urgent=True,
                 prefix="[EOD]",
-                broker="E*TRADE",
+                broker=tag,
             )
         except Exception:
             pass

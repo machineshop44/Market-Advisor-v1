@@ -1,4 +1,4 @@
-"""1.42.38 — Discord broker tagging + overnight defer/peel honesty."""
+"""1.42.38/39 — Discord broker tagging + overnight defer/peel honesty."""
 import os
 import sys
 import unittest
@@ -39,13 +39,29 @@ class TestDiscordBrokerTag(unittest.TestCase):
             ),
             "Coinbase",
         )
-        # Outside cycle: never inherit stale cycle name
         self.assertEqual(
             resolve_discord_broker_tag(
                 None, "EOD flatten done",
                 cycle_broker="Coinbase", in_cycle=False,
             ),
             "App",
+        )
+
+    def test_eod_flatten_label_mixed(self):
+        from activity_log_util import eod_flatten_discord_label, discord_broker_from_fills
+
+        tag, label = eod_flatten_discord_label([
+            {"broker": "Robinhood"},
+            {"broker": "E*TRADE"},
+        ])
+        self.assertEqual(tag, "App")
+        self.assertIn("multi", label.lower())
+        tag2, label2 = eod_flatten_discord_label([{"broker": "Robinhood"}])
+        self.assertEqual(tag2, "Robinhood")
+        self.assertIn("RH", label2)
+        self.assertEqual(
+            discord_broker_from_fills([{"broker": "E*TRADE"}]),
+            "E*TRADE",
         )
 
 
@@ -77,7 +93,6 @@ class TestEquityBuyDeferSession(unittest.TestCase):
                 "ACHR", 2.0, 8.0, "stock", overnight, broker_name="Robinhood",
             )
         )
-        # Mixed lot (≥1) still allowed — peel sells the floor
         self.assertIsNone(
             ac.equity_buy_defer_reason(
                 "ACHR", 2.99, 8.0, "stock", overnight, broker_name="Robinhood",
@@ -103,6 +118,9 @@ class TestEquityBuyDeferSession(unittest.TestCase):
 
         st = "Sell-All partial peel market Filled (2)"
         self.assertTrue(ac.sell_status_is_partial_peel(st, 2.99, 2.0))
+        self.assertTrue(ac.sell_status_is_partial_peel("Filled (2)", 2.99, 2.0))
+        # Plain short fill leaving a whole share is NOT a peel
+        self.assertFalse(ac.sell_status_is_partial_peel("Filled (2)", 3.0, 2.0))
 
 
 if __name__ == "__main__":

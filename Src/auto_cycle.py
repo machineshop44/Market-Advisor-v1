@@ -1269,7 +1269,14 @@ def sell_status_is_partial_peel(status: str, requested: float, sold: float) -> b
         got = float(sold or 0)
     except (TypeError, ValueError):
         return False
-    return req > 0 and got > 0 and (req - got) > 1e-4
+    # Require overnight peel shape: sold ≥1 whole shares, fractional remainder <1.
+    # Plain short fills (e.g. 3→2) must NOT keep basis as a "peel".
+    if req < 1.0 - 1e-9 or got < 1.0 - 1e-9:
+        return False
+    rem = req - got
+    if rem <= 1e-4 or rem >= 1.0 - 1e-9:
+        return False
+    return abs(got - round(got)) <= 1e-4
 
 
 def equity_session_size_mult(now_et=None, *, settings=None) -> tuple[float, str]:
