@@ -3299,7 +3299,10 @@ class MarketAdvisorGUI(QMainWindow):
                     self.log_event(f"[RISK] [{broker_name}] {msg}")
                     try:
                         self.send_discord_alert(
-                            f"[{broker_name}] {msg}", urgent=True, prefix="[RISK]"
+                            f"[{broker_name}] {msg}",
+                            urgent=True,
+                            prefix="[RISK]",
+                            broker=broker_name,
                         )
                     except Exception:
                         pass
@@ -3612,9 +3615,18 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception:
             pass
 
-        # Prefer explicit broker tag. Never inherit cycle name when omitted —
-        # EOD/risk/Advisor alerts were mis-tagged [Coinbase] mid-CB cycle.
-        tag_override = str(broker).strip() if broker else "App"
+        # Prefer explicit broker=. Infer [Robinhood]/… from message; else cycle
+        # only while mid-cycle; else App — never mis-tag EOD/risk as Coinbase.
+        try:
+            from activity_log_util import resolve_discord_broker_tag
+            tag_override = resolve_discord_broker_tag(
+                broker,
+                message or "",
+                cycle_broker=getattr(self, "cycle_broker_name", None),
+                in_cycle=bool(getattr(self, "_cycle_broker", None)),
+            )
+        except Exception:
+            tag_override = str(broker).strip() if broker else "App"
 
         def _post():
             try:
@@ -3859,7 +3871,7 @@ class MarketAdvisorGUI(QMainWindow):
                 slot_dt = slot_dt - timedelta(hours=1)
             self._last_heartbeat_slot = slot_dt.strftime("%Y-%m-%d %H:%M")
 
-        self.send_discord_alert(f"Heartbeat {clock}", embed=embed, prefix="[HEARTBEAT]")
+        self.send_discord_alert(f"Heartbeat {clock}", embed=embed, prefix="[HEARTBEAT]", broker="App")
         self.log_event(f"Discord heartbeat sent ({mode})")
 
     def _weekly_digest_is_due(self, now_ts) -> bool:
@@ -3922,7 +3934,7 @@ class MarketAdvisorGUI(QMainWindow):
                     "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 }
                 self._last_weekly_digest_week = week_key
-                self.send_discord_alert("Weekly digest", embed=embed, prefix="[REPORTS]")
+                self.send_discord_alert("Weekly digest", embed=embed, prefix="[REPORTS]", broker="App")
                 self.log_event("Discord weekly P&L digest sent")
             except Exception:
                 pass
@@ -4022,7 +4034,7 @@ class MarketAdvisorGUI(QMainWindow):
                     "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 }
                 self._last_daily_scoreboard_day = day_key
-                self.send_discord_alert("Daily scoreboard", embed=embed, prefix="[REPORTS]")
+                self.send_discord_alert("Daily scoreboard", embed=embed, prefix="[REPORTS]", broker="App")
                 self.log_event("Discord daily scoreboard sent")
             except Exception:
                 pass
@@ -4064,6 +4076,7 @@ class MarketAdvisorGUI(QMainWindow):
                     f"**[{broker_name}]** Fully deployed — cash **{format_money(bp)}** "
                     f"under min ticket. Buy engines parked; **PORTFOLIO** still recycles winners.",
                     prefix="[DESK]",
+                    broker=broker_name,
                 )
 
     def _maybe_stuck_capital_nudge(self, now_ts):
@@ -4120,7 +4133,9 @@ class MarketAdvisorGUI(QMainWindow):
             cd = 7200 if tier == "warn" else 14400
             logged = self._throttled_log(f"{broker_name}:stuck_capital_{tier}", msg, cooldown_sec=cd)
             if logged and alerts_on and tier == "urgent":
-                self.send_discord_alert(f"**{msg}**", prefix="[DESK]", urgent=True)
+                self.send_discord_alert(
+                    f"**{msg}**", prefix="[DESK]", urgent=True, broker=broker_name,
+                )
 
     def _record_zero_signal(self, broker_name: str, engine: str, buy_n: int):
         """Track consecutive empty scans for focus-broker coach."""
@@ -4886,6 +4901,7 @@ class MarketAdvisorGUI(QMainWindow):
                             f"new buys paused {mins}m (auto-trader still armed).",
                             urgent=True,
                             prefix="[RISK]",
+                            broker=broker_name,
                         )
                         # Clear pending advisor buys so auto-pilot cannot apply mid-pause.
                         try:
@@ -5120,6 +5136,7 @@ class MarketAdvisorGUI(QMainWindow):
                     f"If the phone shows offline, pull-to-refresh after ~1 min.",
                     urgent=True,
                     prefix="[MONITOR]",
+                    broker="App",
                 )
             except Exception:
                 pass
@@ -6721,6 +6738,7 @@ class MarketAdvisorGUI(QMainWindow):
                 "\n".join(lines),
                 urgent=any(s.get("severity") == dw.SEV_CRITICAL for s in new_items),
                 prefix="[WATCHDOG]",
+                broker="App",
             )
             # Track currently-active WARN+ only (drop cleared snags).
             self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
@@ -7581,7 +7599,12 @@ class MarketAdvisorGUI(QMainWindow):
         suppressed = int(prev[1]) if prev else 0
         cool[key] = (now, 0)
         extra = f" (×{suppressed + 1} since last alert)" if suppressed else ""
-        self.send_discord_alert(f"🚨 Cycle thread error in {fname}: {err}{extra}")
+        self.send_discord_alert(
+            f"🚨 Cycle thread error in {fname}: {err}{extra}",
+            urgent=True,
+            prefix="[RISK]",
+            broker=getattr(self, "cycle_broker_name", None) or "App",
+        )
 
     def run_cycle_thread(self, target_func, on_success_callback, *args):
         """Background work for auto-trade cycles — unlocks the queue if the worker crashes."""
@@ -12919,6 +12942,7 @@ class MarketAdvisorGUI(QMainWindow):
                 f"🛑 Auto-Trader **DISARMED** for **{broker_name}**.",
                 urgent=True,
                 prefix="[RISK]",
+                broker=broker_name,
             )
 
     def _arm_intent_key(self, broker_name):
@@ -14294,6 +14318,7 @@ class MarketAdvisorGUI(QMainWindow):
                 f"Open Home → Reauth / Settings → Brokers, then re-arm.",
                 urgent=True,
                 prefix="[REAUTH]",
+                broker=broker_name,
             )
 
         if hasattr(self, "_update_reauth_banner"):
@@ -14410,6 +14435,7 @@ class MarketAdvisorGUI(QMainWindow):
                     "Open Home → Reconnect (or Settings → Brokers).",
                     urgent=True,
                     prefix="[REAUTH]",
+                    broker="E*TRADE",
                 )
             return
 
@@ -14428,6 +14454,7 @@ class MarketAdvisorGUI(QMainWindow):
                 f"E*TRADE token expires in ~{mins}m — consider reauth now.",
                 urgent=True,
                 prefix="[REAUTH]",
+                broker="E*TRADE",
             )
 
     def _refresh_portfolio_heat(self):
@@ -15531,7 +15558,10 @@ class MarketAdvisorGUI(QMainWindow):
         self._update_autotrade_ui()
         if notify_discord:
             self.send_discord_alert(
-                f"🛑 Auto-Trader **DISARMED** ({mode}) — stopped: {stopped}."
+                f"🛑 Auto-Trader **DISARMED** ({mode}) — stopped: {stopped}.",
+                urgent=True,
+                prefix="[RISK]",
+                broker="App",
             )
 
     def _log_armed_brokers(self, armed):
@@ -15589,7 +15619,9 @@ class MarketAdvisorGUI(QMainWindow):
                     )
         self.send_discord_alert(
             f"⚔️ Auto-Trader **ARMED** ({mode}) on {', '.join(armed)}.\n"
-            + "\n".join(bp_lines)
+            + "\n".join(bp_lines),
+            prefix="[DESK]",
+            broker="App",
         )
 
     def toggle_auto_trade(self):
@@ -15669,7 +15701,9 @@ class MarketAdvisorGUI(QMainWindow):
             self.log_event(f"Multi-Engine Auto-Trader still ENABLED for {remaining}")
             mode = "PAPER" if self.paper_mode else "LIVE"
             self.send_discord_alert(
-                f"⚔️ Auto-Trader **UPDATED** ({mode}) — still armed: {remaining}."
+                f"⚔️ Auto-Trader **UPDATED** ({mode}) — still armed: {remaining}.",
+                prefix="[DESK]",
+                broker="App",
             )
         else:
             self.log_event(
@@ -15705,7 +15739,9 @@ class MarketAdvisorGUI(QMainWindow):
                     f"Forcing queue unlock (in-flight results ignored)."
                 )
                 self.log_event(msg)
-                self.send_discord_alert(msg)
+                self.send_discord_alert(
+                    msg, urgent=True, prefix="[RISK]", broker="App",
+                )
                 self._cycle_gen = int(getattr(self, "_cycle_gen", 0) or 0) + 1
                 self._cycle_broker = None
                 self.is_processing_queue = False
@@ -16026,7 +16062,10 @@ class MarketAdvisorGUI(QMainWindow):
                     f"[{broker_name}] Session restored after drop (Discord).",
                     cooldown_sec=3600,
                 ):
-                    self.send_discord_alert(f"✅ [{broker_name}] Session restored after drop.")
+                    self.send_discord_alert(
+                        f"✅ [{broker_name}] Session restored after drop.",
+                        broker=broker_name,
+                    )
                 self._update_autotrade_ui()
                 self._after_broker_session_restored(broker_name, source="reconnect")
                 self._maybe_restore_broker_arm(broker_name, source="reconnect")
@@ -16053,7 +16092,10 @@ class MarketAdvisorGUI(QMainWindow):
                         cooldown_sec=1800,
                     ):
                         self.send_discord_alert(
-                            f"🚨 [{broker_name}] Reconnect failed {streak}x — auto cycles paused until session restored. ({detail})"
+                            f"🚨 [{broker_name}] Reconnect failed {streak}x — auto cycles paused until session restored. ({detail})",
+                            urgent=True,
+                            prefix="[REAUTH]",
+                            broker=broker_name,
                         )
                     self._update_autotrade_ui()
 
@@ -19399,6 +19441,7 @@ class MarketAdvisorGUI(QMainWindow):
                     self.send_discord_alert(
                         f"ROTATE SELL {ticker} → fund {fill.get('rotate_for') or '?'}: {status}",
                         is_trade=True,
+                        broker=broker,
                     )
                 continue
             tag = "SCALE-IN " if fill.get("scale_in") else ""
@@ -19410,7 +19453,9 @@ class MarketAdvisorGUI(QMainWindow):
                 kind = f"{kind} WORKING"
             # Discord confirmed fills only — working limits stay in the activity log.
             if filled:
-                self.send_discord_alert(f"{kind} {ticker}: {status}", is_trade=True)
+                self.send_discord_alert(
+                    f"{kind} {ticker}: {status}", is_trade=True, broker=broker,
+                )
             row = fill.get("table_row")
             if table is not None and row is not None and row < table.rowCount():
                 try:
@@ -19446,6 +19491,7 @@ class MarketAdvisorGUI(QMainWindow):
                             "BUY proposal(s) pending — approve on Home or companion",
                             urgent=True,
                             prefix="Advisor",
+                            broker="App",
                         )
                 except Exception:
                     pass
@@ -19649,9 +19695,12 @@ class MarketAdvisorGUI(QMainWindow):
                         f"🎉 BIG WIN SELL {ticker}: +{gain_pct:.1f}%{net_part}{dollar_part} — {status}",
                         is_trade=True,
                         urgent=True,
+                        broker=broker,
                     )
                 else:
-                    self.send_discord_alert(f"SELL {ticker}: {status}", is_trade=True)
+                    self.send_discord_alert(
+                        f"SELL {ticker}: {status}", is_trade=True, broker=broker,
+                    )
             row = fill.get("table_row")
             if row is not None and hasattr(self, "portfolio_table") and row < self.portfolio_table.rowCount():
                 try:

@@ -329,3 +329,35 @@ def record_buy_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec=
         f"(~{int(use_ttl) // 60}m TTL or until reason changes)"
     )
     return False, note
+
+
+_DISCORD_BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
+
+
+def resolve_discord_broker_tag(
+    broker=None,
+    message: str = "",
+    *,
+    cycle_broker=None,
+    in_cycle: bool = False,
+) -> str:
+    """
+    Pick the Discord [tag] for an alert.
+
+    Prefer explicit broker=. Else infer from [Robinhood]/[Coinbase]/[E*TRADE]
+    in the message body. Else use the active cycle broker when mid-cycle.
+    Else "App" — never invent Coinbase from a stale cycle when broker was omitted.
+    """
+    b = str(broker or "").strip()
+    if b:
+        return b
+    text = str(message or "")
+    for name in _DISCORD_BROKER_NAMES:
+        needle = f"[{name}]"
+        if needle in text:
+            return name
+    if in_cycle:
+        cb = str(cycle_broker or "").strip()
+        if cb in _DISCORD_BROKER_NAMES:
+            return cb
+    return "App"

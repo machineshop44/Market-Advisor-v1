@@ -1646,6 +1646,9 @@ def equity_buy_defer_reason(
     During REGULAR (fractional_ok) allow fractionals — desk can exit same day.
     Do NOT always simulate overnight; that wrongly blocked RTH buys (e.g. ACHR).
 
+    Whole-share projected size (≥1) is never deferred for session peel reasons —
+    overnight peel can sell the floor and leave a fractional remainder.
+
     E*TRADE supports fractional equities and is not subject to that RH session rule —
     applying it there blocked live ET buys (e.g. SMCI) that sized under 1 share.
     """
@@ -1656,7 +1659,15 @@ def equity_buy_defer_reason(
         return None
     sess = dict(session or {})
     # Same-day exit OK — do not defer on a hypothetical overnight hold.
-    if sess.get("fractional_ok") or str(sess.get("label") or "").upper() == "REGULAR":
+    label = str(sess.get("label") or "").upper()
+    if sess.get("fractional_ok") or label == "REGULAR":
+        return None
+    # Whole shares: RH overnight peel can exit the floor; allow the buy.
+    try:
+        proj = float(projected_shares or 0)
+    except (TypeError, ValueError):
+        proj = 0.0
+    if proj >= 1.0 - 1e-9:
         return None
     why = rh_equity_sell_defer_reason(
         ticker, projected_shares, price, asset_type, sess,
@@ -1664,9 +1675,10 @@ def equity_buy_defer_reason(
         known_cryptos=known_cryptos,
     )
     if why:
-        label = str(sess.get("label") or "session").upper()
         if label == "OVERNIGHT":
             return f"would be stuck overnight — {why}"
+        if label == "EXTENDED":
+            return f"late extended exit risk — {why}"
         return f"session exit risk — {why}"
     return None
 
