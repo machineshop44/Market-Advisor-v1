@@ -40,6 +40,9 @@ FLAT_TIME_BANK_ARM_MULT = 1.25
 
 # Small-book crypto: scale out ~45% at first TTP arm; trail the rest.
 TTP_PARTIAL_SCALE_PCT = 0.45
+# After the partial scale-out banks profit, the runner trails wider (9/20–9/29: winners
+# exited at +4.6% avg while the 4h high averaged +6.6%).
+RUNNER_TRAIL_MULT = 1.5
 # Peak DD pause needs agreeing balance reads (like balance_guard day-loss trip).
 PEAK_DD_CONFIRM_READS = 3
 
@@ -1109,6 +1112,15 @@ def apply_small_ticket_exit_nudge(
                 out[key] = val * scale
     out["small_ticket_exit_nudge"] = scale
     return out
+
+
+def runner_trail_pct(base_trail, partial_done) -> float:
+    """Trail distance from peak; wider for the remainder after a TTP partial scale-out."""
+    try:
+        t = abs(float(base_trail or 0.0))
+    except (TypeError, ValueError):
+        t = 0.0
+    return t * RUNNER_TRAIL_MULT if partial_done else t
 
 
 def ttp_partial_scale_eligible(
@@ -3971,10 +3983,12 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
                 f"SELL_PARTIAL (TTP Scale-Out {pct}% — "
                 f"Peak: +{peak_roi*100:.2f}%, Now: +{roi*100:.2f}%)"
             )
-        trail_trigger_price = highest * (1.0 - fees["ttp_trail"])
+        trail = runner_trail_pct(fees["ttp_trail"], bool(mem.get("ttp_partial_done")))
+        trail_trigger_price = highest * (1.0 - trail)
         if current_price <= trail_trigger_price:
             save_state(force=True)
-            return f"SELL (TTP Triggered - Peak: +{peak_roi*100:.2f}%, Exit: +{roi*100:.2f}%)"
+            label = "TTP Runner trail" if mem.get("ttp_partial_done") else "TTP Triggered"
+            return f"SELL ({label} - Peak: +{peak_roi*100:.2f}%, Exit: +{roi*100:.2f}%)"
         save_state()
         return f"HOLD (TTP Armed - Peak: +{peak_roi*100:.2f}%)"
 
@@ -4049,10 +4063,82 @@ def evaluate_crypto_opportunity(
                 f"DO NOT BUY (Hold bias: score {sc:.0f} < "
                 f"{min_score:.0f})"
             )
+        chase = anti_chase_block(base, is_crypto=True)
+        if chase:
+            return chase
         tag = "Mover " if is_mover else ""
         return f"BUY ({tag}MTF Confirmed | RSI: {rsi:.1f} | Score: {sc:.0f})"
 
     return "DO NOT BUY (Consolidating)"
+
+
+ANTI_CHASE_DEFAULT_RUN_PCT = 1.5
+ANTI_CHASE_LOOKBACK_MIN = 120
+_anti_chase_cfg = {"enabled": True, "run_pct": ANTI_CHASE_DEFAULT_RUN_PCT}
+_anti_chase_cache: dict = {}
+_ANTI_CHASE_CACHE_TTL = 60.0
+
+
+def configure_entry_filters(settings: dict | None) -> None:
+    """GUI settings → anti-chase gate (enabled flag + 2h run threshold in %)."""
+    s = settings or {}
+    _anti_chase_cfg["enabled"] = bool(s.get("anti_chase_enabled", True))
+    try:
+        pct = float(s.get("anti_chase_run_pct", ANTI_CHASE_DEFAULT_RUN_PCT))
+    except (TypeError, ValueError):
+        pct = ANTI_CHASE_DEFAULT_RUN_PCT
+    _anti_chase_cfg["run_pct"] = max(0.5, min(10.0, pct))
+
+
+def chase_run_pct(closes) -> float | None:
+    """Percent move from the first to the last close of the lookback window."""
+    chg = _pct_change_from_closes(list(closes or []))
+    return None if chg is None else chg * 100.0
+
+
+def chase_block_reason(run_pct, threshold_pct) -> str:
+    """Empty string when the entry is allowed."""
+    try:
+        run = float(run_pct)
+        thr = float(threshold_pct)
+    except (TypeError, ValueError):
+        return ""
+    if run >= thr:
+        return (
+            f"DO NOT BUY (Chasing: +{run:.1f}% in {ANTI_CHASE_LOOKBACK_MIN // 60}h "
+            f"≥ {thr:.1f}% — wait for a pullback)"
+        )
+    return ""
+
+
+def anti_chase_block(ticker, *, is_crypto=False) -> str:
+    """
+    Skip entries after an extended short-term run (9/20–9/29 log: buys after a
+    ≥1.5% 2h run won 1/7, avg −1.9%). A real pullback shrinks the run below the bar.
+    """
+    if not _anti_chase_cfg.get("enabled", True):
+        return ""
+    clean = str(ticker or "").upper().replace("-USD", "")
+    if not clean:
+        return ""
+    now = time.time()
+    hit = _anti_chase_cache.get(clean)
+    if hit and now - hit[0] < _ANTI_CHASE_CACHE_TTL:
+        run = hit[1]
+    else:
+        run = None
+        try:
+            sym = _safe_ticker(clean, force_crypto=bool(is_crypto))
+            df = _get_yf().Ticker(sym).history(period="1d" if is_crypto else "5d", interval="5m")
+            bars = int(ANTI_CHASE_LOOKBACK_MIN // 5) + 1
+            if df is not None and not df.empty and "Close" in df.columns and len(df) >= bars:
+                run = chase_run_pct(df["Close"].iloc[-bars:].tolist())
+        except Exception:
+            run = None
+        _anti_chase_cache[clean] = (now, run)
+    if run is None:
+        return ""
+    return chase_block_reason(run, _anti_chase_cfg.get("run_pct", ANTI_CHASE_DEFAULT_RUN_PCT))
 
 
 def _pct_change_from_closes(closes) -> float | None:
@@ -4122,6 +4208,7 @@ def explain_gate_from_recommendation(rec: str) -> str:
         ("regime", "Broad market regime gate blocked entry."),
         ("turbulence", "BTC turbulence pause on new crypto."),
         ("overbought", "RSI overbought — wait for a pullback."),
+        ("chasing", "Extended 2h run — wait for a pullback."),
         ("low volume", "Volume too thin vs recent average."),
         ("macro downtrend", "1H macro below EMA — trend filter."),
         ("hold bias", "Score below entry bar (hold bias)."),
@@ -4286,6 +4373,9 @@ def evaluate_opportunity(
     if not has_volume: return "DO NOT BUY (Low Volume Fakeout)"
 
     if micro_bullish:
+        chase = anti_chase_block(ticker, is_crypto=False)
+        if chase:
+            return chase
         return f"BUY (MTF Confirmed | RSI: {rsi:.1f})"
 
     return "DO NOT BUY (Consolidating)"

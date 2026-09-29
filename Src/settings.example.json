@@ -46,6 +46,8 @@
     "consecutive_loss_guard": true,
     "consecutive_loss_max": 3,
     "consecutive_loss_pause_minutes": 45,
+    "anti_chase_enabled": true,
+    "anti_chase_run_pct": 1.5,
     "desk_focus_mode": "auto",
     "desk_focus_broker": "",
     "focus_broker_scan_mult": 2.0,

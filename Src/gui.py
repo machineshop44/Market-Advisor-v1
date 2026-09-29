@@ -282,6 +282,8 @@ def load_settings():
         "consecutive_loss_guard": True,
         "consecutive_loss_max": 3,
         "consecutive_loss_pause_minutes": 45,
+        "anti_chase_enabled": True,
+        "anti_chase_run_pct": 1.5,
         "advisor_ai_max_per_minute": 4,
         "advisor_ai_max_per_day": 20,
         "advisor_ai_local_when_clear": True,
@@ -11447,6 +11449,23 @@ class MarketAdvisorGUI(QMainWindow):
         cl_row.addStretch()
         form_layout.addLayout(cl_row)
 
+        chase_row = QHBoxLayout()
+        self.anti_chase_chk = QCheckBox("Anti-chase — skip buys after a 2h run of at least")
+        self.anti_chase_chk.setChecked(bool(self.settings.get("anti_chase_enabled", True)))
+        self.anti_chase_chk.setToolTip(
+            "Don't buy into an extended move: new entries wait for a pullback when price "
+            "is already up this much over the last 2 hours. Scale-ins and exits are unaffected."
+        )
+        chase_row.addWidget(self.anti_chase_chk)
+        self.anti_chase_spin = QDoubleSpinBox()
+        self.anti_chase_spin.setRange(0.5, 10.0)
+        self.anti_chase_spin.setSingleStep(0.25)
+        self.anti_chase_spin.setSuffix(" %")
+        self.anti_chase_spin.setValue(float(self.settings.get("anti_chase_run_pct", 1.5) or 1.5))
+        chase_row.addWidget(self.anti_chase_spin)
+        chase_row.addStretch()
+        form_layout.addLayout(chase_row)
+
         self.session_size_curve_chk = QCheckBox(
             "Session size curve — half-size first 30m RTH; no new equity last 30m"
         )
@@ -14147,8 +14166,13 @@ class MarketAdvisorGUI(QMainWindow):
     def _sync_equity_posture_snapshot(self):
         """Push live equity into scoring + log when auto-scale tier changes."""
         try:
-            from scoring import describe_posture_for_broker, set_broker_equity_snapshot
+            from scoring import (
+                configure_entry_filters,
+                describe_posture_for_broker,
+                set_broker_equity_snapshot,
+            )
 
+            configure_entry_filters(self.settings)
             totals = getattr(self, "_last_balance_totals", {}) or {}
             by_eq = {
                 name: float((totals.get(name) or {}).get("p_val") or 0)
@@ -19673,6 +19697,7 @@ class MarketAdvisorGUI(QMainWindow):
                     "price": price,
                     "avg_cost": avg_cost,
                     "shares": shares,
+                    "action": item.get("action") or "",
                 })
         finally:
             self._cycle_broker = prior
@@ -19698,7 +19723,11 @@ class MarketAdvisorGUI(QMainWindow):
                     clear_scale_in_count(bid, ticker)
                 except Exception:
                     pass
-            self.log_event(f"[{broker}] Execution [{ticker}]: {status}")
+            why_exit = _auto_cycle.exit_reason_label(fill.get("action"))
+            self.log_event(
+                f"[{broker}] Execution [{ticker}]: {status}"
+                + (f" — exit: {why_exit}" if why_exit else "")
+            )
             if not fill.get("skipped"):
                 roi = None
                 if fill.get("ok"):
@@ -21192,6 +21221,10 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["consecutive_loss_pause_minutes"] = int(
                 self.consec_loss_pause_spin.value()
             )
+        if hasattr(self, "anti_chase_chk"):
+            self.settings["anti_chase_enabled"] = bool(self.anti_chase_chk.isChecked())
+        if hasattr(self, "anti_chase_spin"):
+            self.settings["anti_chase_run_pct"] = float(self.anti_chase_spin.value())
         if hasattr(self, "session_size_curve_chk"):
             self.settings["session_size_curve_enabled"] = bool(
                 self.session_size_curve_chk.isChecked()

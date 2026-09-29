@@ -1407,6 +1407,16 @@ def build_monitor_locked_capital(
     return out
 
 
+def exit_reason_label(action) -> str:
+    """'SELL (Hard Stop: -4.10%)' → 'Hard Stop: -4.10%'; '' when not a sell action."""
+    s = str(action or "").strip()
+    if "SELL" not in s.upper():
+        return ""
+    if "(" in s and s.rstrip().endswith(")"):
+        return s[s.index("(") + 1:-1].strip()[:120]
+    return s[:120]
+
+
 def portfolio_sells_from_scored(
     assets: Iterable,
     results: Iterable,
