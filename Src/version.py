@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.39"
+__version__ = "1.42.40"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "EOD/risk flatten Discord tags; peel heuristic; clear buy-defer on session change"
+    "IONQ not OTC; DD on total equity; advisor miss park; exit retries; rotate loss guard"
 )
 
 

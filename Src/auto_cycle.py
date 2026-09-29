@@ -524,6 +524,22 @@ def format_rotate_sell_failed_note(broker_name: str, fund_ticker: str, status) -
     return f"[{broker_name}] [ROTATE] Sell {fund_ticker} failed: {status}"
 
 
+def rotate_would_trip_loss_guard(fund_roi, streak_count, max_losses) -> bool:
+    """
+    True when rotating out of a losing funder would be the Nth straight loss —
+    the guard then pauses buys and the rotate's own candidate never fills.
+    ``fund_roi`` is a fraction (−0.0137 = −1.37%).
+    """
+    try:
+        roi = float(fund_roi or 0.0)
+        n = int(streak_count or 0)
+        cap = max(1, int(max_losses or 3))
+    except (TypeError, ValueError):
+        return False
+    # Same loss line as record_exit_result: fill < avg × 0.995.
+    return roi < -0.005 and n + 1 >= cap
+
+
 def format_rotate_freed_note(
     broker_name: str,
     fund_ticker: str,
@@ -866,11 +882,17 @@ def filter_otc_portfolio_items(
             kept.append(item)
             continue
         ticker = str(item[1] or "").upper()
-        if ticker.endswith("Q") and len(ticker) >= 4:
+        if is_bankruptcy_q_ticker(ticker):
             skipped.append(ticker)
             continue
         kept.append(item)
     return kept, skipped
+
+
+def is_bankruptcy_q_ticker(ticker) -> bool:
+    """GOEVQ-style OTC bankruptcy symbol — the Q is a 5th letter; IONQ / TQQQ are live."""
+    t = str(ticker or "").upper().replace("-USD", "").strip()
+    return len(t) == 5 and t.isalpha() and t.endswith("Q") and t not in DEFAULT_CRYPTO_TICKERS
 
 
 def classify_locked_holding(holding: dict, *, broker_name: str = "") -> tuple[bool, str]:
@@ -914,7 +936,7 @@ def classify_locked_holding(holding: dict, *, broker_name: str = "") -> tuple[bo
     if val <= 0 and px > 0:
         val = abs(shares * px)
 
-    if t.endswith("Q") and len(t) >= 4:
+    if not is_crypto and is_bankruptcy_q_ticker(t):
         if px <= 0:
             return True, "OTC/delisted (*Q, no quote)"
         return True, "OTC/delisted (*Q)"

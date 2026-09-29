@@ -67,16 +67,24 @@ class TestFillHonestyHelpers(unittest.TestCase):
     def test_rh_cancel_unfilled_success(self):
         rh = br.RobinhoodAdapter.__new__(br.RobinhoodAdapter)
         rh.cancel_order = MagicMock(return_value=(True, "cancelled"))
-        status, spent, oid = rh._rh_cancel_unfilled("oid1", "confirmed", is_crypto=False)
+        status, spent, oid = rh._rh_cancel_unfilled("oid1", "confirmed", is_crypto=True)
         self.assertIn("cancelled", status.lower())
         self.assertEqual(spent, 0.0)
         self.assertIsNone(oid)
+
+    def test_rh_equity_unfilled_left_working(self):
+        rh = br.RobinhoodAdapter.__new__(br.RobinhoodAdapter)
+        rh.cancel_order = MagicMock(return_value=(True, "cancelled"))
+        status, spent, oid = rh._rh_cancel_unfilled("oid1", "queued", is_crypto=False)
+        self.assertIn("left working", status.lower())
+        rh.cancel_order.assert_not_called()
+        self.assertEqual(oid, "oid1")
 
     def test_rh_cancel_unfilled_fail(self):
         rh = br.RobinhoodAdapter.__new__(br.RobinhoodAdapter)
         rh.cancel_order = MagicMock(return_value=(False, "network"))
         status, spent, oid = rh._rh_cancel_unfilled("oid1", "confirmed", is_crypto=True)
-        self.assertIn("cancel failed", status.lower())
+        self.assertIn("left working", status.lower())
         self.assertEqual(spent, 0.0)
         self.assertEqual(oid, "oid1")
 

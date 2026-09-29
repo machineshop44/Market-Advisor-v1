@@ -897,7 +897,7 @@ class RobinhoodAdapter(BaseBroker):
         if iid:
             return True, iid, ""
         hint = ""
-        if clean.endswith("Q") and len(clean) >= 4:
+        if len(clean) == 5 and clean.isalpha() and clean.endswith("Q"):
             hint = " (OTC/delisted *Q — often sell-only in Robinhood app, not API)"
         return False, None, (
             f"RH has no tradeable instrument for {clean}{hint}. "
@@ -1914,7 +1914,10 @@ class CoinbaseAdapter(BaseBroker):
             "AMC", "SMCI", "GME", "MULN", "FFIE", "NIO", "RIVN", "LCID", "SOFI",
         }
         # is_crypto=True bypasses equity block for shared ticker codes traded as crypto
-        if not is_crypto and (clean in equity_block or clean.endswith("Q") and len(clean) >= 4):
+        if not is_crypto and (
+            clean in equity_block
+            or (len(clean) == 5 and clean.isalpha() and clean.endswith("Q"))
+        ):
             return 0.0
 
         if self.is_connected and self.client:
@@ -2148,7 +2151,26 @@ class CoinbaseAdapter(BaseBroker):
         try:
             # Full exit: use available balance (not hold) and prefer native close_position.
             if sell_all:
+                try:
+                    want = float(shares_val or 0.0)
+                except (TypeError, ValueError):
+                    want = 0.0
                 avail = self._available_base_qty(clean)
+                # A just-cancelled protective stop keeps its coins on hold for a moment.
+                tries = 0
+                while want > 0 and avail < want * 0.95 and tries < 5:
+                    time.sleep(0.8)
+                    avail = max(avail, self._available_base_qty(clean))
+                    tries += 1
+                if want > 0 and avail < want * 0.95:
+                    avail_dust, _ = self.position_is_dust(clean, avail, price, asset_type)
+                    want_dust, _ = self.position_is_dust(clean, want, price, asset_type)
+                    if avail_dust and not want_dust:
+                        return (
+                            f"Fail: Coinbase hold not released (available {avail:g} < "
+                            f"position {want:g}) — retry shortly",
+                            None,
+                        )
                 if avail > 0:
                     shares_val = avail
 

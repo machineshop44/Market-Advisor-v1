@@ -335,6 +335,17 @@ def new_snags_for_alert(
     return out
 
 
+def alert_header_severity(new_items: list | None) -> str:
+    """Worst severity among the snags being alerted (not the whole desk's sticky status)."""
+    rank = {SEV_CRITICAL: 0, SEV_WARN: 1, SEV_INFO: 2}
+    best = None
+    for snag in new_items or []:
+        sev = str((snag or {}).get("severity") or SEV_INFO)
+        if best is None or rank.get(sev, 9) < rank.get(best, 9):
+            best = sev
+    return best or SEV_INFO
+
+
 def current_snag_alert_keys(report: dict | None) -> set:
     """Keys for currently-active snags (WARN+). Drop cleared snags so a later re-break can alert."""
     rank = {SEV_CRITICAL: 0, SEV_WARN: 1, SEV_INFO: 2}

@@ -2656,7 +2656,9 @@ class MarketAdvisorGUI(QMainWindow):
                 mark = 0.0
             # Lazy journal VWAP only when broker+cache can't supply a sane basis
             jvwap = 0.0
-            if cb_mod.usable_cost(cost, mark) <= 0 and cb_mod.usable_cost(cached, mark) <= 0:
+            if (
+                cb_mod.usable_cost(cost, mark) <= 0 and cb_mod.usable_cost(cached, mark) <= 0
+            ) or (mark <= 0 and cost > 0 and cb_mod.usable_cost(cached, mark) <= 0):
                 if journal_rows is None:
                     journal_rows = self._journal_rows_for_basis()
                 try:
@@ -4872,9 +4874,13 @@ class MarketAdvisorGUI(QMainWindow):
                         "E*TRADE": "ETRADE",
                     }.get(broker_name, broker_name)
                     eff_eq, eff_bp, _ = self.get_effective_balances(broker_name)
-                    pos_val = max(0.0, float(eff_eq or p_val) - float(eff_bp or bp))
+                    # DD tracks total equity — locked-set membership changes intraday
+                    # and would jump effective equity vs the day-open watermark.
+                    dd_eq = float(p_val or eff_eq or 0.0)
+                    dd_cash = float(bp or eff_bp or 0.0)
+                    pos_val = max(0.0, dd_eq - dd_cash)
                     recovered, rec_msg = maybe_recover_peak_for_cash_heavy_book(
-                        bid, eff_eq or p_val, eff_bp or bp, pos_val, settings=self.settings,
+                        bid, dd_eq, dd_cash, pos_val, settings=self.settings,
                     )
                     if recovered and rec_msg:
                         self.log_event(f"[DD] [{broker_name}] {rec_msg}")
@@ -4886,7 +4892,7 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                     triggered, dd_msg = update_equity_drawdown(
                         bid,
-                        float(eff_eq or p_val),
+                        dd_eq,
                         posture=posture_b,
                         settings=self.settings,
                     )
@@ -6730,7 +6736,7 @@ class MarketAdvisorGUI(QMainWindow):
             if not new_items:
                 self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
                 return
-            lines = [f"**Desk watchdog** ({report.get('status', '?').upper()})"]
+            lines = [f"**Desk watchdog** ({dw.alert_header_severity(new_items).upper()})"]
             snag_brokers = []
             for s in new_items[:4]:
                 bname = str(s.get("broker") or "").strip()
@@ -13417,9 +13423,22 @@ class MarketAdvisorGUI(QMainWindow):
             "queued": True,
         }
 
+    def _advisor_repeat_miss_park(self, broker, ticker):
+        from activity_log_util import advisor_repeat_miss_spec
+
+        key = (str(broker or ""), str(ticker or "").upper())
+        if not key[0] or not key[1]:
+            return None
+        store = getattr(self, "_advisor_miss_times", None)
+        if store is None:
+            store = self._advisor_miss_times = {}
+        times, park = advisor_repeat_miss_spec(store.get(key) or [], time.time())
+        store[key] = times
+        return park
+
     def _on_advisor_buy_done(self, payload, proposal_id):
         import advisor_queue as aq
-        from activity_log_util import advisor_miss_park_spec
+        from activity_log_util import advisor_miss_park_spec, advisor_miss_reason
 
         payload = payload or {}
         prop0 = aq.get(proposal_id) or {}
@@ -13450,22 +13469,14 @@ class MarketAdvisorGUI(QMainWindow):
 
         buys_done = int(payload.get("buys_done") or 0)
         notes = payload.get("notes") or []
-        why = notes[0] if notes else "buy did not fill — proposal restored to pending"
-        # Prefer the most specific fill status when present.
-        for fill in payload.get("fills") or []:
-            st = str((fill or {}).get("status") or "")
-            if st and (
-                "consecutive-loss" in st.lower()
-                or "fail" in st.lower()
-                or "skipped" in st.lower()
-            ):
-                why = st
-                break
+        why = advisor_miss_reason(notes, payload.get("fills"))
         for n in notes:
             if advisor_miss_park_spec(str(n)):
                 why = n
                 break
         park = advisor_miss_park_spec(str(why)) if buys_done <= 0 else None
+        if buys_done <= 0 and not park:
+            park = self._advisor_repeat_miss_park(broker0, prop0.get("ticker"))
         if park:
             cooldown, tag = park
             prop = aq.get(proposal_id) or {}
@@ -18166,7 +18177,7 @@ class MarketAdvisorGUI(QMainWindow):
         try:
             from scoring import update_equity_drawdown
             update_equity_drawdown(
-                broker_id, float(equity or 0),
+                broker_id, float(equity or 0) + float(_locked or 0),
                 posture=posture_for_broker(broker_name, self.settings, equity=equity),
                 settings=self.settings,
             )
@@ -18545,6 +18556,26 @@ class MarketAdvisorGUI(QMainWindow):
                 return False
             ft = fund.get("ticker") or ""
             ftu = str(ft).upper()
+            if bool(self.settings.get("consecutive_loss_guard", True)):
+                try:
+                    import loss_streak as ls
+                    if _auto_cycle.rotate_would_trip_loss_guard(
+                        float(fund.get("roi") or 0),
+                        ls.streak_count(broker_name),
+                        int(self.settings.get("consecutive_loss_max", 3) or 3),
+                    ):
+                        self._throttled_buy_skip_note(
+                            notes, broker_name, "rotate_loss_guard",
+                            _auto_cycle.format_rotate_skip_note(
+                                broker_name,
+                                f"selling {ftu} at a loss would trip the consecutive-loss "
+                                f"guard and block the {candidate_ticker} buy",
+                            ),
+                            cooldown_sec=720,
+                        )
+                        return False
+                except Exception:
+                    pass
             meta = holdings_by_ticker.get(ftu) or {}
             shares = float(meta.get("shares") or fund.get("shares") or 0.0)
             price = float(fund.get("price") or 0.0)
@@ -19801,7 +19832,7 @@ class MarketAdvisorGUI(QMainWindow):
                 price = broker.get_live_price(ticker) if broker else 0.0
                 if not price or price <= 0:
                     tu = str(ticker or "").upper()
-                    if tu.endswith("Q") and len(tu) >= 4:
+                    if _auto_cycle.is_bankruptcy_q_ticker(tu):
                         msg = (
                             "HOLD (Untradeable — no quote; OTC/delisted *Q — "
                             "try Robinhood app)"
@@ -20141,7 +20172,7 @@ class MarketAdvisorGUI(QMainWindow):
                     {"ticker": tick, "type": a.get("type", "")},
                     broker_name=broker_name,
                 )
-                if locked and tick.endswith("Q"):
+                if locked and _auto_cycle.is_bankruptcy_q_ticker(tick):
                     otc_skipped.append(tick)
                     continue
                 kept.append(a)

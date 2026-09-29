@@ -166,8 +166,15 @@ def resolve_holding_cost(
     """
     tracked = usable_cost(tracked_cache, mark)
     jvwap = usable_cost(journal_vwap, mark)
-    broker = usable_cost(broker_cost, mark)
     known = usable_cost(last_known, mark)
+    ref = mark
+    try:
+        if float(mark or 0.0) <= 0:
+            # No mark this read — a dust broker avg (LINK @ $0.02) must not beat a known basis.
+            ref = max(tracked, jvwap, known)
+    except (TypeError, ValueError):
+        ref = max(tracked, jvwap, known)
+    broker = usable_cost(broker_cost, ref)
 
     if broker > 0:
         return broker, "broker"

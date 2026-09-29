@@ -16,6 +16,6 @@ def test_insufficient_fund_sell_ttl_is_long():
     assert ttl >= 6 * 3600
 
 
-def test_empty_response_still_long():
+def test_empty_response_sell_retries_within_15m():
     ttl = alu.sell_fail_ttl_for_status("Fail: RH crypto sell NEAR returned empty response (None)")
-    assert ttl >= 7200
+    assert 5 * 60 <= ttl <= 15 * 60

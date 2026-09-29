@@ -157,8 +157,11 @@ def explain_no_buys_after_rank(
 def sell_fail_ttl_for_status(status, *, default_ttl=1800) -> int:
     """Backoff length by fail class — session-stale should not park a sell for 30m."""
     low = str(status or "").lower()
+    if "hold not released" in low:
+        return 2 * 60
     if "empty response" in low or "returned empty" in low:
-        return max(int(default_ttl or 1800), 7200)  # ≥2h RH crypto empty
+        # Exits must retry: BONK 9/27 slid −4%→−7% across 2h empty-response parks.
+        return 15 * 60
     # Ghost / sync lag positions: hammering every 30m burns log + API.
     if "insufficient_fund" in low or "insufficient balance" in low:
         return max(int(default_ttl or 1800), 6 * 3600)  # ≥6h
@@ -236,7 +239,70 @@ def advisor_miss_park_spec(why: str) -> tuple[float, str] | None:
         return (30.0 * 60.0, "no_bp")
     if "daily rotate cap" in low or "rotate cap" in low:
         return (30.0 * 60.0, "rotate_cap")
+    if (
+        "no rh crypto quote" in low
+        or "crypto quote invalid" in low
+        or "no quote" in low
+        or "not tradable" in low
+        or "not tradeable" in low
+    ):
+        return (60.0 * 60.0, "no_quote")
+    if "policy / size / empty after filter" in low:
+        return (15.0 * 60.0, "policy_filtered")
     return None
+
+
+def advisor_repeat_miss_spec(
+    miss_times: list,
+    now: float,
+    *,
+    window_sec: float = 600.0,
+    threshold: int = 3,
+    cooldown_sec: float = 20.0 * 60.0,
+) -> tuple[list, tuple[float, str] | None]:
+    """
+    Record one execute-miss at ``now``; park after ``threshold`` misses in ``window_sec``.
+    Returns (pruned_times, park_spec_or_None).
+    """
+    times = [float(t) for t in (miss_times or []) if now - float(t) < window_sec]
+    times.append(float(now))
+    if len(times) >= max(1, int(threshold)):
+        return [], (float(cooldown_sec), "repeat_miss")
+    return times, None
+
+
+_ADVISOR_INFO_NOTE_BITS = (
+    "advisor dollars cap",
+    "session size",
+    "cost basis seeded",
+    "frac policy",
+    "fractional qty",
+)
+
+
+def advisor_miss_reason(notes, fills=None) -> str:
+    """
+    Pick the note that explains why an approved advisor buy did not fill.
+    Informational sizing notes (dollars cap, session size) are never the reason.
+    """
+    for fill in fills or []:
+        st = str((fill or {}).get("status") or "")
+        low = st.lower()
+        if st and ("consecutive-loss" in low or "fail" in low or "skipped" in low):
+            return st
+    reasons = []
+    for n in notes or []:
+        s = str(n or "")
+        low = s.lower()
+        if not s or any(bit in low for bit in _ADVISOR_INFO_NOTE_BITS):
+            continue
+        reasons.append(s)
+    for s in reasons:
+        if advisor_miss_park_spec(s):
+            return s
+    if reasons:
+        return reasons[0]
+    return "buy did not fill — proposal restored to pending"
 
 
 def sell_fail_should_skip(store, broker, ticker, *, now=None, ttl_sec=1800):
