@@ -43,6 +43,8 @@ TTP_PARTIAL_SCALE_PCT = 0.45
 # After the partial scale-out banks profit, the runner trails wider (9/20–9/29: winners
 # exited at +4.6% avg while the 4h high averaged +6.6%).
 RUNNER_TRAIL_MULT = 1.5
+# Armed TTP exits never below cost + round-trip fees + this margin.
+TTP_LOCK_MIN_OVER_FEES = 0.003
 # Peak DD pause needs agreeing balance reads (like balance_guard day-loss trip).
 PEAK_DD_CONFIRM_READS = 3
 
@@ -117,9 +119,6 @@ STOCK_COOLDOWN = 20 * 60    # 20 minutes after selling stocks
 CRYPTO_TRADE_LOCK_SEC = 600  # post-fill lock — longer for crypto
 STOCK_TRADE_LOCK_SEC = 300   # equities stay at 5m
 HARD_STOP_COOLDOWN_MULT = 2.0  # hard-stop exits get a longer per-ticker lockout
-LOSS_STREAK_WINDOW_SEC = 90 * 60
-LOSS_STREAK_TRIGGER = 3        # hard stops in window → broker-wide new-buy pause
-LOSS_STREAK_PAUSE_SEC = 45 * 60
 
 # Crypto entry bar: don't spray $5 tickets when edge ≪ ~2% RT
 CRYPTO_MIN_SCORE_FOR_ENTRY = 55.0
@@ -150,7 +149,6 @@ REGIME_BROKER_RING_MAX = 72         # keep ~3d of hourly broker closes
 # Pro risk stack — risk $ per trade is posture/settings tunable (see RISK_POSTURE_PROFILES)
 RISK_PCT_PER_TRADE = 0.0075       # 0.75% of equity risked per trade (Balanced default)
 DEFAULT_MAX_OPEN_RISK_PCT = 0.06  # soft book heat: sum of stop-risk $ ≤ 6% equity
-CASH_RESERVE_PCT = 0.12           # leave 12% buying power undeployed (overridden by target_bp_utilization)
 DEFAULT_TARGET_BP_UTILIZATION = 0.88  # deploy most usable BP; idle cash does not earn
 DEFAULT_SIZING_FOCUS_SLOTS = 6    # size as if filling next N tickets — not all max_open slots
 MAX_CRYPTO_BOOK_FRAC = 0.30       # max crypto share on multi-asset brokers (RH); ~$34 on a $115 book
@@ -178,8 +176,6 @@ _fill_feedback_state = {
     "size_mult": 1.0,
     "last_note": "",
 }
-STOCK_LIMIT_FILL_TIMEOUT = 45     # cancel unfilled stock limits after N seconds
-PRICE_STALE_SECONDS = 120         # reject buys if live quote older than this (when timestamped)
 # Strong buy_rank_score may stretch slot/alloc aim (still hard-capped by risk $ / soft name / deployable)
 CONVICTION_ALLOC_MULT_MAX = 1.50  # top-ranked setup → up to 1.5× slot/alloc aim
 CONVICTION_SCORE_FLOOR = 65.0     # at/below → 1.0× (baseline)
@@ -248,7 +244,7 @@ RISK_POSTURE_PROFILES = {
         "exit_time_scale": 1.0,
         "ttp_arm_scale": 1.0,
         "allow_flat_time_banks": False,  # TTP trail only for green exits
-        "allow_scale_in": True,
+        "allow_scale_in": False,
         "scale_in_size_frac": 0.50,
         "scale_in_max_adds": 1,
         "scale_in_roi_min": -0.025,  # −2.5% … −1.0% underwater
@@ -280,7 +276,7 @@ RISK_POSTURE_PROFILES = {
         "exit_time_scale": 1.30,  # wait longer before time-green
         "ttp_arm_scale": 1.25,    # arm trail later — let winners run
         "allow_flat_time_banks": True,  # high-bar escape only after local turn
-        "allow_scale_in": True,
+        "allow_scale_in": False,
         "scale_in_size_frac": 0.60,
         "scale_in_max_adds": 1,
         "scale_in_roi_min": -0.029,  # near stop_floor; wider than balanced
@@ -314,7 +310,7 @@ RISK_POSTURE_PROFILES = {
         "exit_time_scale": 0.80,
         "ttp_arm_scale": 0.75,
         "allow_flat_time_banks": True,
-        "allow_scale_in": True,
+        "allow_scale_in": False,
         "scale_in_size_frac": 0.55,
         "scale_in_max_adds": 1,
         "scale_in_roi_min": -0.022,
@@ -1102,7 +1098,7 @@ def apply_small_ticket_exit_nudge(
         return out
     # Tiny position (under ~$40) or micro book: arm trail sooner (~12% tighter)
     scale = 0.88 if hv <= 0 or hv >= 15.0 else 0.82
-    for key in ("ttp_arm", "time_profit_roi", "time_profit_min", "time_stop_roi"):
+    for key in ("ttp_arm",):
         if key in out and out[key] is not None:
             try:
                 val = float(out[key])
@@ -1121,6 +1117,27 @@ def runner_trail_pct(base_trail, partial_done) -> float:
     except (TypeError, ValueError):
         t = 0.0
     return t * RUNNER_TRAIL_MULT if partial_done else t
+
+
+def ttp_trigger_price(highest, avg_cost, trail, fee_rt) -> float:
+    """
+    Trail exit price, floored at cost + round-trip fees + TTP_LOCK_MIN_OVER_FEES so an
+    armed trail never books a net loss. Floor only applies once the peak cleared it.
+    """
+    try:
+        hi = float(highest or 0.0)
+        avg = float(avg_cost or 0.0)
+        tr = abs(float(trail or 0.0))
+        rt = max(0.0, float(fee_rt or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    trail_px = hi * (1.0 - tr)
+    if avg <= 0:
+        return trail_px
+    floor_px = avg * (1.0 + rt + TTP_LOCK_MIN_OVER_FEES)
+    if hi > floor_px:
+        return max(trail_px, floor_px)
+    return trail_px
 
 
 def ttp_partial_scale_eligible(
@@ -1223,7 +1240,6 @@ _protective_orders = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> {order_id, 
 _scale_in_counts = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> adds already taken
 _scale_in_last_ts = {b: {} for b in _KNOWN_BROKER_IDS}  # ticker -> last scale-in attempt/fill ts
 # broker -> {"events": [ts, ...], "pause_until": float}
-_loss_streak = {b: {"events": [], "pause_until": 0.0} for b in _KNOWN_BROKER_IDS}
 # Per-broker equity high-water + day open for drawdown pauses
 _equity_dd = {
     b: {
@@ -1286,41 +1302,85 @@ def _crypto_yf_symbol(ticker):
     return f"{clean}-USD" if clean else ""
 
 
+SALE_DETECT_MIN_SEC = 900
+_sale_detect_timeout_sec = SALE_DETECT_MIN_SEC
+_broker_last_holding_eval = {}
+
+
+def configure_sale_detect(interval_portfolio_sec):
+    """Fallback sold-detection window: never shorter than 4 portfolio passes."""
+    global _sale_detect_timeout_sec
+    try:
+        iv = float(interval_portfolio_sec or 0)
+    except (TypeError, ValueError):
+        iv = 0.0
+    _sale_detect_timeout_sec = max(float(SALE_DETECT_MIN_SEC), 4.0 * iv)
+    return _sale_detect_timeout_sec
+
+
+def _drop_position_memory(broker_id, ticker):
+    _portfolio_memory.get(broker_id, {}).pop(ticker, None)
+    if broker_id in _scale_in_counts:
+        _scale_in_counts[broker_id].pop(ticker, None)
+    if broker_id in _scale_in_last_ts:
+        _scale_in_last_ts[broker_id].pop(ticker, None)
+
+
+def mark_position_closed(broker_id, ticker, exit_price=0.0):
+    """Confirmed full exit: cooldown + clear TTP/peak memory now (not on the timeout)."""
+    broker_id = _normalize_broker_id(broker_id)
+    mem = _portfolio_memory.get(broker_id) or {}
+    raw = str(ticker or "").upper().strip()
+    base = raw.replace("-USD", "")
+    key = next((k for k in (ticker, raw, base, f"{base}-USD") if k in mem), None)
+    if key is None:
+        return False
+    data = mem[key]
+    _cooldown_memory.setdefault(broker_id, {})
+    _apply_cooldown(
+        broker_id, key,
+        sell_price=float(exit_price or 0) or data.get("highest") or 0.0,
+        reason=data.get("exit_reason") or "",
+    )
+    _drop_position_memory(broker_id, key)
+    save_state(force=True)
+    return True
+
+
 def _auto_detect_sales(broker_id):
     """
-    Moves tickers from portfolio memory to cooldown if they haven't been
-    evaluated as a holding in the last 3 minutes (GUI sold them).
-    Isolated per broker so CB doesn't delete RH memory.
+    Fallback: move tickers to cooldown when they stop being evaluated as holdings
+    (sold outside a confirmed-fill path). Skips when the whole broker was idle
+    (disarm, reauth, restart) — stale last_eval there is not evidence of a sale.
     """
     broker_id = _normalize_broker_id(broker_id)
     if broker_id not in _portfolio_memory: return
     if broker_id not in _cooldown_memory: _cooldown_memory[broker_id] = {}
 
     now = time.time()
+    timeout = float(_sale_detect_timeout_sec)
+    last_pass = float(_broker_last_holding_eval.get(broker_id) or 0.0)
+    if not last_pass or now - last_pass > timeout:
+        for data in _portfolio_memory[broker_id].values():
+            data['last_eval'] = now
+        _broker_last_holding_eval[broker_id] = now
+        return
     sold_tickers = []
     for ticker, data in _portfolio_memory[broker_id].items():
-        if now - data['last_eval'] > 180:
-            reason = data.get("exit_reason") or ""
-            # Avoid double-counting streak if evaluate_holding already recorded hard_stop
-            already = bool(data.get("loss_recorded"))
+        if now - data['last_eval'] > timeout:
             _apply_cooldown(
                 broker_id, ticker,
                 sell_price=data.get("highest") or 0.0,
-                reason=reason,
-                record_streak=(reason == "hard_stop" and not already),
+                reason=data.get("exit_reason") or "",
             )
             sold_tickers.append(ticker)
 
     for t in sold_tickers:
-        del _portfolio_memory[broker_id][t]
-        if broker_id in _scale_in_counts:
-            _scale_in_counts[broker_id].pop(t, None)
-        if broker_id in _scale_in_last_ts:
-            _scale_in_last_ts[broker_id].pop(t, None)
+        _drop_position_memory(broker_id, t)
 
 
-def _apply_cooldown(broker_id, ticker, sell_price, reason="", record_streak=False):
-    """Write per-ticker cooldown; optionally bump hard-stop loss streak."""
+def _apply_cooldown(broker_id, ticker, sell_price, reason=""):
+    """Write per-ticker re-entry cooldown (loss streaks live in loss_streak.py)."""
     broker_id = _normalize_broker_id(broker_id)
     if broker_id not in _cooldown_memory:
         _cooldown_memory[broker_id] = {}
@@ -1330,37 +1390,6 @@ def _apply_cooldown(broker_id, ticker, sell_price, reason="", record_streak=Fals
         "sell_time": time.time(),
         "reason": str(reason or ""),
     }
-    if record_streak and reason == "hard_stop":
-        _record_hard_stop_streak(broker_id)
-
-
-def _record_hard_stop_streak(broker_id):
-    """Track clustered hard stops; pause new buys after LOSS_STREAK_TRIGGER hits."""
-    broker_id = _normalize_broker_id(broker_id)
-    if broker_id not in _loss_streak:
-        _loss_streak[broker_id] = {"events": [], "pause_until": 0.0}
-    now = time.time()
-    state = _loss_streak[broker_id]
-    events = [t for t in (state.get("events") or []) if now - float(t) <= LOSS_STREAK_WINDOW_SEC]
-    events.append(now)
-    state["events"] = events[-12:]
-    if len(events) >= LOSS_STREAK_TRIGGER:
-        state["pause_until"] = max(float(state.get("pause_until") or 0.0), now + LOSS_STREAK_PAUSE_SEC)
-        # Reset window so one pause does not instantly re-trigger
-        state["events"] = []
-    save_state(force=True)
-
-
-def _loss_streak_block(broker_id):
-    """Return (blocked, reason) when broker is in a loss-streak pause."""
-    broker_id = _normalize_broker_id(broker_id)
-    state = _loss_streak.get(broker_id) or {}
-    pause_until = float(state.get("pause_until") or 0.0)
-    now = time.time()
-    if pause_until > now:
-        mins = int((pause_until - now) / 60) + 1
-        return False, f"DO NOT BUY (Loss-streak pause: {mins}m left)"
-    return True, ""
 
 
 def _local_day_key():
@@ -1658,10 +1687,6 @@ def _check_hysteresis(ticker, current_price, is_crypto, broker_id):
     if broker_id not in _cooldown_memory: _cooldown_memory[broker_id] = {}
     _auto_detect_sales(broker_id)
 
-    allowed, reason = _loss_streak_block(broker_id)
-    if not allowed:
-        return False, reason
-
     allowed, reason = _drawdown_block(broker_id)
     if not allowed:
         return False, reason
@@ -1715,7 +1740,6 @@ def save_state(force=False):
             "protective": _protective_orders,
             "scale_in_counts": _scale_in_counts,
             "scale_in_last_ts": _scale_in_last_ts,
-            "loss_streak": _loss_streak,
             "equity_dd": _equity_dd,
             "regime_last_good": _regime_last_good,
             "regime_broker_hourly": _broker_hourly_closes,
@@ -1741,7 +1765,7 @@ def load_state():
     """Restore TTP/cooldown/protective/regime memory from disk."""
     global _portfolio_memory, _cooldown_memory, _protective_orders, _scale_in_counts
     global _scale_in_last_ts
-    global _loss_streak, _regime_last_good, _broker_hourly_closes, _rotate_day_counts
+    global _regime_last_good, _broker_hourly_closes, _rotate_day_counts
     global _equity_dd
     if not os.path.exists(STATE_FILE):
         return False
@@ -1781,23 +1805,6 @@ def load_state():
                         _scale_in_last_ts[bid][str(k).upper()] = float(v)
                     except (TypeError, ValueError):
                         pass
-        ls = data.get("loss_streak") or {}
-        if isinstance(ls, dict):
-            for bid in _KNOWN_BROKER_IDS:
-                row = ls.get(bid) or {}
-                if not isinstance(row, dict):
-                    continue
-                events = []
-                for t in row.get("events") or []:
-                    try:
-                        events.append(float(t))
-                    except (TypeError, ValueError):
-                        pass
-                try:
-                    pause_until = float(row.get("pause_until") or 0.0)
-                except (TypeError, ValueError):
-                    pause_until = 0.0
-                _loss_streak[bid] = {"events": events[-12:], "pause_until": pause_until}
         edd = data.get("equity_dd") or {}
         if isinstance(edd, dict):
             for bid in _KNOWN_BROKER_IDS:
@@ -1884,6 +1891,38 @@ def get_stop_distance_pct(broker_id, ticker=None, asset_type="", *, for_sizing=F
 def get_trail_pct(broker_id, ticker=None, asset_type=""):
     fees = atr_adapt_exit_fees(_resolve_fee_profile(broker_id, ticker, asset_type), ticker)
     return float(fees.get("ttp_trail") or 0.008)
+
+
+def broker_day_loss_limit(broker_name_or_id, dollar_limit, settings=None, equity=None):
+    """
+    Per-broker $-loss trip: min(desk $ limit, broker day-open equity × posture pct).
+    The desk $ limit is seeded from combined equity, so applying it whole to every
+    broker would let N brokers lose N× the intended amount.
+    """
+    try:
+        lim = float(dollar_limit or 0.0)
+    except (TypeError, ValueError):
+        lim = 0.0
+    if lim <= 0:
+        return 0.0
+    bid = _normalize_broker_id(broker_name_or_id)
+    try:
+        day_open = float((_equity_dd.get(bid) or {}).get("day_open") or 0.0)
+    except (TypeError, ValueError):
+        day_open = 0.0
+    if day_open <= 0:
+        try:
+            day_open = float(equity or 0.0)
+        except (TypeError, ValueError):
+            day_open = 0.0
+    try:
+        knobs = posture_knobs_for_broker(broker_name_or_id, settings or {})
+        pct = float(knobs.get("daily_loss_limit_equity_pct") or 0.0)
+    except Exception:
+        pct = 0.0
+    if day_open > 0 and pct > 0:
+        return round(min(lim, day_open * pct), 2)
+    return lim
 
 
 def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
@@ -1980,12 +2019,13 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
             risk_dollars += val * float(stop_d)
 
         bp_headroom = max(0.0, bp * util)
-        loss_room = max(0.0, loss_limit + pnl) if loss_limit > 0 else None
+        b_limit = broker_day_loss_limit(name or bid, loss_limit, settings, equity=eq)
+        loss_room = max(0.0, b_limit + pnl) if b_limit > 0 else None
         # $-loss path disarms; DD only pauses buys
-        loss_hit = bool(loss_limit > 0 and pnl <= -loss_limit)
+        loss_hit = bool(b_limit > 0 and pnl <= -b_limit)
         used_pct = 0.0
-        if loss_limit > 0:
-            used_pct = min(100.0, abs(min(0.0, pnl)) / loss_limit * 100.0)
+        if b_limit > 0:
+            used_pct = min(100.0, abs(min(0.0, pnl)) / b_limit * 100.0)
 
         snap = {
             "open_risk_dollars": risk_dollars,
@@ -2001,7 +2041,7 @@ def portfolio_heat_snapshot(broker_rows, settings=None, posture=None):
             "peak_dd_pct": peak_dd_pct,
             "day_dd_pct": day_dd_pct,
             "armed": armed,
-            "loss_limit": loss_limit,
+            "loss_limit": b_limit,
             "loss_room": loss_room,
             "loss_hit": loss_hit,
             "loss_disarmed": bool(loss_hit and not armed),
@@ -2167,13 +2207,19 @@ def risk_sizing_breakdown(equity, buying_power, stop_distance_pct, alloc_ceiling
     except (TypeError, ValueError):
         open_risk = 0.0
     remaining_heat_dollars = max(0.0, eq * book_risk_pct - open_risk)
+    out["remaining_heat"] = round(remaining_heat_dollars, 2)
 
     stop_ok = stop_d > 1e-8
+    if stop_ok and open_risk > 0 and remaining_heat_dollars <= 0.01:
+        out["skip_reason"] = (
+            f"book heat full (open risk ${open_risk:.2f} ≥ "
+            f"{book_risk_pct * 100:.1f}% of equity)"
+        )
+        return out
     if stop_ok:
         risk_size = risk_budget / stop_d
-        if remaining_heat_dollars > 0 and stop_d > 0:
-            heat_cap = remaining_heat_dollars / stop_d
-            risk_size = min(risk_size, heat_cap)
+        heat_cap = remaining_heat_dollars / stop_d
+        risk_size = min(risk_size, heat_cap)
         out["risk_size"] = round(risk_size, 2)
         out["sizing_mode"] = "risk_dollar"
         out["sizing_note"] = ""
@@ -3139,6 +3185,11 @@ def evaluate_scale_in(ticker, current_price, avg_cost, broker_id="ROBINHOOD",
     roi = (px - cost) / cost
     result["roi"] = roi
 
+    # Day-trading standard: never add to a loser (raises $ risk past the sized stop).
+    if roi < 0:
+        result["reason"] = f"no averaging down ({roi*100:.2f}% underwater)"
+        return result
+
     # Never add into/through the hard-stop zone
     hard_stop = -abs(float(get_stop_distance_pct(broker_id, ticker=clean, asset_type=asset_type)))
     # Stay a small buffer above the stop so we don't average into a freefall cut
@@ -3930,6 +3981,7 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     if broker_id not in _portfolio_memory: _portfolio_memory[broker_id] = {}
 
     _auto_detect_sales(broker_id)
+    _broker_last_holding_eval[broker_id] = now
 
     if ticker not in _portfolio_memory[broker_id]:
         _portfolio_memory[broker_id][ticker] = {'highest': current_price, 'buy_time': now, 'last_eval': now}
@@ -3950,7 +4002,6 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
                 broker_id, ticker,
                 sell_price=current_price,
                 reason="hard_stop",
-                record_streak=True,
             )
             mem["loss_recorded"] = True
         save_state(force=True)
@@ -3984,7 +4035,10 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
                 f"Peak: +{peak_roi*100:.2f}%, Now: +{roi*100:.2f}%)"
             )
         trail = runner_trail_pct(fees["ttp_trail"], bool(mem.get("ttp_partial_done")))
-        trail_trigger_price = highest * (1.0 - trail)
+        trail_trigger_price = ttp_trigger_price(
+            highest, avg_cost, trail,
+            estimate_round_trip_fee_pct(broker_id, ticker, asset_type),
+        )
         if current_price <= trail_trigger_price:
             save_state(force=True)
             label = "TTP Runner trail" if mem.get("ttp_partial_done") else "TTP Triggered"
@@ -4088,6 +4142,7 @@ def configure_entry_filters(settings: dict | None) -> None:
     except (TypeError, ValueError):
         pct = ANTI_CHASE_DEFAULT_RUN_PCT
     _anti_chase_cfg["run_pct"] = max(0.5, min(10.0, pct))
+    configure_sale_detect(s.get("interval_portfolio", 45))
 
 
 def chase_run_pct(closes) -> float | None:

@@ -237,7 +237,7 @@ def load_settings():
         "sizing_focus_slots": 6,
         "max_single_name_equity_pct": 15.0,
         "conviction_alloc_mult_max": 1.50,
-        "allow_scale_in": True,
+        "allow_scale_in": False,
         "allow_buys_when_regime_blocked": False,  # live default OFF — set True only to bypass SPY/BTC gate
         "scale_in_max_adds": 1,
         "scale_in_size_frac": 0.50,
@@ -284,6 +284,7 @@ def load_settings():
         "consecutive_loss_pause_minutes": 45,
         "anti_chase_enabled": True,
         "anti_chase_run_pct": 1.5,
+        "manage_exits_when_disarmed": True,
         "advisor_ai_max_per_minute": 4,
         "advisor_ai_max_per_day": 20,
         "advisor_ai_local_when_clear": True,
@@ -1070,7 +1071,7 @@ class FirstRunWizardDialog(QDialog):
             "Disabled Completely",
         ])
         saved_lvl = (getattr(parent, "settings", {}) or {}).get(
-            "discord_alert_level", "All Alerts (Every Trade & Heartbeat)"
+            "discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)"
         )
         idx = self.wiz_alert_combo.findText(saved_lvl)
         if idx >= 0:
@@ -3241,9 +3242,16 @@ class MarketAdvisorGUI(QMainWindow):
         return out
 
     def _after_confirmed_sell_fill(
-        self, broker_name, ticker, asset_type, price, shares_val, reason_blob, *, avg_before=None
+        self, broker_name, ticker, asset_type, price, shares_val, reason_blob, *, avg_before=None,
+        full_exit=False,
     ):
         """PDT day-trade count + consecutive-loss pause after a confirmed sell fill."""
+        if full_exit:
+            try:
+                from scoring import mark_position_closed
+                mark_position_closed(broker_name, ticker, price)
+            except Exception:
+                pass
         if avg_before is None:
             try:
                 avg_before = float(self._avg_cost_for(broker_name, ticker) or 0)
@@ -3281,6 +3289,9 @@ class MarketAdvisorGUI(QMainWindow):
                     )
         except Exception:
             pass
+        if not full_exit:
+            # Partial scale-outs / overnight peels are not closed trades for the streak.
+            return
         try:
             import loss_streak as ls
             px = float(price or 0)
@@ -3410,7 +3421,7 @@ class MarketAdvisorGUI(QMainWindow):
             )
             self._after_confirmed_sell_fill(
                 broker_name, ticker, asset_type, price, sell_qty, reason_blob,
-                avg_before=avg_before,
+                avg_before=avg_before, full_exit=fully_exited,
             )
             return status
         # Live: cancel protective first so reserved shares can sell
@@ -3508,7 +3519,7 @@ class MarketAdvisorGUI(QMainWindow):
             self._after_confirmed_sell_fill(
                 broker_name, ticker, asset_type, price, sold_qty or requested_shares,
                 reason_blob,
-                avg_before=avg_before,
+                avg_before=avg_before, full_exit=bool(sell_all),
             )
         elif filled and partial_peel:
             # Overnight whole-floor peel: leftover fractional stays open — keep basis/TTP.
@@ -3588,7 +3599,7 @@ class MarketAdvisorGUI(QMainWindow):
         if not webhook_url:
             return
 
-        alert_lvl = self.settings.get("discord_alert_level", "All Alerts (Every Trade & Heartbeat)")
+        alert_lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         if alert_lvl == "Disabled Completely":
             return
         # Important Only = critical/urgent + heartbeat; suppress routine trade spam
@@ -3797,7 +3808,7 @@ class MarketAdvisorGUI(QMainWindow):
             return
 
         webhook_url = self.settings.get("discord_webhook", "").strip()
-        alert_lvl = self.settings.get("discord_alert_level", "All Alerts (Every Trade & Heartbeat)")
+        alert_lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         if not webhook_url or alert_lvl == "Disabled Completely":
             return
 
@@ -4431,10 +4442,20 @@ class MarketAdvisorGUI(QMainWindow):
     def _balance_reading_is_suspicious(self, broker_name, new_p, old_p, baseline):
         """True when a new equity print looks like a failed API read, not a real wipe."""
         last_trusted = (getattr(self, "_last_trusted_equity", {}) or {}).get(broker_name)
-        loss_limit = float(self.settings.get("daily_loss_limit", 0.0) or 0.0)
+        loss_limit = self._broker_loss_limit(broker_name, last_trusted or old_p)
         return balance_reading_is_suspicious(
             new_p, old_p, baseline, last_trusted, loss_limit=loss_limit
         )
+
+    def _broker_loss_limit(self, broker_name, equity=0.0):
+        try:
+            from scoring import broker_day_loss_limit
+            return float(broker_day_loss_limit(
+                broker_name, self.settings.get("daily_loss_limit", 0.0),
+                self.settings, equity=float(equity or 0.0),
+            ) or 0.0)
+        except Exception:
+            return float(self.settings.get("daily_loss_limit", 0.0) or 0.0)
 
     def _keep_equity_floor(self, broker_name, old_p=0.0, last_trusted=None):
         """Best non-zero equity to paint while rejecting a glitch wipe."""
@@ -4613,7 +4634,7 @@ class MarketAdvisorGUI(QMainWindow):
                         except Exception:
                             pass
 
-            loss_limit = float(self.settings.get("daily_loss_limit", 0.0) or 0.0)
+            loss_limit = self._broker_loss_limit(name, last_trusted or old_p)
             recent_buy = self._recent_buy_notional_for(name)
 
             # Healthy non-zero read always wins — clear glitch state and repaint Home.
@@ -4953,7 +4974,11 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                     self._disarm_broker(broker_name)
 
-                loss_limit = self.settings.get("daily_loss_limit", 0.0)
+                from scoring import broker_day_loss_limit
+                loss_limit = broker_day_loss_limit(
+                    broker_name, self.settings.get("daily_loss_limit", 0.0),
+                    self.settings, equity=float(p_val or 0.0),
+                )
                 if loss_limit > 0 and pl_val <= -loss_limit:
                     blocked, why = self._day_loss_disarm_blocked(broker_name)
                     if blocked:
@@ -11011,7 +11036,7 @@ class MarketAdvisorGUI(QMainWindow):
             "Important Only: critical alerts, big-win sells, day profit/loss limits, "
             "and hourly heartbeat (routine trade fills are suppressed)."
         )
-        saved_lvl = self.settings.get("discord_alert_level", "All Alerts (Every Trade & Heartbeat)")
+        saved_lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         index = self.discord_lvl_combo.findText(saved_lvl)
         if index >= 0:
             self.discord_lvl_combo.setCurrentIndex(index)
@@ -11079,14 +11104,15 @@ class MarketAdvisorGUI(QMainWindow):
         form_layout.setSpacing(ui_px(6))
 
         scale_box = QHBoxLayout()
-        self.allow_scale_in_chk = QCheckBox("Allow scale-in (add near support on held names)")
-        _si_default = get_risk_posture_profile(saved_posture).get("allow_scale_in", True)
+        self.allow_scale_in_chk = QCheckBox("Allow scale-in (adds on green held names only)")
+        _si_default = get_risk_posture_profile(saved_posture).get("allow_scale_in", False)
         if "allow_scale_in" in self.settings and self.settings.get("allow_scale_in") is not None:
             _si_default = bool(self.settings.get("allow_scale_in"))
         self.allow_scale_in_chk.setChecked(bool(_si_default))
         self.allow_scale_in_chk.setToolTip(
-            "When ON, already-held tickers may get a smaller add near support if ROI "
-            "is in the posture add band. Changing Risk Posture resets scale-in bands."
+            "When ON, already-held tickers may get a smaller add if ROI is in the add band. "
+            "Adds never go into a losing position (no averaging down). Changing Risk "
+            "Posture resets scale-in bands."
         )
         scale_box.addWidget(self.allow_scale_in_chk)
         scale_box.addStretch()
@@ -11374,7 +11400,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.loss_spin = QDoubleSpinBox()
         self.loss_spin.setRange(0.0, 10000.0)
         self.loss_spin.setSingleStep(5.0)
-        self.loss_spin.setValue(self.settings.get("daily_loss_limit", 8.0))
+        self.loss_spin.setValue(self.settings.get("daily_loss_limit", 15.0))
         loss_box.addWidget(self.loss_spin)
         loss_box.addStretch()
         form_layout.addLayout(loss_box)
@@ -11465,6 +11491,19 @@ class MarketAdvisorGUI(QMainWindow):
         chase_row.addWidget(self.anti_chase_spin)
         chase_row.addStretch()
         form_layout.addLayout(chase_row)
+
+        self.manage_exits_chk = QCheckBox(
+            "Keep managing exits (hard stop / TTP) after a broker is disarmed"
+        )
+        self.manage_exits_chk.setChecked(
+            bool(self.settings.get("manage_exits_when_disarmed", True))
+        )
+        self.manage_exits_chk.setToolTip(
+            "Loss limit, profit target, and Halt stop new buys. With this on, positions "
+            "already open keep their software stop and trailing take-profit. Turn off for "
+            "fully hands-off disarm."
+        )
+        form_layout.addWidget(self.manage_exits_chk)
 
         self.session_size_curve_chk = QCheckBox(
             "Session size curve — half-size first 30m RTH; no new equity last 30m"
@@ -12922,6 +12961,28 @@ class MarketAdvisorGUI(QMainWindow):
         broker_name = broker_name or self.cycle_broker_name
         return self.auto_trade_enabled.get(broker_name, False)
 
+    def _exits_managed(self, broker_name=None):
+        """Armed, or disarmed after being armed this session with exit management on."""
+        broker_name = broker_name or self.cycle_broker_name
+        if self.auto_trade_enabled.get(broker_name, False):
+            return True
+        if not bool(self.settings.get("manage_exits_when_disarmed", True)):
+            return False
+        if getattr(self, "_broker_manual_auth_needed", {}).get(broker_name):
+            return False
+        return broker_name in (getattr(self, "_exit_watch_brokers", None) or set())
+
+    def _note_exits_still_managed(self, broker_names):
+        if not bool(self.settings.get("manage_exits_when_disarmed", True)):
+            return
+        watch = getattr(self, "_exit_watch_brokers", None) or set()
+        kept = [b for b in (broker_names or []) if b in watch]
+        if kept:
+            self.log_event(
+                f"[RISK] Exits still managed while disarmed ({', '.join(kept)}) — "
+                f"hard stop / TTP keep running; no new buys. Toggle in Settings."
+            )
+
     def _update_autotrade_ui(self):
         active = [b for b, on in self.auto_trade_enabled.items() if on]
         if hasattr(self, "halt_all_btn"):
@@ -12967,6 +13028,7 @@ class MarketAdvisorGUI(QMainWindow):
             if not (isinstance(item, (tuple, list)) and item and item[0] == broker_name)
         ]
         self.log_event(f"Auto-Trader disabled for {broker_name}.")
+        self._note_exits_still_managed([broker_name])
         self._update_autotrade_ui()
         if notify_discord:
             self.send_discord_alert(
@@ -13113,6 +13175,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.auto_trade_enabled[name] = False
         self._set_etrade_arm_intent(False)
         self.log_event("[HALT] Panic Halt All — all brokers disarmed, queues cleared.")
+        self._note_exits_still_managed(halted)
         self._panic_halted = True
         self._update_autotrade_ui()
         self.publish_monitor_status()
@@ -14258,7 +14321,7 @@ class MarketAdvisorGUI(QMainWindow):
         if hasattr(self, "dd_pause_spin"):
             self.dd_pause_spin.setValue(int(prof.get("dd_pause_minutes", 20)))
         if hasattr(self, "allow_scale_in_chk"):
-            self.allow_scale_in_chk.setChecked(bool(prof.get("allow_scale_in", True)))
+            self.allow_scale_in_chk.setChecked(bool(prof.get("allow_scale_in", False)))
         self.settings["advanced_scale_in_override"] = False
         self.log_event(
             "[COACH] Applied Growth preset (3 slots, 1 buy/cycle, peak DD 14%, faster green takes)."
@@ -15575,6 +15638,9 @@ class MarketAdvisorGUI(QMainWindow):
             self._enable_live_orders_on_arm(broker_name)
             self._seed_session_start_for_arm(broker_name)
             self.auto_trade_enabled[broker_name] = True
+            if getattr(self, "_exit_watch_brokers", None) is None:
+                self._exit_watch_brokers = set()
+            self._exit_watch_brokers.add(broker_name)
             self._panic_halted = False
             self._set_broker_arm_intent(broker_name, True)
             # Force an immediate first pulse for this broker (don't wait a full interval)
@@ -15599,6 +15665,7 @@ class MarketAdvisorGUI(QMainWindow):
         self.log_event(f"Auto-Trader DISARMED ({mode}) for all brokers — stopped: {stopped}.")
         for broker_name in was:
             self.log_event(f"[{broker_name}] Auto-Trader disabled.")
+        self._note_exits_still_managed(was)
         self._update_autotrade_ui()
         if notify_discord:
             self.send_discord_alert(
@@ -15768,6 +15835,18 @@ class MarketAdvisorGUI(QMainWindow):
                 self._apply_view_mode_tabs()
         # Never hide/show tabs mid-cycle based on auto context — view_mode owns that.
 
+    def _maybe_queue_exit_only(self, broker_name, now):
+        """Disarmed broker: keep PORTFOLIO (sell checks) running so stops/TTP still fire."""
+        if not self._exits_managed(broker_name):
+            return
+        broker = self.brokers.get(broker_name)
+        if not self.paper_mode and not (broker and getattr(broker, "is_connected", False)):
+            return
+        if now - self.last_port_time.get(broker_name, 0) >= self._portfolio_interval_sec(broker_name):
+            task = (broker_name, "PORTFOLIO")
+            if task not in self.task_queue:
+                self.task_queue.append(task)
+
     def director_tick(self):
         now = time.time()
         self.update_market_status()
@@ -15805,6 +15884,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         for broker_name, enabled in self.auto_trade_enabled.items():
             if not enabled:
+                self._maybe_queue_exit_only(broker_name, now)
                 continue
             # Auth dead — do not enqueue more work (disarm should already have run)
             if getattr(self, "_broker_manual_auth_needed", {}).get(broker_name):
@@ -16170,7 +16250,8 @@ class MarketAdvisorGUI(QMainWindow):
         self._stall_alerted = False
         self._running_cycle_gen = int(getattr(self, "_cycle_gen", 0) or 0)
         broker_name, task = self.task_queue.pop(0)
-        if not self.auto_trade_enabled.get(broker_name):
+        exit_only = task == "PORTFOLIO" and self._exits_managed(broker_name)
+        if not self.auto_trade_enabled.get(broker_name) and not exit_only:
             self.log_event(f"[AUTO] Skipping {task} on {broker_name} (disarmed)")
             self.cycle_finished()
             return
@@ -17042,8 +17123,14 @@ class MarketAdvisorGUI(QMainWindow):
         try:
             heat = getattr(self, "_last_portfolio_heat", None) or {}
             if isinstance(heat, dict):
-                combined = heat.get("combined") if isinstance(heat.get("combined"), dict) else heat
-                open_risk = float(combined.get("open_risk_dollars") or 0.0)
+                by_b = heat.get("by_broker") if isinstance(heat.get("by_broker"), dict) else {}
+                mine = by_b.get(self.cycle_broker_name)
+                if isinstance(mine, dict):
+                    # Equity passed to sizing is this broker's — compare like with like.
+                    open_risk = float(mine.get("open_risk_dollars") or 0.0)
+                else:
+                    combined = heat.get("combined") if isinstance(heat.get("combined"), dict) else heat
+                    open_risk = float(combined.get("open_risk_dollars") or 0.0)
         except (TypeError, ValueError, AttributeError):
             open_risk = 0.0
         # Fill-quality size shrink (conservative)
@@ -20359,7 +20446,7 @@ class MarketAdvisorGUI(QMainWindow):
             for n in notes_tmp:
                 self.log_event(n)
 
-        if actionable and self._is_broker_auto_trading():
+        if actionable and self._exits_managed(broker):
             self._set_engine_banner(f"🤖 💰 [{broker}] PORTFOLIO — executing...", "#00897B")
             self.run_cycle_thread(
                 self._bg_execute_sell_batch,
@@ -20840,7 +20927,7 @@ class MarketAdvisorGUI(QMainWindow):
         if lbl is None:
             return
         wh = bool(str(self.settings.get("discord_webhook") or "").strip())
-        lvl = self.settings.get("discord_alert_level", "All Alerts (Every Trade & Heartbeat)")
+        lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         lbl.setText(_auto_cycle.format_discord_settings_summary(webhook_set=wh, level=str(lvl)))
 
     def _update_advisor_settings_summary(self):
@@ -21225,6 +21312,8 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["anti_chase_enabled"] = bool(self.anti_chase_chk.isChecked())
         if hasattr(self, "anti_chase_spin"):
             self.settings["anti_chase_run_pct"] = float(self.anti_chase_spin.value())
+        if hasattr(self, "manage_exits_chk"):
+            self.settings["manage_exits_when_disarmed"] = bool(self.manage_exits_chk.isChecked())
         if hasattr(self, "session_size_curve_chk"):
             self.settings["session_size_curve_enabled"] = bool(
                 self.session_size_curve_chk.isChecked()

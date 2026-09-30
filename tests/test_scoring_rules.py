@@ -16,7 +16,6 @@ class TestHardStopCooldown(unittest.TestCase):
         for bid in scoring._KNOWN_BROKER_IDS:
             scoring._cooldown_memory[bid] = {}
             scoring._portfolio_memory[bid] = {}
-            scoring._loss_streak[bid] = {"events": [], "pause_until": 0.0}
 
     def test_hard_stop_doubles_lockout(self):
         import scoring
@@ -27,19 +26,13 @@ class TestHardStopCooldown(unittest.TestCase):
         # Normal stock cooldown is 20m; hard-stop uses 2x → still locked at ~1m elapsed
         self.assertGreaterEqual(scoring.STOCK_COOLDOWN * scoring.HARD_STOP_COOLDOWN_MULT, 30 * 60)
 
-    def test_loss_streak_pauses_new_buys(self):
+    def test_hard_stops_no_longer_trip_hidden_scoring_pause(self):
         import scoring
-        now = time.time()
-        with patch("scoring.time.time", return_value=now):
-            for _ in range(scoring.LOSS_STREAK_TRIGGER):
-                scoring._record_hard_stop_streak("COINBASE")
-            allowed, reason = scoring._loss_streak_block("COINBASE")
-            self.assertFalse(allowed)
-            self.assertIn("Loss-streak", reason)
-            # Entry path also blocked
-            ok, msg = scoring._check_hysteresis("BTC", 50000.0, is_crypto=True, broker_id="COINBASE")
-            self.assertFalse(ok)
-            self.assertIn("Loss-streak", msg)
+        for t in ("AAA", "BBB", "CCC"):
+            scoring._apply_cooldown("COINBASE", t, sell_price=1.0, reason="hard_stop")
+        ok, msg = scoring._check_hysteresis("BTC", 50000.0, is_crypto=True, broker_id="COINBASE")
+        self.assertNotIn("Loss-streak", str(msg))
+        self.assertFalse(hasattr(scoring, "_loss_streak_block"))
 
 
 class TestAtrSizingStop(unittest.TestCase):
@@ -70,7 +63,6 @@ class TestAtrSizingStop(unittest.TestCase):
         for bid in scoring._KNOWN_BROKER_IDS:
             scoring._cooldown_memory[bid] = {}
             scoring._portfolio_memory[bid] = {}
-            scoring._loss_streak[bid] = {"events": [], "pause_until": 0.0}
         with patch("scoring.save_state"):
             action = scoring.evaluate_holding(
                 "META", avg_cost=100.0, broker_id="ROBINHOOD",
@@ -86,7 +78,6 @@ class TestAtrSizingStop(unittest.TestCase):
         for bid in scoring._KNOWN_BROKER_IDS:
             scoring._cooldown_memory[bid] = {}
             scoring._portfolio_memory[bid] = {}
-            scoring._loss_streak[bid] = {"events": [], "pause_until": 0.0}
         with patch("scoring.save_state"):
             action = scoring.evaluate_holding(
                 "SOL", avg_cost=0.0007, broker_id="ROBINHOOD",

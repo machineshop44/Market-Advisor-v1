@@ -14,11 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.41"
+__version__ = "1.42.42"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Anti-chase entry gate; crypto runner trail after partial; exit reasons in log; loss guard kept"
+    "Exits run while disarmed; TTP memory kept; heat cap + TTP fee floor; PDT stop reserve; "
+    "per-broker loss limit; no averaging down"
 )
 
 

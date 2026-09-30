@@ -6,6 +6,13 @@ Src/scoring_state.json
 Src/activity_log.txt
 Src/advisor_queue.json
 Src/advisor_decisions.jsonl
+Src/decision_journal.jsonl
+Src/consecutive_loss_streak.json
+Src/pdt_day_trades.json
+Src/working_orders.json
+pdt_day_trades.json
+working_orders.json
+consecutive_loss_streak.json
 Src/crash_log.txt
 Src/crash_log.txt.prev
 Src/_combo_arrow_*.png

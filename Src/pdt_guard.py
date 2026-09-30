@@ -295,14 +295,39 @@ def may_open_equity_buy(
         return True, ""
     used = _gate_day_trade_count(broker)
     cap = max_day_trades(settings)
-    if used < cap:
-        return True, ""
-    return (
-        False,
-        f"PDT entry guard — {used}/{cap} day trades used; "
-        f"no discretionary equity buys until tomorrow "
-        f"(equity ${float(equity):.0f})",
-    )
+    if used >= cap:
+        return (
+            False,
+            f"PDT entry guard — {used}/{cap} day trades used; "
+            f"no discretionary equity buys until tomorrow "
+            f"(equity ${float(equity):.0f})",
+        )
+    # Every name opened today could be forced out same-day (hard stop / EOD);
+    # keep enough slots so those protective exits never exceed the cap.
+    open_today = opened_today_names(broker)
+    sym = str(ticker or "").upper().replace("-USD", "")
+    exposure = used + len(open_today) + (0 if sym in open_today else 1)
+    if exposure > cap:
+        return (
+            False,
+            f"PDT entry guard — {used}/{cap} used + {len(open_today)} opened today "
+            f"({', '.join(sorted(open_today))}); slots reserved for their stops",
+        )
+    return True, ""
+
+
+def opened_today_names(broker: Optional[str] = None) -> set[str]:
+    """Equity names bought today on this broker with no same-day sell consumed yet."""
+    load()
+    day = _day_key()
+    out: set[str] = set()
+    for key, buys in (_buys or {}).items():
+        b, _, sym = str(key).partition("|")
+        if broker and b != str(broker):
+            continue
+        if any(str(x.get("day")) == day for x in (buys or [])):
+            out.add(sym)
+    return out
 
 
 # Optional broker-reported day-trade count (RH). Local journal remains fallback.

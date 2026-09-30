@@ -1,8 +1,8 @@
 """
 Consecutive losing exits → temporary buy pause (peer day-trader risk rail).
 
-Separate from scoring._loss_streak (hard-stop hysteresis). This tracks closed
-exit outcomes and pauses *new buys* after a streak of losses.
+The single loss-streak breaker: tracks closed exit outcomes (hard stops count as
+losses; TTP partial scale-outs are ignored) and pauses *new buys* after a streak.
 """
 from __future__ import annotations
 
