@@ -3525,11 +3525,51 @@ def buy_rank_score(ticker, is_crypto=True):
         # Sweet spot ~40–55; punish approaching overbought
         score += max(0.0, min(20.0, (RSI_CEILING - rsi)))
     try:
-        # Shadow: warm RVOL / VWAP / RS so the buy journal can record them (no score effect yet)
-        entry_quality_features(ticker, is_crypto=is_crypto, fetch=True)
+        # Warm RVOL / VWAP / RS for the buy journal; only moves the rank when enabled.
+        q = entry_quality_features(ticker, is_crypto=is_crypto, fetch=True)
+        if _quality_rank_cfg["enabled"]:
+            score += entry_quality_rank_adjust(q)
     except Exception:
         pass
     return score
+
+
+_quality_rank_cfg = {"enabled": False}
+QUALITY_RANK_MAX_ADJ = 15.0
+
+
+def entry_quality_rank_adjust(q) -> float:
+    """
+    Rank points (±QUALITY_RANK_MAX_ADJ) from entry-quality features:
+      RVOL      ≥2× +8 · ≥1.3× +4 · <0.6× −6 (no participation)
+      VWAP      0–1% over +4 · >2% over −6 · >3.5% over −12 (stretched) · >1.5% under −4
+      RS        > +0.5% vs benchmark +5 · < −0.5% −5
+    Missing features contribute 0.
+    """
+    q = q or {}
+    adj = 0.0
+
+    def _f(k):
+        try:
+            return float(q[k]) if q.get(k) is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    rvol, vw, rs = _f("rvol"), _f("vwap_stretch_pct"), _f("rs_pct")
+    if rvol is not None:
+        adj += 8.0 if rvol >= 2.0 else 4.0 if rvol >= 1.3 else -6.0 if rvol < 0.6 else 0.0
+    if vw is not None:
+        if vw > 3.5:
+            adj -= 12.0
+        elif vw > 2.0:
+            adj -= 6.0
+        elif 0.0 <= vw <= 1.0:
+            adj += 4.0
+        elif vw < -1.5:
+            adj -= 4.0
+    if rs is not None:
+        adj += 5.0 if rs > 0.5 else -5.0 if rs < -0.5 else 0.0
+    return max(-QUALITY_RANK_MAX_ADJ, min(QUALITY_RANK_MAX_ADJ, adj))
 
 
 def affordability_rank_boost(
@@ -4474,6 +4514,7 @@ def configure_entry_filters(settings: dict | None) -> None:
             _liquidity_cfg[key] = max(lo, min(hi, float(s.get(skey))))
         except (TypeError, ValueError):
             pass
+    _quality_rank_cfg["enabled"] = bool(s.get("entry_quality_rank_enabled", False))
     global MAX_CRYPTO_CLUSTER_POSITIONS
     if s.get("max_crypto_cluster_positions") is not None:
         try:

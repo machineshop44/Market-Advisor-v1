@@ -14,12 +14,13 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.44"
+__version__ = "1.42.45"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Profit lock-in; liquidity gate; E*TRADE GTC stops; anchored loss stop; round-trip "
-    "expectancy/R report; Coinbase maker entries; half-day calendar; crypto cluster cap; hotkeys"
+    "Working-order & stop blotter with cancel; opt-in entry-quality rank (RVOL/VWAP/RS); "
+    "Settings for maker wait, lunch/crypto sizing, crypto cluster cap; builds on 1.42.44 "
+    "profit lock, loss stop anchor, E*TRADE GTC stops"
 )
 
 

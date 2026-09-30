@@ -61,6 +61,7 @@
     "lunch_lull_size_mult": 0.75,
     "crypto_off_hours_size_mult": 0.75,
     "max_crypto_cluster_positions": 5,
+    "entry_quality_rank_enabled": false,
     "desk_focus_mode": "auto",
     "desk_focus_broker": "",
     "focus_broker_scan_mult": 2.0,

@@ -297,6 +297,7 @@ def load_settings():
         "lunch_lull_size_mult": 0.75,
         "crypto_off_hours_size_mult": 0.75,
         "max_crypto_cluster_positions": 5,
+        "entry_quality_rank_enabled": False,
         "advisor_ai_max_per_minute": 4,
         "advisor_ai_max_per_day": 20,
         "advisor_ai_local_when_clear": True,
@@ -8727,12 +8728,116 @@ class MarketAdvisorGUI(QMainWindow):
         polish_table(self.recent_trades_table)
         layout.addWidget(self.recent_trades_table, 1)
 
+        blot_bar = QHBoxLayout()
+        blot_hdr = QLabel("Working orders & broker stops")
+        blot_hdr.setObjectName("sectionHeader")
+        blot_hdr.setStyleSheet(section_header_style())
+        blot_hdr.setToolTip(
+            "Orders Market Advisor submitted that have not filled yet, plus the protective "
+            "stops it tracks at each broker. Orders placed in the broker app are not listed."
+        )
+        blot_bar.addWidget(blot_hdr)
+        blot_bar.addStretch()
+        blot_refresh = QPushButton("Refresh")
+        blot_refresh.clicked.connect(self.refresh_blotter)
+        blot_bar.addWidget(blot_refresh)
+        self.blotter_cancel_btn = QPushButton("Cancel selected")
+        self.blotter_cancel_btn.setToolTip(
+            "Cancel the selected working orders / stops at the broker. A cancelled stop is not "
+            "re-attached by auto-repair for 8h; software TTP keeps managing the position."
+        )
+        self.blotter_cancel_btn.clicked.connect(self._blotter_cancel_selected)
+        blot_bar.addWidget(self.blotter_cancel_btn)
+        layout.addLayout(blot_bar)
+
+        self.blotter_table = QTableWidget(0, 8)
+        self.blotter_table.setHorizontalHeaderLabels(
+            ["Kind", "Broker", "Ticker", "Side", "Qty", "Price / Stop", "Age", "Status"]
+        )
+        self.blotter_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.blotter_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        polish_trades_header(self.blotter_table)
+        self.blotter_table.setMinimumHeight(ui_px(110))
+        polish_table(self.blotter_table)
+        layout.addWidget(self.blotter_table)
+
         self._style_home_cards()
         self._update_home_wide_layout()
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
         self.tabs.addTab(tab, "Home")
         QTimer.singleShot(0, self.refresh_recent_trades)
+        QTimer.singleShot(0, self.refresh_blotter)
+
+    def refresh_blotter(self):
+        if not hasattr(self, "blotter_table"):
+            return
+        try:
+            import working_orders as wo
+            from scoring import list_protective_orders
+            wo.expire_stale()
+            rows = wo.blotter_rows(wo.open_orders(), list_protective_orders())
+        except Exception as e:
+            self.log_event(f"[Blotter] refresh error: {e}")
+            rows = []
+        self._blotter_rows = rows
+        self.blotter_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            px = r.get("price")
+            age = r.get("age_min")
+            vals = [
+                "Working" if r["kind"] == "working" else ("Stop (paper)" if r.get("paper") else "Stop"),
+                r["broker"],
+                r["ticker"],
+                r["side"],
+                f"{float(r.get('qty') or 0):g}",
+                format_currency(px) if px else "—",
+                (f"{age:.0f}m" if age < 120 else f"{age / 60:.1f}h") if age is not None else "—",
+                str(r.get("status") or "")[:40],
+            ]
+            for col, text in enumerate(vals):
+                item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setToolTip(f"order id {r.get('order_id') or '—'}")
+                self.blotter_table.setItem(i, col, item)
+
+    def _blotter_cancel_selected(self):
+        rows = getattr(self, "_blotter_rows", None) or []
+        picked = sorted({ix.row() for ix in self.blotter_table.selectionModel().selectedRows()})
+        picked = [rows[i] for i in picked if 0 <= i < len(rows)]
+        if not picked:
+            QMessageBox.information(self, "Cancel orders", "Select one or more rows first.")
+            return
+        mode = "PAPER" if self.paper_mode else "LIVE"
+        desc = "\n".join(f"• [{r['broker']}] {r['kind']} {r['side']} {r['ticker']}" for r in picked[:12])
+        if QMessageBox.question(
+            self, "Cancel orders", f"[{mode}] Cancel {len(picked)} order(s)?\n\n{desc}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        import working_orders as wo
+        for r in picked:
+            broker_name, ticker = r["broker"], r["ticker"]
+            is_crypto = ticker.upper().replace("-USD", "") in KNOWN_CRYPTOS
+            try:
+                if r["kind"] == "stop":
+                    self._cancel_protective_stop(broker_name, ticker, "crypto" if is_crypto else "")
+                    self._suppress_stop_repair(broker_name, ticker, sec=8 * 3600)
+                    continue
+                broker = self.brokers.get(broker_name)
+                ok, msg = (True, "paper") if self.paper_mode else (
+                    broker.cancel_order(r["order_id"], is_crypto=is_crypto) if broker
+                    else (False, "broker not loaded")
+                )
+                if ok:
+                    wo.resolve(broker_name, r["order_id"], "cancelled")
+                self.log_event(
+                    f"[{broker_name}] Blotter cancel {r['side']} {ticker} "
+                    f"({r['order_id'][:10]}): {'OK' if ok else 'fail'} — {msg}"
+                )
+            except Exception as e:
+                self.log_event(f"[{broker_name}] Blotter cancel error [{ticker}]: {e}")
+        self.refresh_blotter()
 
     def refresh_recent_trades(self):
         if not hasattr(self, 'recent_trades_table'):
@@ -8760,6 +8865,7 @@ class MarketAdvisorGUI(QMainWindow):
             ]
             for col, text in enumerate(vals):
                 self.recent_trades_table.setItem(i, col, QTableWidgetItem(text))
+        self.refresh_blotter()
 
     def build_portfolio_screen(self):
         tab = QWidget()
@@ -11703,7 +11809,57 @@ class MarketAdvisorGUI(QMainWindow):
             "coinbase_maker_timeout_sec (45s), then cancel. Partial fills are kept. No book or a "
             "post-only reject falls back to the normal order. Blocks the buy thread while it waits."
         )
+        maker_row = QHBoxLayout()
+        maker_row.addWidget(QLabel("Maker wait before cancel:"))
+        self.cb_maker_timeout_spin = QSpinBox()
+        self.cb_maker_timeout_spin.setRange(10, 300)
+        self.cb_maker_timeout_spin.setSingleStep(5)
+        self.cb_maker_timeout_spin.setSuffix(" s")
+        self.cb_maker_timeout_spin.setValue(int(self.settings.get("coinbase_maker_timeout_sec", 45) or 45))
+        maker_row.addWidget(self.cb_maker_timeout_spin)
+        maker_row.addStretch()
+        form_layout.addLayout(maker_row)
         form_layout.addWidget(self.cb_maker_chk)
+
+        self.quality_rank_chk = QCheckBox(
+            "Entry quality in buy rank — relative volume, VWAP stretch, strength vs SPY/BTC"
+        )
+        self.quality_rank_chk.setChecked(bool(self.settings.get("entry_quality_rank_enabled", False)))
+        self.quality_rank_chk.setToolTip(
+            "Adds up to ±15 rank points: favors real volume (≥1.3× the time slot), entries near "
+            "VWAP, and names beating SPY/BTC; penalizes buys stretched >2% over VWAP. Off = the "
+            "features are only journaled. Check Reports → Round trips (shadow buckets) first."
+        )
+        form_layout.addWidget(self.quality_rank_chk)
+
+        sizing_row = QHBoxLayout()
+        sizing_row.addWidget(QLabel("Lunch lull size ×"))
+        self.lunch_mult_spin = QDoubleSpinBox()
+        self.lunch_mult_spin.setRange(0.0, 1.0)
+        self.lunch_mult_spin.setSingleStep(0.05)
+        self.lunch_mult_spin.setValue(float(self.settings.get("lunch_lull_size_mult", 0.75)))
+        self.lunch_mult_spin.setToolTip("Equity ticket multiplier 11:30–13:30 ET (1.0 = off).")
+        sizing_row.addWidget(self.lunch_mult_spin)
+        sizing_row.addWidget(QLabel("Crypto off-hours size ×"))
+        self.crypto_offhours_spin = QDoubleSpinBox()
+        self.crypto_offhours_spin.setRange(0.0, 1.0)
+        self.crypto_offhours_spin.setSingleStep(0.05)
+        self.crypto_offhours_spin.setValue(float(self.settings.get("crypto_off_hours_size_mult", 0.75)))
+        self.crypto_offhours_spin.setToolTip(
+            "Crypto ticket multiplier 20:00–02:00 ET and Fri 20:00 → Sun 20:00 ET (1.0 = off)."
+        )
+        sizing_row.addWidget(self.crypto_offhours_spin)
+        sizing_row.addWidget(QLabel("Max crypto positions (all brokers):"))
+        self.crypto_cluster_spin = QSpinBox()
+        self.crypto_cluster_spin.setRange(0, 50)
+        self.crypto_cluster_spin.setValue(int(self.settings.get("max_crypto_cluster_positions", 5)))
+        self.crypto_cluster_spin.setToolTip(
+            "Crypto moves with BTC, so Robinhood + Coinbase crypto count as one cluster. "
+            "Holdings under $5 are ignored. 0 = off."
+        )
+        sizing_row.addWidget(self.crypto_cluster_spin)
+        sizing_row.addStretch()
+        form_layout.addLayout(sizing_row)
 
         self.session_size_curve_chk = QCheckBox(
             "Session size curve — open/lunch/close equity sizing; crypto off-hours sizing"
@@ -14851,6 +15007,10 @@ class MarketAdvisorGUI(QMainWindow):
         """Update Home heat strip + DD / $-loss chips from balances + open risk estimate."""
         if not hasattr(self, "home_heat_lbl"):
             return
+        try:
+            self.refresh_blotter()
+        except Exception:
+            pass
         try:
             from scoring import portfolio_heat_snapshot
         except Exception:
@@ -21657,8 +21817,20 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["liquidity_gate_enabled"] = bool(self.liquidity_chk.isChecked())
         if hasattr(self, "cb_maker_chk"):
             self.settings["coinbase_maker_entries"] = bool(self.cb_maker_chk.isChecked())
+            self.settings["coinbase_maker_timeout_sec"] = int(self.cb_maker_timeout_spin.value())
             if self.brokers.get("Coinbase") is not None:
                 self.brokers["Coinbase"].maker_entries = self.settings["coinbase_maker_entries"]
+                self.brokers["Coinbase"].maker_timeout_sec = self.settings["coinbase_maker_timeout_sec"]
+        if hasattr(self, "quality_rank_chk"):
+            self.settings["entry_quality_rank_enabled"] = bool(self.quality_rank_chk.isChecked())
+            self.settings["lunch_lull_size_mult"] = float(self.lunch_mult_spin.value())
+            self.settings["crypto_off_hours_size_mult"] = float(self.crypto_offhours_spin.value())
+            self.settings["max_crypto_cluster_positions"] = int(self.crypto_cluster_spin.value())
+            try:
+                from scoring import configure_entry_filters
+                configure_entry_filters(self.settings)
+            except Exception:
+                pass
         if hasattr(self, "profit_lock_chk"):
             self.settings["profit_lock_enabled"] = bool(self.profit_lock_chk.isChecked())
             self.settings["profit_lock_activate_pct"] = float(self.profit_lock_act_spin.value())

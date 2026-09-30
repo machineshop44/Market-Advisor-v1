@@ -189,6 +189,65 @@ def should_book_fill(status: str, *, spent: float = 0.0) -> bool:
         return "Filled" in st
 
 
+_BROKER_DISPLAY = {"ROBINHOOD": "Robinhood", "COINBASE": "Coinbase", "ETRADE": "E*TRADE"}
+
+
+def blotter_rows(working=None, protective=None, *, now: Optional[float] = None) -> list[dict]:
+    """
+    One table for the desk: app-tracked working orders + tracked broker protective stops.
+    working: open_orders() rows; protective: [(broker_id, ticker, info)] from scoring.
+    Rows: {kind, broker, ticker, side, qty, price, age_min, order_id, status, paper}.
+    Working orders first (newest first), then stops by broker/ticker.
+    """
+    ts_now = float(now if now is not None else time.time())
+    rows = []
+    for o in working if working is not None else open_orders():
+        try:
+            age = max(0.0, (ts_now - float(o.get("ts") or ts_now)) / 60.0)
+        except (TypeError, ValueError):
+            age = None
+        qty = float(o.get("qty") or 0)
+        dollars = float(o.get("dollars") or 0)
+        rows.append({
+            "kind": "working",
+            "broker": str(o.get("broker") or ""),
+            "ticker": str(o.get("ticker") or ""),
+            "side": str(o.get("side") or ""),
+            "qty": qty,
+            "price": (dollars / qty) if qty > 0 and dollars > 0 else None,
+            "dollars": dollars,
+            "age_min": age,
+            "order_id": str(o.get("order_id") or ""),
+            "status": str(o.get("status") or "working"),
+            "paper": False,
+        })
+    rows.sort(key=lambda r: (r["age_min"] if r["age_min"] is not None else 1e9))
+    stops = []
+    for bid, ticker, info in protective or []:
+        info = info or {}
+        oid = str(info.get("order_id") or "")
+        paper = bool(info.get("paper")) or oid.startswith("paper-")
+        try:
+            sp = float(info.get("stop_price") or 0) or None
+        except (TypeError, ValueError):
+            sp = None
+        stops.append({
+            "kind": "stop",
+            "broker": _BROKER_DISPLAY.get(str(bid).upper(), str(bid)),
+            "ticker": str(ticker or ""),
+            "side": "SELL",
+            "qty": float(info.get("qty") or 0),
+            "price": sp,
+            "dollars": (sp or 0) * float(info.get("qty") or 0),
+            "age_min": None,
+            "order_id": oid,
+            "status": "virtual stop" if paper else str(info.get("kind") or "broker_stop"),
+            "paper": paper,
+        })
+    stops.sort(key=lambda r: (r["broker"], r["ticker"]))
+    return rows + stops
+
+
 def is_working_unfilled(status: str) -> bool:
     """Delegate to auto_cycle helper when available."""
     try:
