@@ -9,6 +9,7 @@ Active file stays bounded for UI/perf; older lines are archived indefinitely
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from datetime import datetime
 
@@ -398,6 +399,21 @@ def record_buy_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec=
 
 
 _DISCORD_BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
+
+
+DISCORD_CONTENT_LIMIT = 2000
+
+
+def discord_safe_content(text, limit=DISCORD_CONTENT_LIMIT):
+    """Strip HTML error pages and cap to Discord's 2000-char content limit (else HTTP 400)."""
+    s = str(text or "")
+    if "<" in s and ">" in s:
+        s = re.sub(r"<(style|script)[^>]*>.*?</\1>", " ", s, flags=re.I | re.S)
+        s = re.sub(r"</?[A-Za-z!][^<>]*>", " ", s)
+        s = re.sub(r"[ \t]{2,}", " ", s)
+    if len(s) > limit:
+        s = s[: limit - 1].rstrip() + "…"
+    return s
 
 
 def resolve_discord_broker_tag(

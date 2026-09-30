@@ -1347,6 +1347,20 @@ def mark_position_closed(broker_id, ticker, exit_price=0.0):
     return True
 
 
+def mark_partial_done(broker_id, ticker):
+    """Confirmed TTP scale-out fill: the remainder now trails as a runner."""
+    broker_id = _normalize_broker_id(broker_id)
+    mem = _portfolio_memory.get(broker_id) or {}
+    raw = str(ticker or "").upper().strip()
+    base = raw.replace("-USD", "")
+    key = next((k for k in (ticker, raw, base, f"{base}-USD") if k in mem), None)
+    if key is None:
+        return False
+    mem[key]["ttp_partial_done"] = True
+    save_state(force=True)
+    return True
+
+
 def _auto_detect_sales(broker_id):
     """
     Fallback: move tickers to cooldown when they stop being evaluated as holdings
@@ -4021,28 +4035,26 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     peak_roi = (highest - avg_cost) / avg_cost
     mem = _portfolio_memory[broker_id][ticker]
     if peak_roi >= fees["ttp_arm"]:
-        if (
-            not mem.get("ttp_partial_done")
-            and ttp_partial_scale_eligible(
-                broker_id, ticker, asset_type, equity=equity, holding_value=hv,
-            )
-        ):
-            mem["ttp_partial_done"] = True
-            save_state(force=True)
-            pct = int(round(TTP_PARTIAL_SCALE_PCT * 100))
-            return (
-                f"SELL_PARTIAL (TTP Scale-Out {pct}% — "
-                f"Peak: +{peak_roi*100:.2f}%, Now: +{roi*100:.2f}%)"
-            )
-        trail = runner_trail_pct(fees["ttp_trail"], bool(mem.get("ttp_partial_done")))
+        # ttp_partial_done is set only by mark_partial_done() on a confirmed fill —
+        # a failed scale-out must not widen the trail on the full position.
+        partial_done = bool(mem.get("ttp_partial_done"))
+        trail = runner_trail_pct(fees["ttp_trail"], partial_done)
         trail_trigger_price = ttp_trigger_price(
             highest, avg_cost, trail,
             estimate_round_trip_fee_pct(broker_id, ticker, asset_type),
         )
         if current_price <= trail_trigger_price:
             save_state(force=True)
-            label = "TTP Runner trail" if mem.get("ttp_partial_done") else "TTP Triggered"
+            label = "TTP Runner trail" if partial_done else "TTP Triggered"
             return f"SELL ({label} - Peak: +{peak_roi*100:.2f}%, Exit: +{roi*100:.2f}%)"
+        if not partial_done and ttp_partial_scale_eligible(
+            broker_id, ticker, asset_type, equity=equity, holding_value=hv,
+        ):
+            pct = int(round(TTP_PARTIAL_SCALE_PCT * 100))
+            return (
+                f"SELL_PARTIAL (TTP Scale-Out {pct}% — "
+                f"Peak: +{peak_roi*100:.2f}%, Now: +{roi*100:.2f}%)"
+            )
         save_state()
         return f"HOLD (TTP Armed - Peak: +{peak_roi*100:.2f}%)"
 

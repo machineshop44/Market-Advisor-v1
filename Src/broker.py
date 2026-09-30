@@ -28,6 +28,26 @@ def _as_dict(v):
     return v if isinstance(v, dict) else {}
 
 
+def rh_crypto_collar_price(raw_price, tick, side):
+    """RH market-order collar on the pair's price tick: sells round down, buys up."""
+    try:
+        px = Decimal(str(raw_price))
+    except Exception:
+        return ""
+    if px <= 0:
+        return ""
+    try:
+        t = Decimal(str(tick)) if tick is not None else Decimal("0")
+    except Exception:
+        t = Decimal("0")
+    if t > 0:
+        mode = ROUND_DOWN if side == "sell" else ROUND_UP
+        px = (px / t).quantize(Decimal("1"), rounding=mode) * t
+        if px <= 0:
+            px = t
+    return format(px.normalize(), "f")
+
+
 def _as_list(v):
     if v is None or v == "":
         return []
@@ -804,6 +824,52 @@ class RobinhoodAdapter(BaseBroker):
             self._crypto_inc_cache[ticker] = inc
         return inc, min_qty
 
+    def _rh_crypto_market_order(self, side, ticker, qty_str):
+        """
+        Market crypto order with the collar price on the pair's real tick.
+        robin_stocks.order_crypto rounds sub-cent prices to 6 decimals (BONK
+        ~$0.0000037 → $0.000004, ~8% off bid) and returns None on HTTP errors,
+        so RH rejected sells intermittently with no reason logged.
+        """
+        from robin_stocks.robinhood.crypto import get_crypto_info, load_crypto_profile
+        from robin_stocks.robinhood.helper import request_post
+        from robin_stocks.robinhood.urls import order_crypto_url
+        from uuid import uuid4
+
+        info = get_crypto_info(ticker)
+        info = info if isinstance(info, dict) else {}
+        pair_id = info.get("id")
+        if not pair_id:
+            return None
+        q = r.crypto.get_crypto_quote(ticker)
+        q = q if isinstance(q, dict) else {}
+        key = "bid_price" if side == "sell" else "ask_price"
+        raw_px = q.get(key) or q.get("mark_price")
+        tick = info.get("min_order_price_increment")
+        price_str = rh_crypto_collar_price(raw_px, tick, side)
+        if not price_str:
+            return None
+        payload = {
+            "account_id": load_crypto_profile(info="id"),
+            "currency_pair_id": pair_id,
+            "price": price_str,
+            "quantity": qty_str,
+            "ref_id": str(uuid4()),
+            "side": side,
+            "time_in_force": "gtc",
+            "type": "market",
+        }
+        res = request_post(order_crypto_url(), payload, json=True, jsonify_data=False)
+        if res is None:
+            return None
+        try:
+            body = res.json()
+        except Exception:
+            body = {"detail": f"HTTP {getattr(res, 'status_code', '?')} (no JSON body)"}
+        if isinstance(body, dict) and "id" not in body:
+            body.setdefault("http_status", getattr(res, "status_code", None))
+        return body
+
     def position_is_dust(self, ticker, shares, price, asset_type=""):
         """True when RH cannot sell this size (crypto min qty or stock <$1 fractional)."""
         try:
@@ -1066,7 +1132,7 @@ class RobinhoodAdapter(BaseBroker):
             try:
                 res = None
                 for _attempt in range(2):
-                    res = r.order_buy_crypto_by_quantity(ticker, safe_qty_str)
+                    res = self._rh_crypto_market_order("buy", ticker, safe_qty_str)
                     if isinstance(res, dict) and "id" in res:
                         break
                     if res is not None:
@@ -1301,7 +1367,7 @@ class RobinhoodAdapter(BaseBroker):
             try:
                 res = None
                 for _attempt in range(2):
-                    res = r.order_sell_crypto_by_quantity(ticker, safe_qty_str)
+                    res = self._rh_crypto_market_order("sell", ticker, safe_qty_str)
                     if isinstance(res, dict) and "id" in res:
                         break
                     if res is not None:

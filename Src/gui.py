@@ -3252,6 +3252,12 @@ class MarketAdvisorGUI(QMainWindow):
                 mark_position_closed(broker_name, ticker, price)
             except Exception:
                 pass
+        elif "SCALE-OUT" in str(reason_blob or "").upper():
+            try:
+                from scoring import mark_partial_done
+                mark_partial_done(broker_name, ticker)
+            except Exception:
+                pass
         if avg_before is None:
             try:
                 avg_before = float(self._avg_cost_for(broker_name, ticker) or 0)
@@ -3653,12 +3659,15 @@ class MarketAdvisorGUI(QMainWindow):
                 if urgent and "REAUTH" in str(prefix or "").upper():
                     mention = "@here "
                     body["allowed_mentions"] = {"parse": ["here"]}
+                from activity_log_util import discord_safe_content
                 if embed:
                     body["embeds"] = [embed]
                     if message:
                         body["content"] = f"{mention}🤖 **MarketAdvisor [{tag}]** {pfx}".rstrip()
                 else:
-                    body["content"] = f"{mention}🤖 **MarketAdvisor [{tag}]**: {pfx}{message}"
+                    body["content"] = discord_safe_content(
+                        f"{mention}🤖 **MarketAdvisor [{tag}]**: {pfx}{message}"
+                    )
                 payload = json.dumps(body).encode('utf-8')
                 req = urllib.request.Request(
                     webhook_url,
@@ -17526,6 +17535,15 @@ class MarketAdvisorGUI(QMainWindow):
                     price = float(h.get("price") or h.get("last") or 0)
                 except (TypeError, ValueError):
                     price = 0.0
+                if shares < 1.0:
+                    # E*TRADE API orders are whole-share only — fractional dust can't be sold here.
+                    self._throttled_log(
+                        f"E*TRADE:eod_frac_dust:{ticker}",
+                        f"[EOD] [{ticker}] {shares:g} sh fractional dust on E*TRADE — "
+                        f"API can't sell <1 share; close it in the E*TRADE app/site.",
+                        cooldown_sec=86400,
+                    )
+                    continue
                 et_equity_rows.append({
                     "broker": "E*TRADE",
                     "ticker": ticker,

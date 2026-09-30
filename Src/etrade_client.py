@@ -220,7 +220,8 @@ class ETradeClient:
 
             if resp.status_code >= 400:
                 raise ETradeAPIError(
-                    f"E*TRADE {method.upper()} {path} failed ({resp.status_code}): {resp.text[:400]}",
+                    f"E*TRADE {method.upper()} {path} failed ({resp.status_code}): "
+                    f"{etrade_error_summary(resp.text)}",
                     status_code=resp.status_code,
                     body=resp.text,
                 )
@@ -337,6 +338,23 @@ def _extract_accounts(data: Any) -> list:
     if isinstance(accounts_node, list):
         return [a for a in accounts_node if isinstance(a, dict)]
     return []
+
+
+def etrade_error_summary(text, limit=300) -> str:
+    """One-line E*TRADE error: <code>/<message> from XML or JSON, else compacted body."""
+    import re as _re
+
+    raw = str(text or "")
+    code = _re.search(r"<code>\s*([^<]+?)\s*</code>", raw, _re.I)
+    msg = _re.search(r"<message>\s*([^<]+?)\s*</message>", raw, _re.I)
+    if not msg:
+        msg = _re.search(r'"message"\s*:\s*"([^"]+)"', raw)
+        code = code or _re.search(r'"code"\s*:\s*"?(\w+)', raw)
+    if msg:
+        head = f"[{code.group(1)}] " if code else ""
+        return (head + msg.group(1))[:limit]
+    compact = " ".join(_re.sub(r"<[^>]+>", " ", raw).split())
+    return compact[:limit] if compact else "(empty body)"
 
 
 def _format_oauth_error(step, resp) -> str:

@@ -692,6 +692,15 @@ class ETradeAdapter(BaseBroker):
         qty = round_fractional_qty(shares_val) if allow_fractional else float(math.floor(float(shares_val)))
         if qty <= 0:
             return "Nothing to sell", None
+        if qty < 1.0:
+            # orders/preview rejects fractional quantities (400) — whole shares only.
+            return (
+                f"Skipped: Dust below E*TRADE API min ({qty:g} sh <1 whole share — "
+                f"close in the E*TRADE app)",
+                None,
+            )
+        if qty != math.floor(qty):
+            qty = float(math.floor(qty))
         price = float(price or 0) or self.get_live_price(ticker)
 
         if qty < 1.0:

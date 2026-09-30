@@ -44,6 +44,9 @@ def test_ttp_partial_on_small_crypto():
         scoring.fetch_current_price = orig
 
     assert "SELL_PARTIAL" in action
+    # Flag waits for a confirmed fill — a failed scale-out must not widen the trail.
+    assert not scoring._portfolio_memory[broker][ticker].get("ttp_partial_done")
+    assert scoring.mark_partial_done(broker, ticker) is True
     assert scoring._portfolio_memory[broker][ticker].get("ttp_partial_done") is True
 
 

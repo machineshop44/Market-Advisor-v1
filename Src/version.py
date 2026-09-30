@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.42"
+__version__ = "1.42.43"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Exits run while disarmed; TTP memory kept; heat cap + TTP fee floor; PDT stop reserve; "
-    "per-broker loss limit; no averaging down"
+    "RH micro-price crypto sells (BONK) fixed; TTP partial flag on fill; ET fractional dust; "
+    "readable E*TRADE errors; Discord 2000-char cap"
 )
 
 
