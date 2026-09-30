@@ -336,9 +336,20 @@ def merge_crypto_scan_universe(
     return out
 
 
-def extract_coinbase_usd_movers(products_payload, *, limit: int = 8) -> list[str]:
+MOVER_MIN_QUOTE_VOLUME_24H = 5_000_000.0  # USD — thin books spread/slip past the fee model
+MOVER_MAX_CHANGE_24H_PCT = 25.0            # beyond this the move is a chase, not a setup
+
+
+def extract_coinbase_usd_movers(
+    products_payload,
+    *,
+    limit: int = 8,
+    min_quote_volume: float = MOVER_MIN_QUOTE_VOLUME_24H,
+    max_change_pct: float = MOVER_MAX_CHANGE_24H_PCT,
+) -> list[str]:
     """
-    Rank Coinbase product dicts by 24h % change (USD quote only).
+    Rank Coinbase product dicts by 24h % change (USD quote only), requiring real
+    24h quote volume and skipping blow-off moves.
     Accepts list[dict] or {'products': [...]}.
     """
     if isinstance(products_payload, dict):
@@ -366,7 +377,19 @@ def extract_coinbase_usd_movers(products_payload, *, limit: int = 8) -> list[str
             )
         except (TypeError, ValueError):
             chg = 0.0
-        if chg <= 0:
+        if chg <= 0 or chg > float(max_change_pct):
+            continue
+        vol_raw = p.get("approximate_quote_24h_volume")
+        if vol_raw in (None, ""):
+            try:
+                vol_raw = float(p.get("volume_24h") or 0) * float(p.get("price") or 0)
+            except (TypeError, ValueError):
+                vol_raw = 0.0
+        try:
+            vol = float(vol_raw or 0.0)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if vol < float(min_quote_volume):
             continue
         ranked.append((chg, base))
     ranked.sort(key=lambda x: x[0], reverse=True)
@@ -1305,9 +1328,10 @@ def equity_session_size_mult(now_et=None, *, settings=None) -> tuple[float, str]
     """
     Time-of-day equity ticket curve (joint-audit P1/P2).
       - First 30m RTH (9:30–10:00 ET): half-size
-      - Last 30m RTH (15:30–16:00 ET): no new equity entries (mult=0)
+      - Last 30m RTH (15:30–16:00 ET; 12:30–13:00 on half days): no new equity entries
+      - Lunch lull (11:30–13:30 ET): lunch_lull_size_mult (0.75)
       - Else: full size
-    Crypto callers should ignore this (24/7).
+    Crypto callers should use crypto_session_size_mult instead (24/7).
     """
     s = settings or {}
     if not bool(s.get("session_size_curve_enabled", True)):
@@ -1323,12 +1347,58 @@ def equity_session_size_mult(now_et=None, *, settings=None) -> tuple[float, str]
         return 1.0, ""
     open_s = 9 * 3600 + 30 * 60
     close_s = 16 * 3600
+    try:
+        from market_calendar import regular_close_hour
+        close_s = int(regular_close_hour(now_et.date()) * 3600)
+    except Exception:
+        pass
     if sod < open_s or sod >= close_s:
         return 1.0, ""  # extended/overnight handled by session gates elsewhere
     if sod < open_s + 30 * 60:
         return 0.5, "open half-size (first 30m RTH)"
     if sod >= close_s - 30 * 60:
         return 0.0, "last 30m RTH — no new equity entries"
+    if 11 * 3600 + 30 * 60 <= sod < 13 * 3600 + 30 * 60:
+        try:
+            lull = float(s.get("lunch_lull_size_mult", 0.75))
+        except (TypeError, ValueError):
+            lull = 0.75
+        lull = max(0.0, min(1.0, lull))
+        if lull < 1.0 - 1e-9:
+            return lull, f"lunch lull ×{lull:g} (11:30–13:30 ET)"
+    return 1.0, ""
+
+
+def crypto_session_size_mult(now_et=None, *, settings=None) -> tuple[float, str]:
+    """
+    Crypto ticket curve: thinner books overnight (20:00–02:00 ET) and on weekends
+    (Fri 20:00 → Sun 20:00 ET) → crypto_off_hours_size_mult (0.75).
+    """
+    s = settings or {}
+    if not bool(s.get("session_size_curve_enabled", True)):
+        return 1.0, ""
+    try:
+        mult = float(s.get("crypto_off_hours_size_mult", 0.75))
+    except (TypeError, ValueError):
+        mult = 0.75
+    mult = max(0.0, min(1.0, mult))
+    if mult >= 1.0 - 1e-9:
+        return 1.0, ""
+    try:
+        if now_et is None:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        wd = int(now_et.weekday())
+        h = int(now_et.hour)
+    except Exception:
+        return 1.0, ""
+    weekend = wd == 5 or (wd == 4 and h >= 20) or (wd == 6 and h < 20)
+    if weekend:
+        return mult, f"crypto weekend ×{mult:g}"
+    if h >= 20 or h < 2:
+        return mult, f"crypto overnight ×{mult:g} (20:00–02:00 ET)"
     return 1.0, ""
 
 

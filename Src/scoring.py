@@ -1119,6 +1119,24 @@ def runner_trail_pct(base_trail, partial_done) -> float:
     return t * RUNNER_TRAIL_MULT if partial_done else t
 
 
+def anchored_hard_stop(mem, live_stop) -> float:
+    """
+    Hard stop fixed at the first evaluation (≈ entry). Live ATR widening after entry
+    would let realized risk exceed what was sized; the TTP trail does the tightening.
+    """
+    try:
+        live = float(live_stop)
+    except (TypeError, ValueError):
+        return live_stop
+    if not isinstance(mem, dict):
+        return live
+    try:
+        return float(mem["stop_roi"])
+    except (KeyError, TypeError, ValueError):
+        mem["stop_roi"] = live
+        return live
+
+
 def ttp_trigger_price(highest, avg_cost, trail, fee_rt) -> float:
     """
     Trail exit price, floored at cost + round-trip fees + TTP_LOCK_MIN_OVER_FEES so an
@@ -1318,7 +1336,46 @@ def configure_sale_detect(interval_portfolio_sec):
     return _sale_detect_timeout_sec
 
 
+_last_excursion: dict = {}
+
+
+def position_excursion(broker_id, ticker):
+    """
+    {mfe_roi, mae_roi, stop_roi, hold_min} for a live or just-closed position; {} if unknown.
+    MFE uses the tracked peak vs basis; MAE is the worst ROI seen at evaluation time.
+    """
+    broker_id = _normalize_broker_id(broker_id)
+    base = str(ticker or "").upper().replace("-USD", "")
+    mem = _portfolio_memory.get(broker_id) or {}
+    data = next((mem[k] for k in (ticker, base, f"{base}-USD") if k in mem), None)
+    if data is None:
+        return dict(_last_excursion.get((broker_id, base)) or {})
+    out = {}
+    try:
+        cost = float(data.get("avg_cost") or 0)
+        if cost > 0:
+            out["mfe_roi"] = round(max(0.0, float(data.get("highest") or 0) / cost - 1.0), 6)
+    except (TypeError, ValueError):
+        pass
+    for k in ("mae_roi", "stop_roi"):
+        if data.get(k) is not None:
+            try:
+                out[k] = round(float(data[k]), 6)
+            except (TypeError, ValueError):
+                pass
+    try:
+        out["hold_min"] = round((time.time() - float(data.get("buy_time") or 0)) / 60.0, 1)
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
 def _drop_position_memory(broker_id, ticker):
+    exc = position_excursion(broker_id, ticker)
+    if exc:
+        _last_excursion[(_normalize_broker_id(broker_id), str(ticker).upper().replace("-USD", ""))] = exc
+        if len(_last_excursion) > 200:
+            _last_excursion.pop(next(iter(_last_excursion)))
     _portfolio_memory.get(broker_id, {}).pop(ticker, None)
     if broker_id in _scale_in_counts:
         _scale_in_counts[broker_id].pop(ticker, None)
@@ -1688,11 +1745,98 @@ def _get_trend_data(ticker, interval="5m", period="5d"):
             is_bullish = (macd > sig)
 
             result = (is_bullish, is_uptrend, rsi, has_volume)
+            try:
+                _quality_cache[cache_key] = (time.time(), _bar_quality_features(df))
+            except Exception:
+                pass
         except Exception:
             result = (False, False, None, False)
 
         _trend_cache[cache_key] = (time.time(), result)
     return result
+
+
+_quality_cache: dict = {}
+QUALITY_RS_BARS = 12
+
+
+def _bar_quality_features(df) -> dict:
+    """
+    Shadow entry-quality features from already-fetched closed bars:
+      rvol              last bar volume ÷ mean volume of the same time slot on prior days
+                        (falls back to the prior 48 bars when only one day is loaded)
+      vwap_stretch_pct  (close − session VWAP) ÷ VWAP × 100, session = last calendar day
+      ret_pct           % return over the last QUALITY_RS_BARS bars (for relative strength)
+    """
+    out = {}
+    if df is None or len(df) < 3:
+        return out
+    close = df["Close"]
+    vol = df["Volume"]
+    last_ts = df.index[-1]
+    last_vol = float(vol.iloc[-1] or 0)
+    try:
+        same_slot = df[(df.index.time == last_ts.time()) & (df.index.date != last_ts.date())]
+        base = float(same_slot["Volume"].mean()) if len(same_slot) >= 2 else 0.0
+    except Exception:
+        base = 0.0
+    if base <= 0:
+        prior = vol.iloc[-49:-1]
+        base = float(prior.mean()) if len(prior) else 0.0
+    if base > 0:
+        out["rvol"] = round(last_vol / base, 3)
+    try:
+        sess = df[df.index.date == last_ts.date()]
+    except Exception:
+        sess = df
+    if len(sess):
+        typical = (sess["High"] + sess["Low"] + sess["Close"]) / 3.0
+        vsum = float(sess["Volume"].sum())
+        if vsum > 0:
+            vwap = float((typical * sess["Volume"]).sum()) / vsum
+            if vwap > 0:
+                out["vwap_stretch_pct"] = round((float(close.iloc[-1]) / vwap - 1.0) * 100.0, 3)
+    n = min(QUALITY_RS_BARS, len(close) - 1)
+    ref = float(close.iloc[-1 - n] or 0)
+    if n > 0 and ref > 0:
+        out["ret_pct"] = round((float(close.iloc[-1]) / ref - 1.0) * 100.0, 3)
+    return out
+
+
+def entry_quality_features(ticker, is_crypto=True, *, fetch=False) -> dict:
+    """
+    {rvol, vwap_stretch_pct, rs_pct} for a candidate (shadow only — not in the rank yet).
+    rs_pct = ticker ret_pct − benchmark ret_pct (BTC for crypto, SPY for equities).
+    fetch=False reads caches only, so order-time callers never hit Yahoo.
+    """
+    interval = "5m" if is_crypto else "15m"
+    period = "1d" if is_crypto else "5d"
+    bench = "BTC" if is_crypto else "SPY"
+
+    def _feat(sym):
+        su = str(sym).upper()
+        base = su.replace("-USD", "")
+        key = (su, interval, period)
+        hit = _quality_cache.get(key)
+        if hit is None:
+            for alt in (base, f"{base}-USD"):
+                if (alt, interval, period) in _quality_cache:
+                    hit = _quality_cache[(alt, interval, period)]
+                    break
+        if (hit is None or time.time() - hit[0] >= _TREND_CACHE_TTL) and fetch:
+            _get_trend_data(sym, interval=interval, period=period)
+            hit = _quality_cache.get(key)
+        return dict(hit[1]) if hit else {}
+
+    out = _feat(ticker)
+    if not out:
+        return {}
+    tu = str(ticker).upper().replace("-USD", "")
+    if tu not in ("BTC", "SPY"):
+        b = _feat(bench)
+        if out.get("ret_pct") is not None and b.get("ret_pct") is not None:
+            out["rs_pct"] = round(float(out["ret_pct"]) - float(b["ret_pct"]), 3)
+    return out
 
 
 def _check_hysteresis(ticker, current_price, is_crypto, broker_id):
@@ -2492,9 +2636,50 @@ def reset_execution_feedback():
     }
 
 
+MAX_CRYPTO_CLUSTER_POSITIONS = 5   # crypto positions across ALL brokers (0 = off)
+_cross_broker_crypto: dict = {}     # broker_id -> set of held crypto tickers
+
+
+def set_cross_broker_crypto(by_broker) -> None:
+    """Latest held crypto per broker (from the heat refresh) for the cross-broker cluster cap."""
+    global _cross_broker_crypto
+    out = {}
+    for b, tickers in (by_broker or {}).items():
+        out[_normalize_broker_id(b)] = {
+            str(t).replace("-USD", "").upper() for t in (tickers or []) if t
+        }
+    _cross_broker_crypto = out
+
+
+def crypto_cluster_block(ticker, broker_id, own_crypto_held) -> tuple[bool, str]:
+    """
+    Crypto trades as one BTC-beta cluster: alts across Robinhood + Coinbase all move with BTC,
+    so cap total crypto positions across brokers. Adds to a name this broker holds pass.
+    """
+    cap = int(MAX_CRYPTO_CLUSTER_POSITIONS or 0)
+    if cap <= 0:
+        return False, ""
+    bid = _normalize_broker_id(broker_id)
+    clean = str(ticker or "").replace("-USD", "").upper()
+    own = {str(t).replace("-USD", "").upper() for t in (own_crypto_held or []) if t}
+    if clean in own:
+        return False, ""
+    positions = [(bid, t) for t in own]
+    for b, tickers in _cross_broker_crypto.items():
+        if b == bid:
+            continue
+        positions.extend((b, t) for t in tickers)
+    if len(positions) >= cap:
+        names = ", ".join(sorted({t for _, t in positions})[:8])
+        return True, (
+            f"cluster CRYPTO full ({len(positions)}/{cap} crypto positions across brokers: {names})"
+        )
+    return False, ""
+
+
 def concentration_blocks_buy(ticker, held_tickers, holdings_meta=None, portfolio_value=0.0,
                              proposed_dollars=0.0, is_crypto=False, allow_held_scale_in=False,
-                             crypto_only_broker=False):
+                             crypto_only_broker=False, broker_id=None):
     """
     Portfolio concentration heuristics before a buy.
     holdings_meta: optional list of {ticker, value, is_crypto}
@@ -2522,6 +2707,27 @@ def concentration_blocks_buy(ticker, held_tickers, holdings_meta=None, portfolio
             overlap = held & members
             if len(overlap) >= MAX_CLUSTER_POSITIONS:
                 return True, f"cluster {name} full ({', '.join(sorted(overlap))})"
+
+    new_is_crypto = is_crypto or clean in CRYPTO_TICKERS
+    if broker_id and new_is_crypto and not already_held:
+        if crypto_only_broker:
+            own_crypto = held
+        else:
+            meta_crypto = {
+                str(h.get("ticker") or "").replace("-USD", "").upper()
+                for h in (holdings_meta or []) if h.get("is_crypto")
+            }
+            own_crypto = {t for t in held if t in CRYPTO_TICKERS or t in meta_crypto}
+        dust = set()
+        for h in holdings_meta or []:
+            try:
+                if h.get("value") is not None and float(h.get("value")) < 5.0:
+                    dust.add(str(h.get("ticker") or "").replace("-USD", "").upper())
+            except (TypeError, ValueError):
+                pass
+        blocked, why = crypto_cluster_block(clean, broker_id, own_crypto - dust)
+        if blocked:
+            return True, why
 
     # Crypto book fraction — multi-asset brokers only (RH stocks+crypto)
     if not crypto_only_broker and (is_crypto or clean in CRYPTO_TICKERS):
@@ -2649,8 +2855,9 @@ def protective_stop_health(holdings, *, paper_mode=False):
     holdings: iterable of {
       broker_id|broker, ticker, value?, shares?, is_crypto?, supports_protective?
     }
-    Brokers with supports_protective=False are skipped (E*TRADE).
-    Crypto and fractional equity qty are N/A for broker stops (TTP only) — not "missing".
+    Brokers with supports_protective=False are skipped.
+    Crypto off Coinbase and fractional equity qty are N/A for broker stops (TTP only) — not
+    "missing". E*TRADE stops the whole-share part, so only sub-1-share lots are N/A there.
     Returns {ok, missing, fractional_na, crypto_na, tracked, expected, missing_count, ...}.
     """
     expected = []
@@ -2668,18 +2875,21 @@ def protective_stop_health(holdings, *, paper_mode=False):
         supports = h.get("supports_protective")
         if supports is False:
             continue
-        # Default: ROBINHOOD / COINBASE expect stops; ETRADE does not
-        if supports is None and bid == "ETRADE":
-            continue
         is_crypto = bool(h.get("is_crypto")) or t in CRYPTO_TICKERS
-        if is_crypto:
-            # No broker stop API — software TTP only; do not count as missing
-            crypto_na.append({"broker_id": bid, "ticker": t, "why": "crypto — TTP only"})
-            continue
         try:
             val = float(h.get("value") or 0.0)
         except (TypeError, ValueError):
             val = 0.0
+        if is_crypto:
+            if bid != "COINBASE":
+                # No broker stop API — software TTP only; do not count as missing
+                crypto_na.append({"broker_id": bid, "ticker": t, "why": "crypto — TTP only"})
+                continue
+            if val < 5.0 and not paper_mode:
+                # below Coinbase stop-limit minimums — repair would retry forever
+                continue
+            expected.append((bid, t))
+            continue
         if val < 1.0 and not paper_mode:
             # skip dust
             continue
@@ -2691,7 +2901,11 @@ def protective_stop_health(holdings, *, paper_mode=False):
         except (TypeError, ValueError):
             shares_f = None
         # RH rejects stops on fractional qty — classify separately from true gaps
-        if shares_f is not None and not _qty_is_whole_shares(shares_f):
+        if bid == "ETRADE":
+            frac = shares_f is not None and shares_f < 1.0
+        else:
+            frac = shares_f is not None and not _qty_is_whole_shares(shares_f)
+        if frac:
             fractional_na.append({
                 "broker_id": bid,
                 "ticker": t,
@@ -2734,6 +2948,19 @@ def cluster_heat_snapshot(held_tickers):
             "max": int(MAX_CLUSTER_POSITIONS),
             "full": n >= MAX_CLUSTER_POSITIONS,
             "members": sorted(members),
+        })
+    cap = int(MAX_CRYPTO_CLUSTER_POSITIONS or 0)
+    if cap > 0 and _cross_broker_crypto:
+        pairs = sorted(
+            f"{t}@{b[:2]}" for b, ts in _cross_broker_crypto.items() for t in ts
+        )
+        rows.append({
+            "name": "CRYPTO",
+            "held": pairs,
+            "count": len(pairs),
+            "max": cap,
+            "full": len(pairs) >= cap,
+            "members": ["all crypto, all brokers"],
         })
     # fullest first, then name
     rows.sort(key=lambda r: (-r["count"], r["name"]))
@@ -3297,6 +3524,11 @@ def buy_rank_score(ticker, is_crypto=True):
     if rsi is not None:
         # Sweet spot ~40–55; punish approaching overbought
         score += max(0.0, min(20.0, (RSI_CEILING - rsi)))
+    try:
+        # Shadow: warm RVOL / VWAP / RS so the buy journal can record them (no score effect yet)
+        entry_quality_features(ticker, is_crypto=is_crypto, fetch=True)
+    except Exception:
+        pass
     return score
 
 
@@ -4007,6 +4239,11 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     highest = _portfolio_memory[broker_id][ticker]['highest']
     held_time_minutes = (now - _portfolio_memory[broker_id][ticker]['buy_time']) / 60.0
     roi = (current_price - avg_cost) / avg_cost
+    _pm = _portfolio_memory[broker_id][ticker]
+    fees["hard_stop"] = anchored_hard_stop(_pm, fees["hard_stop"])
+    if not unknown_basis:
+        _pm["mae_roi"] = min(float(_pm.get("mae_roi", 0.0) or 0.0), roi)
+        _pm["avg_cost"] = float(avg_cost)
 
     if roi <= fees["hard_stop"]:
         mem = _portfolio_memory[broker_id][ticker]
@@ -4145,6 +4382,76 @@ _anti_chase_cache: dict = {}
 _ANTI_CHASE_CACHE_TTL = 60.0
 
 
+ENTRY_MAX_SPREAD_PCT_STOCK = 0.60
+ENTRY_MAX_SPREAD_PCT_CRYPTO = 1.00  # RH crypto embeds its fee in the spread
+ENTRY_MIN_DOLLAR_VOLUME_STOCK = 5_000_000.0
+ENTRY_MIN_STOCK_PRICE = 1.00
+_liquidity_cfg = {
+    "enabled": True,
+    "spread_stock": ENTRY_MAX_SPREAD_PCT_STOCK,
+    "spread_crypto": ENTRY_MAX_SPREAD_PCT_CRYPTO,
+    "adv_stock": ENTRY_MIN_DOLLAR_VOLUME_STOCK,
+}
+_adv_cache: dict = {}  # ticker -> (ts, avg daily $ volume or None)
+ADV_CACHE_TTL_SEC = 3600.0
+
+
+def spread_pct(bid, ask) -> float | None:
+    try:
+        b, a = float(bid), float(ask)
+    except (TypeError, ValueError):
+        return None
+    if b <= 0 or a <= 0 or a < b:
+        return None
+    return (a - b) / ((a + b) / 2.0) * 100.0
+
+
+def stock_avg_dollar_volume(ticker) -> float | None:
+    """20-session average of close × volume (yfinance, cached 1h)."""
+    sym = str(ticker or "").upper().strip()
+    if not sym:
+        return None
+    hit = _adv_cache.get(sym)
+    now = time.time()
+    if hit and now - hit[0] < ADV_CACHE_TTL_SEC:
+        return hit[1]
+    adv = None
+    try:
+        df = _get_yf().Ticker(sym).history(period="1mo", interval="1d")
+        if df is not None and len(df) >= 5:
+            tail = df.tail(20)
+            adv = float((tail["Close"] * tail["Volume"]).mean())
+    except Exception:
+        adv = None
+    _adv_cache[sym] = (now, adv)
+    return adv
+
+
+def entry_liquidity_block(ticker, *, is_crypto=False, bid_ask=None, price=0.0) -> str:
+    """'' when liquid enough to enter; else a DO NOT BUY reason. Unknown data passes."""
+    cfg = _liquidity_cfg
+    if not cfg.get("enabled", True):
+        return ""
+    if bid_ask:
+        sp = spread_pct(*bid_ask)
+        cap = float(cfg["spread_crypto"] if is_crypto else cfg["spread_stock"])
+        if sp is not None and sp > cap:
+            return f"DO NOT BUY (Wide spread {sp:.2f}% > {cap:.2f}%)"
+    if is_crypto:
+        return ""
+    try:
+        px = float(price or 0.0)
+    except (TypeError, ValueError):
+        px = 0.0
+    if 0 < px < ENTRY_MIN_STOCK_PRICE:
+        return f"DO NOT BUY (Sub-${ENTRY_MIN_STOCK_PRICE:.0f} stock ${px:.2f})"
+    adv = stock_avg_dollar_volume(ticker)
+    floor = float(cfg["adv_stock"])
+    if adv is not None and adv < floor:
+        return f"DO NOT BUY (Thin volume ${adv / 1e6:.1f}M/day < ${floor / 1e6:.0f}M)"
+    return ""
+
+
 def configure_entry_filters(settings: dict | None) -> None:
     """GUI settings → anti-chase gate (enabled flag + 2h run threshold in %)."""
     s = settings or {}
@@ -4155,6 +4462,24 @@ def configure_entry_filters(settings: dict | None) -> None:
         pct = ANTI_CHASE_DEFAULT_RUN_PCT
     _anti_chase_cfg["run_pct"] = max(0.5, min(10.0, pct))
     configure_sale_detect(s.get("interval_portfolio", 45))
+    _liquidity_cfg["enabled"] = bool(s.get("liquidity_gate_enabled", True))
+    for key, skey, lo, hi in (
+        ("spread_stock", "max_entry_spread_pct_stock", 0.05, 5.0),
+        ("spread_crypto", "max_entry_spread_pct_crypto", 0.05, 5.0),
+        ("adv_stock", "min_entry_dollar_volume_stock", 0.0, 1e9),
+    ):
+        if s.get(skey) is None:
+            continue
+        try:
+            _liquidity_cfg[key] = max(lo, min(hi, float(s.get(skey))))
+        except (TypeError, ValueError):
+            pass
+    global MAX_CRYPTO_CLUSTER_POSITIONS
+    if s.get("max_crypto_cluster_positions") is not None:
+        try:
+            MAX_CRYPTO_CLUSTER_POSITIONS = max(0, min(50, int(s.get("max_crypto_cluster_positions"))))
+        except (TypeError, ValueError):
+            pass
 
 
 def chase_run_pct(closes) -> float | None:

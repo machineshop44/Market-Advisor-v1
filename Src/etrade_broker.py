@@ -108,6 +108,13 @@ def qty_for_notional(dollars, price, allow_fractional=True):
     return float(math.floor(raw))
 
 
+def etrade_price_str(price) -> str:
+    """Equity tick: $0.01 at/above $1, $0.0001 below (sub-penny rejects otherwise)."""
+    p = Decimal(str(float(price)))
+    step = Decimal("0.01") if p >= 1 else Decimal("0.0001")
+    return str(p.quantize(step, rounding=ROUND_DOWN))
+
+
 def build_equity_order_xml(
     *,
     client_order_id,
@@ -119,11 +126,16 @@ def build_equity_order_xml(
     order_term="GOOD_FOR_DAY",
     market_session="REGULAR",
     preview_id=None,
+    stop_price=None,
 ):
     """Build PreviewOrderRequest / PlaceOrderRequest XML body."""
     symbol = str(symbol).upper().replace("-USD", "")
     qty = f"{float(quantity):.3f}".rstrip("0").rstrip(".") if float(quantity) % 1 else str(int(float(quantity)))
     limit_xml = f"<limitPrice>{float(limit_price):.2f}</limitPrice>" if limit_price is not None else "<limitPrice></limitPrice>"
+    stop_xml = (
+        f"<stopPrice>{etrade_price_str(stop_price)}</stopPrice>"
+        if stop_price is not None else "<stopPrice></stopPrice>"
+    )
     preview_xml = ""
     if preview_id is not None:
         preview_xml = f"<PreviewIds><previewId>{int(preview_id)}</previewId></PreviewIds>"
@@ -139,7 +151,7 @@ def build_equity_order_xml(
         f"<priceType>{price_type}</priceType>"
         f"<orderTerm>{order_term}</orderTerm>"
         f"<marketSession>{market_session}</marketSession>"
-        "<stopPrice></stopPrice>"
+        f"{stop_xml}"
         f"{limit_xml}"
         "<Instrument>"
         "<Product>"
@@ -195,7 +207,8 @@ class ETradeAdapter(BaseBroker):
         self.supports_fractional_equities = True
         self.supports_extended_hours = False  # deferred phase
         self.supports_options = False
-        self.supports_protective_stops = False
+        # GTC sell-stop on whole shares; fractional remainder stays on software TTP.
+        self.supports_protective_stops = True
         self.requires_daily_reauth = True
         self.min_equity_notional = MIN_EQUITY_NOTIONAL
         self.client = None
@@ -476,6 +489,15 @@ class ETradeAdapter(BaseBroker):
             except Exception:
                 pass
         return 0.0
+
+    def get_bid_ask(self, ticker, asset_type=""):
+        if not (self.is_connected and self.client):
+            return None
+        clean = str(ticker).upper().replace("-USD", "")
+        try:
+            return parse_etrade_bid_ask(self.client.get_quotes(clean), clean)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------- orders
     def _orders_allowed(self):
@@ -811,6 +833,60 @@ class ETradeAdapter(BaseBroker):
         except Exception as e:
             return f"E*TRADE sell error: {e}", None
 
+    def place_protective_stop(self, ticker, asset_type, quantity, entry_price, stop_pct,
+                              trail_pct=None):
+        """GTC sell-stop at entry × (1 − stop_pct). Triggers in the regular session only."""
+        if self._reject_crypto(ticker, asset_type):
+            return False, None, "E*TRADE crypto unsupported — software TTP only"
+        ok, reason = self._orders_allowed()
+        if not ok:
+            return False, None, reason
+        if not self.is_connected or not self.client or not self.account_id_key:
+            return False, None, "E*TRADE not connected"
+        try:
+            qty = float(math.floor(float(quantity or 0)))
+            entry = float(entry_price or 0)
+            stop_d = abs(float(stop_pct or 0))
+        except (TypeError, ValueError):
+            return False, None, "invalid qty/entry/stop"
+        if qty < 1.0:
+            return False, None, "fractional — broker stop N/A, TTP only"
+        if entry <= 0 or stop_d <= 0:
+            return False, None, "invalid qty/entry/stop"
+        stop_px = float(etrade_price_str(entry * (1.0 - stop_d)))
+        if stop_px <= 0:
+            return False, None, "stop price rounded to 0"
+        client_order_id = uuid.uuid4().hex[:18]
+        common = dict(
+            client_order_id=client_order_id,
+            symbol=ticker,
+            order_action="SELL",
+            quantity=qty,
+            price_type="STOP",
+            order_term="GOOD_UNTIL_CANCEL",
+            market_session="REGULAR",
+            stop_price=stop_px,
+        )
+        try:
+            preview = self.client.preview_equity_order(
+                self.account_id_key, build_equity_order_xml(**common)
+            )
+            preview_id = _extract_preview_id(preview)
+            if preview_id is None:
+                return False, None, f"E*TRADE stop preview failed: {preview}"
+            placed = self.client.place_equity_order(
+                self.account_id_key, build_equity_order_xml(preview_id=preview_id, **common)
+            )
+            order_id = _extract_order_id(placed)
+            if not order_id:
+                return False, None, f"E*TRADE stop place failed: {placed}"
+            self._last_order_meta[str(order_id)] = {
+                "side": "SELL", "qty": qty, "symbol": str(ticker).upper(), "kind": "stop",
+            }
+            return True, str(order_id), f"E*TRADE GTC stop {int(qty)} sh @ {stop_px:g} (id={order_id})"
+        except Exception as e:
+            return False, None, f"E*TRADE stop error: {e}"
+
     def confirm_order(self, order_id, is_crypto=False, timeout_sec=10):
         if is_crypto:
             return False, "crypto unsupported"
@@ -1038,6 +1114,26 @@ def parse_etrade_quote_price(data, symbol=None):
         if px > 0:
             return px
     return 0.0
+
+
+def parse_etrade_bid_ask(data, symbol=None):
+    """(bid, ask) from a quote payload's All block, or None."""
+    if not isinstance(data, dict):
+        return None
+    qroot = _as_dict(data.get("QuoteResponse") or data.get("quoteResponse") or data)
+    want = str(symbol or "").upper()
+    for q in _as_list(qroot.get("QuoteData") or qroot.get("quoteData")):
+        if not isinstance(q, dict):
+            continue
+        product = _as_dict(q.get("Product") or q.get("product"))
+        sym = str(product.get("symbol") or q.get("symbol") or "").upper()
+        if want and sym and sym != want:
+            continue
+        all_q = _as_dict(q.get("All") or q.get("all"))
+        bid, ask = _f(all_q.get("bid")), _f(all_q.get("ask"))
+        if bid > 0 and ask > 0:
+            return bid, ask
+    return None
 
 
 def _extract_preview_id(data):

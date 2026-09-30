@@ -13,6 +13,8 @@ Src/working_orders.json
 pdt_day_trades.json
 working_orders.json
 consecutive_loss_streak.json
+profit_lock.json
+Src/profit_lock.json
 Src/crash_log.txt
 Src/crash_log.txt.prev
 Src/_combo_arrow_*.png

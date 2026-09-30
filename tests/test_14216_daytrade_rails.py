@@ -141,7 +141,7 @@ class TestSessionSizeMult(unittest.TestCase):
         except Exception:
             et = timezone.utc
         open_t = datetime(2026, 3, 10, 9, 45, tzinfo=et)
-        mid = datetime(2026, 3, 10, 12, 0, tzinfo=et)
+        mid = datetime(2026, 3, 10, 14, 0, tzinfo=et)
         late = datetime(2026, 3, 10, 15, 45, tzinfo=et)
         m1, w1 = ac.equity_session_size_mult(open_t)
         m2, _ = ac.equity_session_size_mult(mid)

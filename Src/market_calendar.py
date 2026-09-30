@@ -6,7 +6,7 @@ walk-forward bar filtering without an external dependency.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 
 
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
@@ -88,3 +88,27 @@ def is_equity_session_day(d: date | None = None) -> bool:
     if d.weekday() >= 5:
         return False
     return not is_nyse_holiday(d)
+
+
+EARLY_CLOSE = time(13, 0)
+
+
+def early_close_time(d: date | None = None) -> time | None:
+    """
+    13:00 ET NYSE half days: July 3 and Dec 24 when they fall Mon–Thu, and the day after
+    Thanksgiving. None on normal days (and on holidays/weekends).
+    """
+    d = d or date.today()
+    if not is_equity_session_day(d):
+        return None
+    if d == _nth_weekday(d.year, 11, 3, 4) + timedelta(days=1):
+        return EARLY_CLOSE
+    if (d.month, d.day) in ((7, 3), (12, 24)) and d.weekday() <= 3:
+        return EARLY_CLOSE
+    return None
+
+
+def regular_close_hour(d: date | None = None) -> float:
+    """RTH close as fractional ET hour (16.0 normal, 13.0 on half days)."""
+    ec = early_close_time(d)
+    return (ec.hour + ec.minute / 60.0) if ec else 16.0

@@ -42,11 +42,13 @@ class TestCryptoMoversMerge(unittest.TestCase):
 
         payload = {
             "products": [
-                {"product_id": "WIF-USD", "status": "online", "price_percentage_change_24h": "12.5"},
+                {"product_id": "WIF-USD", "status": "online", "price_percentage_change_24h": "12.5",
+                 "approximate_quote_24h_volume": "90000000"},
                 {"product_id": "BTC-USD", "status": "online", "price_percentage_change_24h": "2.0"},
                 {"product_id": "USDT-USD", "status": "online", "price_percentage_change_24h": "0.1"},
                 {"product_id": "ETH-EUR", "status": "online", "price_percentage_change_24h": "9.0"},
-                {"product_id": "FLOKI-USD", "status": "online", "price_percentage_change_24h": "8.0"},
+                {"product_id": "FLOKI-USD", "status": "online", "price_percentage_change_24h": "8.0",
+                 "approximate_quote_24h_volume": "12000000"},
                 {"product_id": "FLOP-USD", "status": "delisted", "price_percentage_change_24h": "50.0"},
             ]
         }

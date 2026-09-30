@@ -324,6 +324,255 @@ def format_engine_pnl_line(by_engine: dict | None, *, money_fmt=None, limit: int
     return "Engines: " + " · ".join(parts)
 
 
+def classify_exit_reason(row: dict) -> str:
+    """Bucket a SELL row's reason/status into a coarse exit type."""
+    blob = f"{row.get('reason') or ''} {row.get('status') or ''}".upper()
+    if str(row.get("engine") or "").upper() == "EXTERNAL" or "EXTERNAL" in blob:
+        return "external"
+    for token, name in (
+        ("HARD STOP", "hard_stop"),
+        ("SCALE-OUT", "scale_out"),
+        ("TTP", "ttp"),
+        ("TRAIL", "ttp"),
+        ("STALE", "stale"),
+        ("ROTATE", "rotate"),
+        ("FLATTEN", "flatten"),
+        ("EOD", "flatten"),
+        ("TIME", "time"),
+        ("PROFIT", "take_profit"),
+    ):
+        if token in blob:
+            return name
+    return "other"
+
+
+def _score_bucket(score) -> str:
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "n/a"
+    lo = int(s // 10) * 10
+    return f"{lo}-{lo + 9}"
+
+
+def _band(value, cuts, top_label) -> str:
+    """cuts: ((upper_exclusive, label), ...) ascending; None → 'n/a'."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    for upper, label in cuts:
+        if v < upper:
+            return label
+    return top_label
+
+
+def _stat_bucket() -> dict:
+    return {"n": 0, "wins": 0, "net": 0.0, "gross_win": 0.0, "gross_loss": 0.0, "r_sum": 0.0, "r_n": 0}
+
+
+def _finish_stat(b: dict) -> dict:
+    n = int(b.get("n") or 0)
+    gl = abs(float(b.get("gross_loss") or 0.0))
+    return {
+        "n": n,
+        "win_rate": (b["wins"] / n) if n else None,
+        "net": round(float(b.get("net") or 0.0), 2),
+        "expectancy": (float(b["net"]) / n) if n else None,
+        "profit_factor": (float(b["gross_win"]) / gl) if gl > 1e-9 else None,
+        "avg_r": (b["r_sum"] / b["r_n"]) if b.get("r_n") else None,
+    }
+
+
+def summarize_round_trips(rows: list[dict], *, broker: str | None = None) -> dict[str, Any]:
+    """
+    FIFO-pair fills into round trips (flat → flat per broker/ticker), net of fees.
+    Returns totals plus by_hour (entry hour), by_exit (exit reason), by_score, by_engine,
+    avg MFE/MAE, R-multiples (net P&L ÷ journaled initial_risk), and failed-order counts.
+    """
+    open_trades: dict[tuple[str, str], dict] = {}
+    trips: list[dict] = []
+    failed: dict[str, int] = {}
+
+    def _fee(row: dict, notion: float) -> float:
+        fe = _row_broker_fee_dollars(row)
+        if fe is None:
+            try:
+                fe = float(row.get("fee_est")) if row.get("fee_est") is not None else 0.0
+            except (TypeError, ValueError):
+                fe = 0.0
+        return float(fe or 0.0)
+
+    for row in rows or []:
+        b = str(row.get("broker") or "Unknown")
+        if broker and b != broker:
+            continue
+        side = str(row.get("side") or "").upper()
+        if side not in ("BUY", "SELL"):
+            continue
+        status = str(row.get("status") or "")
+        if "Fail" in status or "Reject" in status:
+            failed[b] = failed.get(b, 0) + 1
+            continue
+        if not _is_fill(row):
+            continue
+        ticker = str(row.get("ticker") or "").upper().replace("-USD", "")
+        key = (b, ticker)
+        notion = _notional(row)
+        try:
+            px = float(row.get("fill_price") or row.get("price") or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        try:
+            qty = abs(float(row.get("qty") or 0.0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0 and px > 0 and notion > 0:
+            qty = notion / px
+        if qty <= 0:
+            continue
+        fee = _fee(row, notion)
+        if side == "BUY":
+            t = open_trades.get(key)
+            if t is None:
+                t = open_trades[key] = {
+                    "broker": b, "ticker": ticker, "qty": 0.0, "cost": 0.0, "pnl": 0.0,
+                    "fees": 0.0, "risk": 0.0, "entry_ts": _parse_ts(row),
+                    "score": row.get("score"), "engine": infer_engine(row),
+                    "rvol": row.get("rvol"), "vwap": row.get("vwap_stretch_pct"),
+                    "rs": row.get("rs_pct"),
+                }
+            t["qty"] += qty
+            t["cost"] += px * qty
+            t["fees"] += fee
+            try:
+                t["risk"] += float(row.get("initial_risk") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            continue
+        t = open_trades.get(key)
+        if t is None or t["qty"] <= 1e-12:
+            continue
+        take = min(qty, t["qty"])
+        avg = t["cost"] / t["qty"] if t["qty"] > 0 else 0.0
+        t["pnl"] += (px - avg) * take
+        t["fees"] += fee
+        t["cost"] -= avg * take
+        t["qty"] -= take
+        if t["qty"] > max(1e-9, 0.02 * take):
+            continue
+        exit_ts = _parse_ts(row)
+        net = t["pnl"] - t["fees"]
+        trips.append({
+            **{k: t[k] for k in ("broker", "ticker", "score", "engine", "rvol", "vwap", "rs")},
+            "net": net,
+            "r": (net / t["risk"]) if t["risk"] > 1e-9 else None,
+            "entry_hour": t["entry_ts"].hour if t["entry_ts"] else None,
+            "exit": classify_exit_reason(row),
+            "mfe": row.get("mfe_roi"),
+            "mae": row.get("mae_roi"),
+            "hold_min": (
+                (exit_ts - t["entry_ts"]).total_seconds() / 60.0
+                if exit_ts and t["entry_ts"] else None
+            ),
+        })
+        open_trades.pop(key, None)
+
+    total = _stat_bucket()
+    groups: dict[str, dict[str, dict]] = {
+        "by_hour": {}, "by_exit": {}, "by_score": {}, "by_engine": {},
+        "by_rvol": {}, "by_vwap": {}, "by_rs": {},
+    }
+    mfe_vals, mae_vals = [], []
+    for tr in trips:
+        labels = {
+            "by_hour": f"{tr['entry_hour']:02d}:00" if tr["entry_hour"] is not None else "n/a",
+            "by_exit": tr["exit"],
+            "by_score": _score_bucket(tr["score"]),
+            "by_engine": tr["engine"] or "OTHER",
+            "by_rvol": _band(tr.get("rvol"), ((0.8, "<0.8x"), (1.5, "0.8-1.5x")), "≥1.5x"),
+            "by_vwap": _band(tr.get("vwap"), ((0.0, "below VWAP"), (1.0, "0-1% over")), ">1% over"),
+            "by_rs": _band(tr.get("rs"), ((0.0, "lagging"),), "leading"),
+        }
+        for bkt in [total] + [groups[g].setdefault(lbl, _stat_bucket()) for g, lbl in labels.items()]:
+            bkt["n"] += 1
+            bkt["net"] += tr["net"]
+            if tr["net"] > 0:
+                bkt["wins"] += 1
+                bkt["gross_win"] += tr["net"]
+            else:
+                bkt["gross_loss"] += tr["net"]
+            if tr["r"] is not None:
+                bkt["r_sum"] += tr["r"]
+                bkt["r_n"] += 1
+        for src, dst in (("mfe", mfe_vals), ("mae", mae_vals)):
+            try:
+                if tr[src] is not None:
+                    dst.append(float(tr[src]))
+            except (TypeError, ValueError):
+                pass
+
+    out = _finish_stat(total)
+    out.update({g: {k: _finish_stat(v) for k, v in sorted(d.items())} for g, d in groups.items()})
+    out["avg_mfe_pct"] = (sum(mfe_vals) / len(mfe_vals) * 100.0) if mfe_vals else None
+    out["avg_mae_pct"] = (sum(mae_vals) / len(mae_vals) * 100.0) if mae_vals else None
+    out["open_count"] = len(open_trades)
+    out["failed_orders"] = failed
+    out["trips"] = trips
+    return out
+
+
+def format_round_trip_report(summary: dict, *, money_fmt=None) -> str:
+    """Plain-text block for the Reports tab."""
+
+    def _m(x):
+        if callable(money_fmt):
+            return money_fmt(x)
+        return f"${float(x or 0):,.2f}"
+
+    def _pct(x):
+        return "—" if x is None else f"{float(x) * 100:.0f}%"
+
+    def _num(x, fmt="{:.2f}"):
+        return "—" if x is None else fmt.format(float(x))
+
+    def _line(label, s):
+        return (
+            f"  {label:<12} n={s['n']:<3} win {_pct(s['win_rate']):>4}  "
+            f"net {_m(s['net']):>10}  exp {_m(s['expectancy'] or 0):>8}  "
+            f"PF {_num(s['profit_factor']):>5}  avgR {_num(s['avg_r']):>5}"
+        )
+
+    s = summary or {}
+    if not s.get("n"):
+        return "Round trips: none closed in this window."
+    lines = [
+        "ROUND TRIPS (net of fees, flat→flat)",
+        _line("All", s),
+        f"  Avg MFE {_num(s.get('avg_mfe_pct'), '{:.2f}%')} · Avg MAE {_num(s.get('avg_mae_pct'), '{:.2f}%')}"
+        f" · still open {s.get('open_count', 0)}",
+    ]
+    failed = s.get("failed_orders") or {}
+    if failed:
+        lines.append("  Failed orders: " + ", ".join(f"{b} {n}" for b, n in sorted(failed.items())))
+    for title, key in (
+        ("By exit reason", "by_exit"),
+        ("By entry hour", "by_hour"),
+        ("By score", "by_score"),
+        ("By engine", "by_engine"),
+        ("By entry RVOL (shadow)", "by_rvol"),
+        ("By VWAP stretch (shadow)", "by_vwap"),
+        ("By rel. strength (shadow)", "by_rs"),
+    ):
+        grp = s.get(key) or {}
+        if not grp or set(grp) == {"n/a"}:
+            continue
+        lines.append(title)
+        for label, st in grp.items():
+            lines.append(_line(str(label), st))
+    return "\n".join(lines)
+
+
 def _row_broker_fee_dollars(row: dict) -> float | None:
     """Prefer explicit broker invoice fields when present on a journal row."""
     for key in ("fee_paid", "commission", "broker_fee", "fees"):

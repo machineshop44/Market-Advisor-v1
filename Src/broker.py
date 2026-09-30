@@ -146,6 +146,10 @@ class BaseBroker:
     def get_account_balances(self): raise NotImplementedError
     def get_current_holdings(self): raise NotImplementedError
     def get_live_price(self, ticker, allow_yahoo_fallback=True): raise NotImplementedError
+
+    def get_bid_ask(self, ticker, asset_type=""):
+        """(bid, ask) from the broker's own book, or None when unavailable."""
+        return None
     def place_buy_order(self, ticker, asset_type, price, trade_dollars, offset_pct, use_ext_hours,
                         market_hours="regular_hours", allow_fractional=True): raise NotImplementedError
     def place_sell_order(self, ticker, asset_type, price, shares_val, offset_pct, use_ext_hours,
@@ -779,6 +783,20 @@ class RobinhoodAdapter(BaseBroker):
         except Exception:
             pass
         return 0.0
+
+    def get_bid_ask(self, ticker, asset_type=""):
+        clean = str(ticker).replace("-USD", "").upper()
+        try:
+            if "crypto" in str(asset_type).lower() or is_known_crypto(clean):
+                q = r.crypto.get_crypto_quote(clean)
+            else:
+                qs = r.stocks.get_quotes(clean) or []
+                q = qs[0] if qs else None
+            q = q if isinstance(q, dict) else {}
+            bid, ask = float(q.get("bid_price") or 0), float(q.get("ask_price") or 0)
+            return (bid, ask) if bid > 0 and ask > 0 else None
+        except Exception:
+            return None
 
     def _get_crypto_order_limits(self, ticker):
         """Return (qty_increment, min_order_qty) for Robinhood crypto."""
@@ -2006,6 +2024,23 @@ class CoinbaseAdapter(BaseBroker):
             pass
         return 0.0
 
+    def get_bid_ask(self, ticker, asset_type=""):
+        if not getattr(self, "client", None):
+            return None
+        pid = f"{str(ticker).replace('-USD', '').upper()}-USD"
+        try:
+            data = self._cb_payload(
+                self._cb_call(self.client.get_best_bid_ask, product_ids=[pid])
+            )
+            books = data.get("pricebooks") or []
+            book = books[0] if books and isinstance(books[0], dict) else {}
+            bids, asks = book.get("bids") or [], book.get("asks") or []
+            bid = float((bids[0] or {}).get("price") or 0) if bids else 0.0
+            ask = float((asks[0] or {}).get("price") or 0) if asks else 0.0
+            return (bid, ask) if bid > 0 and ask > 0 else None
+        except Exception:
+            return None
+
     def _get_product_limits(self, ticker):
         """
         Return dict with base_increment, base_min_size, quote_min_size for a CB product.
@@ -2110,6 +2145,11 @@ class CoinbaseAdapter(BaseBroker):
         clean = str(ticker).replace("-USD", "").upper()
         product_id = f"{clean}-USD"
 
+        if getattr(self, "maker_entries", False):
+            maker = self._maker_buy(clean, float(trade_dollars or 0))
+            if maker is not None:
+                return maker
+
         try:
             client_order_id = str(int(time.time() * 1000))
             off = float(offset_pct or 0)
@@ -2189,6 +2229,81 @@ class CoinbaseAdapter(BaseBroker):
             return f"Fail: {data.get('error_response', 'Unknown Error')}", 0.0, None
         except Exception as e:
             return f"Fail: {e}", 0.0, None
+
+    def _order_filled_value(self, order_id):
+        """(filled_base, filled_quote_value) for an order; (0, 0) if unknown."""
+        try:
+            data = self._cb_payload(self._cb_call(self.client.get_order, order_id))
+            order = _as_dict(data.get("order")) or data or {}
+            size = float(order.get("filled_size") or 0)
+            value = float(order.get("filled_value") or 0)
+            if value <= 0 and size > 0:
+                value = size * float(order.get("average_filled_price") or 0)
+            return size, value
+        except Exception:
+            return 0.0, 0.0
+
+    def _maker_buy(self, clean, trade_dollars):
+        """
+        Post-only limit at the best bid (maker fee tier). Waits maker_timeout_sec, then cancels.
+        Returns an order tuple, or None to fall back to the normal taker path
+        (no book / post-only rejected because it would cross).
+        """
+        if trade_dollars <= 0:
+            return None
+        ba = self.get_bid_ask(clean, "crypto")
+        if not ba:
+            return None
+        bid, ask = ba
+        limits = self._get_product_limits(clean)
+        d_q = Decimal(str(float(limits.get("quote_increment", 0.01) or 0.01)))
+        d_inc = Decimal(str(float(limits.get("base_increment", 0.00000001) or 0.00000001)))
+        limit_dec = (Decimal(str(bid)) / d_q).to_integral_value(rounding=ROUND_DOWN) * d_q
+        if limit_dec >= Decimal(str(ask)):
+            limit_dec -= d_q
+        if limit_dec <= 0:
+            return None
+        base_qty = (Decimal(str(trade_dollars)) / limit_dec / d_inc).quantize(
+            Decimal("1"), rounding=ROUND_DOWN
+        ) * d_inc
+        if base_qty <= 0:
+            return None
+        timeout = max(10, int(getattr(self, "maker_timeout_sec", 45) or 45))
+        try:
+            res = self._cb_call(
+                self.client.limit_order_gtc_buy,
+                client_order_id=f"mk-{int(time.time() * 1000)}",
+                product_id=f"{clean}-USD",
+                base_size=format(base_qty, "f"),
+                limit_price=format(limit_dec, "f"),
+                post_only=True,
+            )
+            data = self._cb_payload(res)
+        except Exception:
+            return None
+        if not data.get("success"):
+            return None
+        oid = self._extract_order_id(data)
+        if not oid:
+            return None
+        filled, state = self.confirm_order(oid, is_crypto=True, timeout_sec=timeout)
+        if filled:
+            _, value = self._order_filled_value(oid)
+            spent = value if value > 0 else float(base_qty * limit_dec)
+            return f"Coinbase Buy Filled (maker @ {format(limit_dec, 'f')} {spent:.2f})", spent, oid
+        cancel_ok, cancel_st = self.cancel_order(oid, is_crypto=True)
+        _, value = self._order_filled_value(oid)
+        if value > 0:
+            # Partial maker fill before cancel — position is real, report what filled.
+            return f"Coinbase Buy Filled (maker partial {value:.2f} of {trade_dollars:.2f})", value, oid
+        if not cancel_ok:
+            return (
+                f"Coinbase Buy submitted pending fill (maker {trade_dollars:.2f}; {state}; "
+                f"cancel failed: {cancel_st}; left working)",
+                0.0,
+                oid,
+            )
+        return f"Skipped: Maker bid unfilled in {timeout}s ({state}) — cancelled", 0.0, None
 
     def _available_base_qty(self, ticker):
         """Sellable (available, not hold) base size for a currency."""
