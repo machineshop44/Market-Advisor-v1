@@ -30,6 +30,9 @@ AUTHORIZE_URL = "https://us.etrade.com/e/t/etws/authorize"
 
 _MIN_REQUEST_GAP_SEC = 0.35
 _MAX_RETRIES = 4
+_HTTP_TIMEOUT = (8, 20)  # (connect, read) seconds
+# Whole-request budget across retries; stays well under the 180s cycle-stall watchdog.
+_REQUEST_BUDGET_SEC = 50.0
 
 
 class ETradeAPIError(Exception):
@@ -188,8 +191,14 @@ class ETradeClient:
             headers["Content-Type"] = "application/json"
             data = json.dumps(json_body).encode("utf-8")
 
+        # A placed order may have executed even when the response timed out or 5xx'd;
+        # resending would risk a duplicate fill.
+        is_place = method.upper() != "GET" and "/place" in path
+        deadline = time.time() + _REQUEST_BUDGET_SEC
         last_err = None
         for attempt in range(_MAX_RETRIES):
+            if attempt and time.time() >= deadline:
+                break
             self._throttle()
             auth = self._oauth(self.access_token, self.access_token_secret)
             try:
@@ -200,15 +209,24 @@ class ETradeClient:
                     data=data,
                     headers=headers,
                     auth=auth,
-                    timeout=45,
+                    timeout=_HTTP_TIMEOUT,
                 )
             except Exception as e:
                 last_err = e
+                if is_place and not isinstance(e, requests.exceptions.ConnectTimeout):
+                    break
                 time.sleep(min(8.0, (0.5 * (2 ** attempt)) + random.random() * 0.2))
                 continue
             finally:
                 self._last_request_ts = time.time()
 
+            if is_place and resp.status_code in (500, 502, 503, 504):
+                raise ETradeAPIError(
+                    f"E*TRADE {method.upper()} {path} returned HTTP {resp.status_code} — "
+                    "order state unknown; check open orders before retrying",
+                    status_code=resp.status_code,
+                    body=resp.text,
+                )
             if resp.status_code in (429, 500, 502, 503, 504):
                 time.sleep(min(8.0, (0.6 * (2 ** attempt)) + random.random() * 0.3))
                 last_err = ETradeAPIError(

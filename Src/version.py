@@ -14,13 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.45"
+__version__ = "1.42.46"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Working-order & stop blotter with cancel; opt-in entry-quality rank (RVOL/VWAP/RS); "
-    "Settings for maker wait, lunch/crypto sizing, crypto cluster cap; builds on 1.42.44 "
-    "profit lock, loss stop anchor, E*TRADE GTC stops"
+    "Desk focus never lands on a closed broker; equity focus no longer parks crypto; "
+    "E*TRADE request budget (no 180s stalls) and no blind order resends; stop wording fixed"
 )
 
 

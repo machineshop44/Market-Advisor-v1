@@ -3953,7 +3953,7 @@ class MarketAdvisorGUI(QMainWindow):
             "description": "Auto-trader heartbeat — balances & day P&L by broker",
             "color": color,
             "fields": fields,
-            "footer": {"text": f"{display_name()} · dual-broker telemetry"},
+            "footer": {"text": f"{display_name()} · multi-broker telemetry"},
             "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
 
@@ -14287,9 +14287,32 @@ class MarketAdvisorGUI(QMainWindow):
                 return getattr(self, "_desk_focus_broker_cache", None)
         except Exception:
             return getattr(self, "_desk_focus_broker_cache", None)
+        try:
+            ctx_map = {
+                name: ctx for name, ctx in (ctx_map or {}).items()
+                if self._broker_buy_session_open(name)
+            }
+        except Exception:
+            pass
         focus = do.resolve_focus_broker(ctx_map or {}, self.settings)
         self._desk_focus_broker_cache = focus
         return focus
+
+    def _broker_buy_session_open(self, broker_name) -> bool:
+        """True when at least one of this broker's buy engines may place orders right now."""
+        if self._broker_supports(broker_name, "supports_crypto"):
+            return True
+        if not self._broker_supports(broker_name, "supports_equities"):
+            return False
+        if not self.is_equity_session_active():
+            return False
+        if broker_name == "E*TRADE":
+            ok, _ = _auto_cycle.etrade_equity_session_ok(
+                self.get_equity_session_info(),
+                broker=self.brokers.get("E*TRADE"),
+            )
+            return bool(ok)
+        return True
 
     def _profit_guard_rest_reason(self) -> str:
         """
@@ -14342,7 +14365,7 @@ class MarketAdvisorGUI(QMainWindow):
         task.start()
         return last_why
 
-    def _buy_engines_should_rest(self, broker_name) -> tuple[bool, str]:
+    def _buy_engines_should_rest(self, broker_name, engine=None) -> tuple[bool, str]:
         """
         True when CRYPTO/PENNY/CORE should not enqueue (PORTFOLIO still runs).
         Cheap: cached BP/holdings + local DD flag — no live broker APIs.
@@ -14353,7 +14376,8 @@ class MarketAdvisorGUI(QMainWindow):
         if store is None:
             self._buy_rest_cache = {}
             store = self._buy_rest_cache
-        hit = store.get(broker_name)
+        key = (broker_name, str(engine or ""))
+        hit = store.get(key)
         if isinstance(hit, tuple) and len(hit) == 3:
             ts, resting, why = hit
             if now - float(ts or 0.0) < 2.0:
@@ -14362,11 +14386,17 @@ class MarketAdvisorGUI(QMainWindow):
         import desk_orchestration as do
         focus = self._desk_focus_broker()
         combined_eq = float(self._launch_equity_total() or 0.0)
-        if do.focus_parks_buys(
+        # Cash is per-broker: an equity-only focus can't use this broker's crypto BP.
+        crypto_exempt = (
+            str(engine or "").upper() == "CRYPTO"
+            and bool(focus)
+            and not self._broker_supports(focus, "supports_crypto")
+        )
+        if not crypto_exempt and do.focus_parks_buys(
             broker_name, focus, self.settings, combined_equity=combined_eq,
         ):
             out = (True, f"Desk focus on {focus} — buy engines parked here (autosizing unchanged)")
-            store[broker_name] = (now, out[0], out[1])
+            store[key] = (now, out[0], out[1])
             return out
         # Micro crypto capital park (optional; default off so leftover CB BP still buys)
         try:
@@ -14379,23 +14409,23 @@ class MarketAdvisorGUI(QMainWindow):
             deploy = deploy * util
             parked, why = do.micro_broker_buy_parked(broker_name, deploy, self.settings)
             if parked:
-                store[broker_name] = (now, True, why)
+                store[key] = (now, True, why)
                 return True, why
         except Exception:
             pass
         pg = self._profit_guard_rest_reason()
         if pg:
-            store[broker_name] = (now, True, pg)
+            store[key] = (now, True, pg)
             return True, pg
         if self._dd_paused_for_broker(broker_name):
             out = (True, "DD pause — buy engines resting (portfolio sells still run)")
-            store[broker_name] = (now, out[0], out[1])
+            store[key] = (now, out[0], out[1])
             return out
         idle = self._buy_engines_idle_reason(broker_name)
         if idle:
-            store[broker_name] = (now, True, idle)
+            store[key] = (now, True, idle)
             return True, idle
-        store[broker_name] = (now, False, "")
+        store[key] = (now, False, "")
         return False, ""
 
     def _interval_with_focus(self, broker_name: str, base_key: str, default: float) -> float:
@@ -16123,7 +16153,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.send_discord_alert(
                 f"🛑 Auto-Trader **DISARMED** ({mode}) — stopped: {stopped}.",
                 urgent=True,
-                prefix="[RISK]",
+                prefix="[DESK]",
                 broker="App",
             )
 
@@ -16353,7 +16383,7 @@ class MarketAdvisorGUI(QMainWindow):
             if now - self.last_crypto_time[broker_name] >= self._interval_with_focus(
                 broker_name, "interval_crypto", 45
             ):
-                rest, rest_why = self._buy_engines_should_rest(broker_name)
+                rest, rest_why = self._buy_engines_should_rest(broker_name, engine="CRYPTO")
                 if rest:
                     self._throttled_log(
                         f"{broker_name}:buy_engines_idle",

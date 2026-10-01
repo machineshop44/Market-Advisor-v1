@@ -359,7 +359,7 @@ class TestCycleBookExtract(unittest.TestCase):
         chip, tip, col = ac.etrade_home_env_chip(
             environment="live", live_trading=True, buying_power=0.0, min_trade_dollars=5,
         )
-        self.assertIn("stops N/A", chip)
+        self.assertIn("GTC stops", chip)
         self.assertIn("$0", chip)
         self.assertIn("funding", tip.lower())
         bp_txt, bp_tip = ac.etrade_bp_label(0.0, environment="live")

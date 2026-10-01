@@ -254,10 +254,11 @@ def etrade_path_honesty_note(
     if low:
         return (
             "E*TRADE: live · orders ON but ~$0 BP — buy engines parked until "
-            "funded BP; verify account selection. Stops N/A (TTP only)."
+            "funded BP; verify account selection."
         )
     return (
-        "E*TRADE: live · orders ON — real path. Protective stops N/A (software TTP only)."
+        "E*TRADE: live · orders ON — real path. GTC broker stops on whole shares; "
+        "fractional remainders on software TTP."
     )
 
 

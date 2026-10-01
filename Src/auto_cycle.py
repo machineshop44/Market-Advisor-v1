@@ -695,7 +695,7 @@ def etrade_home_env_chip(
 ) -> tuple[str, str, str]:
     """
     Home E*TRADE env chip: (label, tooltip, color_hex).
-    Surfaces Stops N/A · TTP and live $0 BP honesty (not sandbox-only).
+    Surfaces stop coverage and live $0 BP honesty (not sandbox-only).
     """
     env = str(environment or "sandbox").lower()
     try:
@@ -719,24 +719,22 @@ def etrade_home_env_chip(
         return chip, tip, "#F9A825"
 
     if live_trading:
-        chip = "Live · orders ON · stops N/A"
+        chip = "Live · orders ON · GTC stops"
         tip = (
             "Live environment with live order placement enabled. "
-            "Protective stops N/A on E*TRADE — software TTP only. Repair skips E*TRADE."
+            "Whole-share positions get a GTC broker stop; fractional remainders stay on software TTP."
         )
         col = "#2E7D32"
     else:
-        chip = "Live · orders OFF · stops N/A"
+        chip = "Live · orders OFF"
         tip = (
             "Live environment but live trading kill-switch is OFF (read-only). "
-            "Enable in Settings after validation. Protective stops N/A (TTP only)."
+            "Enable in Settings after validation."
         )
         col = "#EF6C00"
 
     if low_bp:
-        chip = chip.replace(" · stops N/A", " · $0 BP · stops N/A")
-        if "stops N/A" not in chip:
-            chip = f"{chip} · $0 BP"
+        chip = f"{chip} · $0 BP"
         tip += (
             " Buying power is ~$0 — buy engines parked; verify funding / account "
             "selection before arming (no fake live fills)."
