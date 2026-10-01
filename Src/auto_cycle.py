@@ -1400,6 +1400,23 @@ def crypto_session_size_mult(now_et=None, *, settings=None) -> tuple[float, str]
     return 1.0, ""
 
 
+def heartbeat_should_skip(fingerprint, last_fingerprint, secs_since_last_post: float, settings=None) -> bool:
+    """
+    Skip an hourly heartbeat when broker status, whole-dollar equity/cash, armed set and
+    market session match the last post — but never stay quiet past the max-quiet window.
+    """
+    s = settings or {}
+    if not bool(s.get("discord_heartbeat_skip_unchanged", True)):
+        return False
+    if last_fingerprint is None or fingerprint != last_fingerprint:
+        return False
+    try:
+        quiet_h = float(s.get("discord_heartbeat_max_quiet_hours", 4) or 4)
+    except (TypeError, ValueError):
+        quiet_h = 4.0
+    return float(secs_since_last_post or 0) < max(1.0, quiet_h) * 3600.0 - 60.0
+
+
 def interleave_tasks_by_broker(queue: list) -> list:
     """
     Round-robin by broker so one venue's PORTFOLIO/XML work cannot starve others

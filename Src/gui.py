@@ -7,6 +7,7 @@ import json
 import builtins
 import webbrowser
 import urllib.request
+import concurrent.futures
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_DOWN
@@ -298,6 +299,10 @@ def load_settings():
         "crypto_off_hours_size_mult": 0.75,
         "max_crypto_cluster_positions": 5,
         "entry_quality_rank_enabled": False,
+        "scan_score_budget_sec": 75,
+        "discord_heartbeat_skip_unchanged": True,
+        "discord_heartbeat_max_quiet_hours": 4,
+        "verbose_cycle_log": False,
         "advisor_ai_max_per_minute": 4,
         "advisor_ai_max_per_day": 20,
         "advisor_ai_local_when_clear": True,
@@ -3896,6 +3901,7 @@ class MarketAdvisorGUI(QMainWindow):
         active = [b for b, on in self.auto_trade_enabled.items() if on]
         totals = getattr(self, "_last_balance_totals", {}) or {}
         fields = []
+        fingerprint = []
         combined_eq = combined_cash = combined_pl = 0.0
 
         # Always show both brokers (armed or not) so a false loss-halt doesn't "erase" RH from Discord
@@ -3915,6 +3921,7 @@ class MarketAdvisorGUI(QMainWindow):
                 status = "✅ Online · Armed"
             else:
                 status = "⏸️ Online · Disarmed"
+            fingerprint.append((name, status, round(p_val), round(bp)))
             pl_txt = f"+{format_money(pl)}" if pl >= 0 else format_money(pl)
             fields.append({
                 "name": name,
@@ -3967,6 +3974,16 @@ class MarketAdvisorGUI(QMainWindow):
                 slot_dt = slot_dt - timedelta(hours=1)
             self._last_heartbeat_slot = slot_dt.strftime("%Y-%m-%d %H:%M")
 
+        fp = (tuple(fingerprint), tuple(active), market)
+        if _auto_cycle.heartbeat_should_skip(
+            fp,
+            getattr(self, "_last_heartbeat_fp", None),
+            now_ts - float(getattr(self, "_last_heartbeat_post_ts", 0) or 0),
+            self.settings,
+        ):
+            return
+        self._last_heartbeat_fp = fp
+        self._last_heartbeat_post_ts = now_ts
         self.send_discord_alert(f"Heartbeat {clock}", embed=embed, prefix="[HEARTBEAT]", broker="App")
         self.log_event(f"Discord heartbeat sent ({mode})")
 
@@ -4265,7 +4282,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._throttled_log(f"{key}:zero_signal_coach", f"[COACH] {msg}", cooldown_sec=3600)
 
     def _reorder_task_queue_buy_focus(self):
-        """When only some brokers can still buy, run focus broker cycles first."""
+        """Sell checks (PORTFOLIO) first, then focus-broker buy cycles, then the rest."""
         if not self.task_queue:
             return
         import desk_orchestration as do
@@ -4281,7 +4298,7 @@ class MarketAdvisorGUI(QMainWindow):
             else:
                 broker_prio = 2
             task_prio = 0 if task in buy_tasks else 1
-            return (broker_prio, task_prio)
+            return (0 if task == "PORTFOLIO" else 1, broker_prio, task_prio)
 
         self.task_queue.sort(key=sort_key)
         # Round-robin remaining same-priority items across brokers
@@ -16780,7 +16797,9 @@ class MarketAdvisorGUI(QMainWindow):
         self._cycle_broker = broker_name
         self._cycle_task = task
         self._set_trading_context(broker_name)
-        self.log_event(f"[AUTO] Starting {task} cycle on {broker_name}")
+        self._cycle_started_ts = time.time()
+        if bool(self.settings.get("verbose_cycle_log", False)):
+            self.log_event(f"[AUTO] Starting {task} cycle on {broker_name}")
 
         # Sandbox/no-BP: skip buy engines already in queue; PORTFOLIO still runs
         if task in ("CRYPTO", "PENNY", "CORE"):
@@ -16871,7 +16890,12 @@ class MarketAdvisorGUI(QMainWindow):
         self._queue_started_at = None
         self._stall_alerted = False
         if finished_broker:
-            self.log_event(f"[AUTO] Cycle finished for {finished_broker}")
+            took = time.time() - float(getattr(self, "_cycle_started_ts", 0) or time.time())
+            task = getattr(self, "_cycle_task", "") or ""
+            if bool(self.settings.get("verbose_cycle_log", False)):
+                self.log_event(f"[AUTO] Cycle finished for {finished_broker}")
+            elif took >= 30.0:
+                self.log_event(f"[AUTO] Slow {task} cycle on {finished_broker}: {took:.0f}s")
         self.process_queue()
 
     # ---------------------------------------------------------
@@ -20570,9 +20594,11 @@ class MarketAdvisorGUI(QMainWindow):
         flush_state()
         return results
 
-    def _bg_score_opportunities(self, items):
+    def _bg_score_opportunities(self, items, budget_sec=None):
         from scoring import evaluate_crypto_opportunity, evaluate_opportunity, posture_for_broker
         results = []
+        deadline = (time.time() + float(budget_sec)) if budget_sec else None
+        budget_skipped = 0
         # Price/score in the cycle broker's context (E*TRADE equities use ET, not RH)
         cycle = self.cycle_broker
         cycle_id = getattr(cycle, "broker_id", None) or self.cycle_broker_name
@@ -20585,6 +20611,10 @@ class MarketAdvisorGUI(QMainWindow):
         with SuppressPrints():
             for entry in items:
                 row, ticker, shares, avg_cost, asset_type = entry[:5]
+                if deadline is not None and time.time() > deadline:
+                    budget_skipped += 1
+                    results.append((row, 0.0, "SKIPPED (scan time budget)", asset_type, None))
+                    continue
                 is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
                 is_crypto_mover = "crypto mover" in str(asset_type).lower()
                 is_penny = (
@@ -20618,6 +20648,13 @@ class MarketAdvisorGUI(QMainWindow):
                         live_price=price, posture=posture,
                     )
                 results.append((row, price, action, asset_type, None))
+        if budget_skipped:
+            self._throttled_log(
+                f"{self.cycle_broker_name}:scan_budget",
+                f"[{self.cycle_broker_name}] Scan hit its {float(budget_sec):.0f}s budget — "
+                f"scored {len(items) - budget_skipped}/{len(items)}; rest wait for the next cycle.",
+                cooldown_sec=900,
+            )
         return results
 
     def toggle_all_rows(self, table, check_state):
@@ -20658,7 +20695,11 @@ class MarketAdvisorGUI(QMainWindow):
             items.append((i, sym, 0.0, 0.0, o.get("type", "")))
         if not items:
             return [], [], [], []
-        results = self._bg_score_opportunities(items)
+        try:
+            budget = float(self.settings.get("scan_score_budget_sec", 75) or 75)
+        except (TypeError, ValueError):
+            budget = 75.0
+        results = self._bg_score_opportunities(items, budget_sec=max(20.0, budget))
 
         broker_name = self.cycle_broker_name
         broker_id = getattr(self.brokers.get(broker_name), "broker_id", None) or str(broker_name).upper()
@@ -20944,7 +20985,11 @@ class MarketAdvisorGUI(QMainWindow):
                     self.manual_portfolio_reload(and_score=False, force=True)
                 except Exception:
                     pass
-            self.log_event(f"[AUTO] [{broker}] Portfolio empty — no sells this cycle")
+            self._throttled_log(
+                f"{broker}:portfolio_empty",
+                f"[AUTO] [{broker}] Portfolio empty — no sells this cycle",
+                cooldown_sec=1800,
+            )
             self.set_working_state(False)
             self.cycle_finished()
             return
@@ -21006,7 +21051,10 @@ class MarketAdvisorGUI(QMainWindow):
             deferred=deferred,
             first_defer_this_session=bool(notes_tmp),
         )
-        if trail:
+        quiet_zero = not sell_n and not notes_tmp and not deferred
+        if trail and quiet_zero:
+            self._throttled_log(f"{broker}:portfolio_zero_sells", trail, cooldown_sec=1800)
+        elif trail:
             self.log_event(trail)
             for n in notes_tmp:
                 self.log_event(n)
@@ -21340,15 +21388,21 @@ class MarketAdvisorGUI(QMainWindow):
         finviz_syms, rh_syms, yahoo_syms = [], [], []
         Overview = _get_overview_class()
         if Overview is not None:
-            try:
+            def _finviz():
                 fs = Overview()
                 fs.set_filter(filters_dict={'Price': 'Under $5', 'Current Volume': 'Over 2M'})
-                df = fs.screener_view()
+                return fs.screener_view()
+
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                df = pool.submit(_finviz).result(timeout=12)
                 if df is not None and not df.empty and 'Ticker' in df.columns:
                     for t in df['Ticker'].head(10).tolist():
                         finviz_syms.append(str(t).upper().strip())
             except Exception:
                 pass
+            finally:
+                pool.shutdown(wait=False)
         # Micro-book afford ceiling — skip mega-cap RH movers when BP can't buy 1 share
         max_sh = 0.0
         try:

@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.47"
+__version__ = "1.42.48"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Crypto engines never parked by desk focus; focus cache respects session; E*TRADE "
-    "hard 50s request wall, no resend on 429, whole-share buys, pre-open reauth nag; coach logs once"
+    "Sells run before buy scans; 75s scan budget + Finviz timeout; heartbeat skips unchanged "
+    "hours (4h max quiet); routine cycle lines dropped, slow cycles logged"
 )
 
 
