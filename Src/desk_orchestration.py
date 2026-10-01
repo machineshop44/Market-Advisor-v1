@@ -504,6 +504,11 @@ def zero_signal_coach_message(
     max_afford_share: float,
     cycles: int,
 ) -> str:
+    if str(engine or "").upper() == "CRYPTO":
+        return (
+            f"[{broker}] {cycles}× zero {engine} BUY — "
+            f"check spread gate, anti-chase, or crypto regime."
+        )
     return (
         f"[{broker}] {cycles}× zero {engine} BUY — session {session_label}; "
         f"afford ≤{max_afford_share:.0f}/share whole. "

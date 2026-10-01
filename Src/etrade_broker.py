@@ -204,7 +204,8 @@ class ETradeAdapter(BaseBroker):
         self.broker_id = "ETRADE"
         self.supports_equities = True
         self.supports_crypto = False
-        self.supports_fractional_equities = True
+        # The API can't sell <1 share, so fractional buys leave unsellable dust (PLUG 0.001).
+        self.supports_fractional_equities = False
         self.supports_extended_hours = False  # deferred phase
         self.supports_options = False
         # GTC sell-stop on whole shares; fractional remainder stays on software TTP.

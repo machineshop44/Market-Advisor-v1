@@ -191,16 +191,21 @@ class ETradeClient:
             headers["Content-Type"] = "application/json"
             data = json.dumps(json_body).encode("utf-8")
 
-        # A placed order may have executed even when the response timed out or 5xx'd;
-        # resending would risk a duplicate fill.
+        # A placed order may have executed even when the response timed out, was throttled
+        # or 5xx'd; resending would risk a duplicate fill.
         is_place = method.upper() != "GET" and "/place" in path
         deadline = time.time() + _REQUEST_BUDGET_SEC
         last_err = None
+        def _backoff(sec):
+            time.sleep(max(0.0, min(sec, deadline - time.time())))
+
         for attempt in range(_MAX_RETRIES):
-            if attempt and time.time() >= deadline:
+            remaining = deadline - time.time()
+            if attempt and remaining <= 1.0:
                 break
             self._throttle()
             auth = self._oauth(self.access_token, self.access_token_secret)
+            connect_to, read_to = _HTTP_TIMEOUT
             try:
                 resp = self.session.request(
                     method.upper(),
@@ -209,18 +214,18 @@ class ETradeClient:
                     data=data,
                     headers=headers,
                     auth=auth,
-                    timeout=_HTTP_TIMEOUT,
+                    timeout=(connect_to, max(2.0, min(read_to, remaining))),
                 )
             except Exception as e:
                 last_err = e
                 if is_place and not isinstance(e, requests.exceptions.ConnectTimeout):
                     break
-                time.sleep(min(8.0, (0.5 * (2 ** attempt)) + random.random() * 0.2))
+                _backoff(min(8.0, (0.5 * (2 ** attempt)) + random.random() * 0.2))
                 continue
             finally:
                 self._last_request_ts = time.time()
 
-            if is_place and resp.status_code in (500, 502, 503, 504):
+            if is_place and resp.status_code in (429, 500, 502, 503, 504):
                 raise ETradeAPIError(
                     f"E*TRADE {method.upper()} {path} returned HTTP {resp.status_code} — "
                     "order state unknown; check open orders before retrying",
@@ -228,7 +233,7 @@ class ETradeClient:
                     body=resp.text,
                 )
             if resp.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(8.0, (0.6 * (2 ** attempt)) + random.random() * 0.3))
+                _backoff(min(8.0, (0.6 * (2 ** attempt)) + random.random() * 0.3))
                 last_err = ETradeAPIError(
                     f"HTTP {resp.status_code}",
                     status_code=resp.status_code,

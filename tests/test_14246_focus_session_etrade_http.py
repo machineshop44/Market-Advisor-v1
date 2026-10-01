@@ -120,7 +120,7 @@ def _gui_stub(*, session_active, et_ok, focus_ctx=None):
     )
     s._broker_supports = lambda name, attr: gui_mod.MarketAdvisorGUI._broker_supports(s, name, attr)
     s._broker_buy_session_open = lambda name: gui_mod.MarketAdvisorGUI._broker_buy_session_open(s, name)
-    ctx = focus_ctx or {
+    ctx = focus_ctx if focus_ctx is not None else {
         n: {"can_place_new_buy": True, "deployable_bp": bp}
         for n, bp in (("Robinhood", 60.0), ("Coinbase", 17.0), ("E*TRADE", 99.0))
     }
@@ -171,7 +171,108 @@ def test_equity_focus_still_parks_other_equity_engines():
     assert rest and "Desk focus on E*TRADE" in why
 
 
-def test_crypto_focus_still_parks_other_crypto():
+def test_crypto_focus_does_not_park_other_crypto_venue():
     fn, s = _rest_stub("Robinhood")
-    rest, why = fn(s, "Coinbase", engine="CRYPTO")
-    assert rest and "Desk focus on Robinhood" in why
+    assert fn(s, "Coinbase", engine="CRYPTO") == (False, "")
+
+
+def test_focus_cache_fallback_respects_session():
+    cls, s = _gui_stub(session_active=False, et_ok=False, focus_ctx={})
+    s._desk_focus_broker_cache = "E*TRADE"
+    assert cls._desk_focus_broker(s) is None
+    s._desk_focus_broker_cache = "Robinhood"
+    assert cls._desk_focus_broker(s) == "Robinhood"
+
+
+def test_focus_filter_error_excludes_broker_instead_of_failing_open():
+    cls, s = _gui_stub(session_active=True, et_ok=True)
+
+    def boom(name):
+        if name == "E*TRADE":
+            raise RuntimeError("session lookup failed")
+        return True
+
+    s._broker_buy_session_open = boom
+    assert cls._desk_focus_broker(s) == "Robinhood"
+
+
+# --- 1.42.47: Grok tester findings -------------------------------------------
+
+def test_place_order_429_not_resent():
+    c = _client()
+    c.session.request = mock.Mock(return_value=_resp(429, b"slow down"))
+    with pytest.raises(ec.ETradeAPIError, match="order state unknown"):
+        c.post_xml("/v1/accounts/abc/orders/place", "<x/>")
+    assert c.session.request.call_count == 1
+
+
+def test_read_timeout_shrinks_to_remaining_budget(monkeypatch):
+    c = _client()
+    now = {"t": 0.0}
+    monkeypatch.setattr(ec.time, "time", lambda: now["t"])
+    seen = []
+
+    def hang(*_a, timeout=None, **_k):
+        seen.append(timeout[1])
+        now["t"] += timeout[1]
+        raise requests.exceptions.ReadTimeout("hung")
+
+    c.session.request = mock.Mock(side_effect=hang)
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        c.get("/v1/accounts/abc/portfolio")
+    assert now["t"] <= ec._REQUEST_BUDGET_SEC + 2.0
+    assert seen[-1] <= seen[0]
+
+
+def test_etrade_buys_whole_shares_only():
+    from etrade_broker import ETradeAdapter
+    assert ETradeAdapter().supports_fractional_equities is False
+
+
+def test_crypto_coach_message_drops_share_price_clause():
+    import desk_orchestration as do
+    msg = do.zero_signal_coach_message(
+        broker="Robinhood", engine="CRYPTO", session_label="OVERNIGHT", max_afford_share=57, cycles=12,
+    )
+    assert "/share" not in msg and "spread" in msg
+
+
+def _nag_stub(*, intent=True, auth_dead=True, armed=False):
+    import gui as gui_mod
+    sent = []
+    s = SimpleNamespace(
+        paper_mode=False,
+        brokers={"E*TRADE": object()},
+        settings={"etrade_arm_intent": intent},
+        _broker_manual_auth_needed={"E*TRADE": auth_dead},
+        auto_trade_enabled={"E*TRADE": armed},
+        log_event=lambda *_: None,
+        send_discord_alert=lambda msg, **kw: sent.append((msg, kw)),
+    )
+    return gui_mod.MarketAdvisorGUI._maybe_etrade_preopen_reauth_nag, s, sent
+
+
+def _et_ts(hh, mm, day="2026-10-02"):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromisoformat(f"{day}T{hh:02d}:{mm:02d}:00").replace(
+        tzinfo=ZoneInfo("America/New_York")
+    ).timestamp()
+
+
+def test_preopen_reauth_nag_fires_once():
+    fn, s, sent = _nag_stub()
+    fn(s, _et_ts(8, 50))
+    fn(s, _et_ts(9, 5))
+    assert len(sent) == 1 and sent[0][1]["prefix"] == "[REAUTH]"
+
+
+def test_preopen_reauth_nag_quiet_when_not_needed():
+    for kw in ({"intent": False}, {"auth_dead": False}, {"armed": True}):
+        fn, s, sent = _nag_stub(**kw)
+        fn(s, _et_ts(8, 50))
+        assert sent == []
+    fn, s, sent = _nag_stub()
+    fn(s, _et_ts(10, 0))
+    fn(s, _et_ts(8, 50, day="2026-10-03"))
+    assert sent == []

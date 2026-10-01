@@ -4262,8 +4262,7 @@ class MarketAdvisorGUI(QMainWindow):
             broker=broker_name, engine=engine, session_label=sess,
             max_afford_share=max_sh, cycles=streak,
         )
-        if self._throttled_log(f"{key}:zero_signal_coach", msg, cooldown_sec=3600):
-            self.log_event(f"[COACH] {msg}")
+        self._throttled_log(f"{key}:zero_signal_coach", f"[COACH] {msg}", cooldown_sec=3600)
 
     def _reorder_task_queue_buy_focus(self):
         """When only some brokers can still buy, run focus broker cycles first."""
@@ -13559,6 +13558,43 @@ class MarketAdvisorGUI(QMainWindow):
         if _is_manual_auth_failure(msg):
             self._handle_broker_auth_failure("E*TRADE", msg, source="midnight_et")
 
+    def _maybe_etrade_preopen_reauth_nag(self, now_ts=None):
+        """Once per trading day, 8:45–9:30 ET: ping Discord if E*TRADE is meant to be armed but auth is dead."""
+        if self.paper_mode or "E*TRADE" not in self.brokers:
+            return
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+            now_et = datetime.fromtimestamp(float(now_ts or time.time()), ZoneInfo("America/New_York"))
+        except Exception:
+            return
+        if now_et.weekday() >= 5:
+            return
+        sod = now_et.hour * 60 + now_et.minute
+        if not (8 * 60 + 45 <= sod < 9 * 60 + 30):
+            return
+        day_key = now_et.date().isoformat()
+        if getattr(self, "_etrade_preopen_nag_day", None) == day_key:
+            return
+        try:
+            from market_calendar import is_equity_session_day
+            if not is_equity_session_day(now_et.date()):
+                return
+        except Exception:
+            pass
+        if not bool(self.settings.get("etrade_arm_intent", False)):
+            return
+        auth_dead = bool(getattr(self, "_broker_manual_auth_needed", {}).get("E*TRADE"))
+        if not auth_dead or self.auto_trade_enabled.get("E*TRADE"):
+            return
+        self._etrade_preopen_nag_day = day_key
+        msg = (
+            "⏰ E*TRADE still needs reauth and the open is at 9:30 ET — "
+            "reauthorize in Settings (or Companion) so it re-arms for the session."
+        )
+        self.log_event(f"[REAUTH] [E*TRADE] {msg}")
+        self.send_discord_alert(msg, urgent=True, prefix="[REAUTH]", broker="E*TRADE")
+
     def panic_halt_all(self, flatten=None):
         """Disarm every broker, clear queues, urgent Discord — Panic Halt All.
         flatten=None follows the panic_halt_flatten setting; False = disarm only."""
@@ -14281,20 +14317,22 @@ class MarketAdvisorGUI(QMainWindow):
     def _desk_focus_broker(self) -> str | None:
         """Cache-friendly focus broker for orchestration (no broker API / regime)."""
         import desk_orchestration as do
+
+        def session_open(name) -> bool:
+            try:
+                return bool(self._broker_buy_session_open(name))
+            except Exception:
+                return False
+
         try:
             ctx_map = self._get_trader_context_map(max_age=120.0, allow_build=False)
-            if not ctx_map:
-                return getattr(self, "_desk_focus_broker_cache", None)
         except Exception:
-            return getattr(self, "_desk_focus_broker_cache", None)
-        try:
-            ctx_map = {
-                name: ctx for name, ctx in (ctx_map or {}).items()
-                if self._broker_buy_session_open(name)
-            }
-        except Exception:
-            pass
-        focus = do.resolve_focus_broker(ctx_map or {}, self.settings)
+            ctx_map = None
+        if not ctx_map:
+            cached = getattr(self, "_desk_focus_broker_cache", None)
+            return cached if cached and session_open(cached) else None
+        ctx_map = {name: ctx for name, ctx in ctx_map.items() if session_open(name)}
+        focus = do.resolve_focus_broker(ctx_map, self.settings)
         self._desk_focus_broker_cache = focus
         return focus
 
@@ -14386,12 +14424,9 @@ class MarketAdvisorGUI(QMainWindow):
         import desk_orchestration as do
         focus = self._desk_focus_broker()
         combined_eq = float(self._launch_equity_total() or 0.0)
-        # Cash is per-broker: an equity-only focus can't use this broker's crypto BP.
-        crypto_exempt = (
-            str(engine or "").upper() == "CRYPTO"
-            and bool(focus)
-            and not self._broker_supports(focus, "supports_crypto")
-        )
+        # Cash is per-broker, so parking crypto frees nothing for the focus broker;
+        # cross-broker crypto concentration is capped by crypto_cluster_block instead.
+        crypto_exempt = str(engine or "").upper() == "CRYPTO"
         if not crypto_exempt and do.focus_parks_buys(
             broker_name, focus, self.settings, combined_equity=combined_eq,
         ):
@@ -16363,6 +16398,7 @@ class MarketAdvisorGUI(QMainWindow):
         # Equity RTH boundary wake-ups before interval scheduling (sets last_* so no double-queue)
         self._maybe_session_boundary_wakeup(now)
         self._maybe_etrade_midnight_handling(now)
+        self._maybe_etrade_preopen_reauth_nag(now)
 
         for broker_name, enabled in self.auto_trade_enabled.items():
             if not enabled:
