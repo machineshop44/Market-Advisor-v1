@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.50"
+__version__ = "1.42.51"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Selective ET EOD flatten: winners ≥0.5% on a GTC stop with no earnings ride overnight; "
-    "losers / unstopped / earnings names still sold at 15:50"
+    "Last-hour ET buys allowed when overnight-hold research passes (gap history, trend, "
+    "close strength, earnings); advisor judges the overnight case; planned holds skip flatten"
 )
 
 

@@ -257,6 +257,7 @@ def load_settings():
         "et_flatten_before_close": True,
         "et_eod_flatten_mode": "smart",
         "et_overnight_hold_min_roi_pct": 0.5,
+        "et_overnight_intent_max_loss_pct": 1.0,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -18098,6 +18099,85 @@ class MarketAdvisorGUI(QMainWindow):
         finally:
             ex.shutdown(wait=False)
 
+    def _overnight_research(self, ticker, price=None):
+        """Daily-history overnight-hold check for late-day ET entries (cached 15m)."""
+        tu = str(ticker or "").upper()
+        cache = getattr(self, "_overnight_research_cache", None)
+        if cache is None:
+            cache = self._overnight_research_cache = {}
+        hit = cache.get(tu)
+        if hit and time.time() - hit[0] < 900:
+            return dict(hit[1])
+        out = {"ok": False, "summary": "overnight research unavailable", "reasons": []}
+        try:
+            import yfinance as yf
+            from overnight_research import assess_overnight_hold
+            from scoring import _trend_lock, get_stop_distance_pct
+            with _trend_lock():
+                df = yf.Ticker(tu).history(period="6mo", interval="1d")
+            if df is not None and len(df) > 0:
+                try:
+                    stop_pct = float(get_stop_distance_pct("ETRADE", tu, "stock") or 0.04)
+                except Exception:
+                    stop_pct = 0.04
+                out = assess_overnight_hold(
+                    df["Open"].tolist(), df["High"].tolist(),
+                    df["Low"].tolist(), df["Close"].tolist(),
+                    price=price, stop_pct=stop_pct,
+                    earnings_next=self._earnings_before_next_open(tu),
+                )
+        except Exception as e:
+            out["summary"] = f"overnight research failed: {str(e)[:80]}"
+        cache[tu] = (time.time(), dict(out))
+        return out
+
+    def _mark_et_overnight_intent(self, ticker, research):
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo
+            day = _dt.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            day = time.strftime("%Y-%m-%d")
+        store = self._load_et_overnight_intent()
+        store = {k: v for k, v in store.items() if isinstance(v, dict) and v.get("day") == day}
+        store[str(ticker).upper()] = {"day": day, "summary": str((research or {}).get("summary") or "")}
+        self._et_overnight_intent = store
+        try:
+            import json as _json
+            with open(self._et_overnight_intent_path(), "w", encoding="utf-8") as f:
+                _json.dump(store, f, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _et_overnight_intent_path():
+        from scoring import STATE_DIR
+        return os.path.join(str(STATE_DIR), "et_overnight_intent.json")
+
+    def _load_et_overnight_intent(self):
+        store = getattr(self, "_et_overnight_intent", None)
+        if isinstance(store, dict):
+            return dict(store)
+        try:
+            import json as _json
+            with open(self._et_overnight_intent_path(), "r", encoding="utf-8") as f:
+                raw = _json.load(f)
+            store = raw if isinstance(raw, dict) else {}
+        except Exception:
+            store = {}
+        self._et_overnight_intent = store
+        return dict(store)
+
+    def _et_overnight_intent_today(self, ticker):
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo
+            day = _dt.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            day = time.strftime("%Y-%m-%d")
+        rec = self._load_et_overnight_intent().get(str(ticker).upper())
+        return bool(rec and rec.get("day") == day)
+
     def _et_eod_select_flatten(self, et_equity_rows):
         """Selective flatten: return rows to sell; log why each is held or sold."""
         from scoring import get_protective_order
@@ -18119,6 +18199,7 @@ class MarketAdvisorGUI(QMainWindow):
             action, why = _auto_cycle.et_eod_overnight_decision(
                 t, price=r.get("price"), avg_cost=cost,
                 has_broker_stop=has_stop, earnings_next=earn, settings=self.settings,
+                overnight_intent=self._et_overnight_intent_today(t),
             )
             if action == "hold":
                 note = "" if earn is not None else " (earnings lookup unavailable)"
@@ -19651,19 +19732,31 @@ class MarketAdvisorGUI(QMainWindow):
                     settings=self.settings,
                 )
                 if eod_blk:
-                    self._throttled_buy_skip_note(
-                        notes, broker_name, f"eodwin_{tu}",
-                        f"[{broker_name}] Skipped [{ticker}]: {eod_why}",
-                        cooldown_sec=600,
-                    )
-                    execute_skips.append(f"{ticker}: near EOD flatten")
-                    self._log_decision(
-                        broker=broker_name, ticker=ticker, action="SKIP",
-                        score=cand_score, reason="eod_flatten_window",
-                        posture=posture, open_count=open_count, max_open=max_positions,
-                        is_crypto=False, regime_ok=True,
-                    )
-                    continue
+                    # Late-day entry is allowed only as a researched overnight hold.
+                    on = self._overnight_research(ticker, price)
+                    if on.get("ok"):
+                        c["overnight"] = on
+                        self._throttled_buy_skip_note(
+                            notes, broker_name, f"eodok_{tu}",
+                            f"[{broker_name}] Late-day [{ticker}] cleared overnight research "
+                            f"(score {on.get('score')}): {on.get('summary')}",
+                            cooldown_sec=600,
+                        )
+                    else:
+                        self._throttled_buy_skip_note(
+                            notes, broker_name, f"eodwin_{tu}",
+                            f"[{broker_name}] Skipped [{ticker}]: {eod_why} — "
+                            f"{on.get('summary') or 'overnight research unavailable'}",
+                            cooldown_sec=600,
+                        )
+                        execute_skips.append(f"{ticker}: late-day, not an overnight hold")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason="eod_overnight_research",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=False, regime_ok=True,
+                        )
+                        continue
 
             # Equity (and any non-crypto new name): must clear RT fees + edge buffer.
             # Micro books: also fee-gate crypto new entries (defense in depth).
@@ -20094,6 +20187,7 @@ class MarketAdvisorGUI(QMainWindow):
                         engine=engine,
                         reason="scale_in" if scale_in else "entry",
                         regime_caution=bool(c.get("regime_caution")),
+                        overnight=c.get("overnight"),
                     )
                     if prop:
                         is_refresh = bool(prop.get("_refreshed"))
@@ -20262,6 +20356,8 @@ class MarketAdvisorGUI(QMainWindow):
                     "table_row": c.get("table_row"),
                     "scale_in": scale_in,
                 })
+                if (filled or working) and c.get("overnight") and broker_name == "E*TRADE":
+                    self._mark_et_overnight_intent(ticker, c.get("overnight"))
                 bought = True
                 break
 

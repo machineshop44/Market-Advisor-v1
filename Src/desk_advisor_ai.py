@@ -592,6 +592,14 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
         reasons_skip.append(f"${price:.2f}/share above affordable max ~${max_sh:.0f} on {broker}")
     if price > 0 and bp > 0 and price > bp * 0.95 and "crypto" not in str(proposal.get("asset_type") or "").lower():
         reasons_skip.append(f"1 share ~${price:.0f} eats almost all ${bp:.0f} BP on {broker}")
+    overnight = proposal.get("overnight") if isinstance(proposal.get("overnight"), dict) else None
+    if overnight is not None:
+        if not overnight.get("ok"):
+            reasons_skip.append(str(overnight.get("summary") or "late-day: not an overnight hold"))
+        else:
+            reasons_ok.append(
+                f"late-day overnight hold — {overnight.get('summary') or 'history checks pass'}"
+            )
     if score < 50:
         reasons_skip.append(f"score {score:.0f} is weak for this book")
     elif score >= 70:
@@ -718,6 +726,15 @@ def _proposal_prompt(
                 else
                 "Use app_research_pack (price action + desk fill history) — do not invent "
                 "headlines or numbers that are not in the data. Cite one research fact in detail. "
+            )
+            + (
+                "OVERNIGHT HOLD: this BUY is in the last hour before the 15:50 E*TRADE "
+                "flatten and would be held overnight on a GTC stop. proposal.overnight has "
+                "the desk's history check (gap drift, gap-down tail vs stop, trend, strength "
+                "into close, earnings). Judge whether it is a sound close-to-next-open hold "
+                "(news/catalyst risk tonight, sector tone); skip if unsure. "
+                if isinstance(proposal.get("overnight"), dict)
+                else ""
             )
             + "CRITICAL: when verdict is skip or wait, set retry_after_min to how many minutes "
             f"the desk must wait before asking again about THIS exact BUY of {tick} "

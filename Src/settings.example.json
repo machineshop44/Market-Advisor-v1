@@ -96,6 +96,7 @@
     "et_flatten_before_close": true,
     "et_eod_flatten_mode": "smart",
     "et_overnight_hold_min_roi_pct": 0.5,
+    "et_overnight_intent_max_loss_pct": 1.0,
     "daily_loss_flatten": true,
     "panic_halt_flatten": true,
     "desk_focus_park_others": false,

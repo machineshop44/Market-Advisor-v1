@@ -1903,8 +1903,8 @@ def etrade_entry_near_flatten_block(now_et=None, settings=None) -> tuple[bool, s
     if mins_left > window or now_h >= close_h:
         return False, ""
     return True, (
-        f"EOD flatten in ~{max(0, int(mins_left))}m — no new ET entries in the last "
-        f"{int(window)}m (would round-trip fees + burn a PDT slot)"
+        f"EOD flatten in ~{max(0, int(mins_left))}m — last-{int(window)}m ET entries must "
+        f"pass overnight-hold research"
     )
 
 
@@ -1916,6 +1916,7 @@ def et_eod_overnight_decision(
     has_broker_stop: bool,
     earnings_next: Optional[bool],
     settings=None,
+    overnight_intent: bool = False,
 ) -> tuple[str, str]:
     """
     Selective EOD flatten for E*TRADE equities. Returns ("hold"|"flatten", reason).
@@ -1944,6 +1945,17 @@ def et_eod_overnight_decision(
         return "flatten", f"no broker stop (ROI {roi*100:+.2f}%)"
     if earnings_next:
         return "flatten", f"earnings before next open (ROI {roi*100:+.2f}%)"
+    if overnight_intent:
+        # Bought late as a researched overnight hold — give it the night unless it broke down.
+        try:
+            max_loss = float(s.get("et_overnight_intent_max_loss_pct", 1.0) or 0.0) / 100.0
+        except (TypeError, ValueError):
+            max_loss = 0.01
+        if roi >= -max_loss:
+            return "hold", f"overnight-research entry, ROI {roi*100:+.2f}% — holding as planned"
+        return "flatten", (
+            f"overnight entry broke down (ROI {roi*100:+.2f}% < −{max_loss*100:.1f}%)"
+        )
     if roi < min_roi:
         return "flatten", f"ROI {roi*100:+.2f}% < hold bar {min_roi*100:.1f}%"
     return "hold", f"winner ROI {roi*100:+.2f}% on GTC stop — riding overnight"

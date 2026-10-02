@@ -340,6 +340,7 @@ def propose(
     ttl_sec: int = DEFAULT_TTL_SEC,
     regime_caution: bool = False,
     honor_cooldown: bool = True,
+    overnight: dict | None = None,
 ) -> dict | None:
     """Create or refresh a pending proposal for broker+ticker.
 
@@ -373,6 +374,10 @@ def propose(
                     p["engine"] = str(engine or "")
                     p["reason"] = str(reason or "entry")
                     p["regime_caution"] = bool(regime_caution)
+                    if overnight:
+                        p["overnight"] = dict(overnight)
+                    else:
+                        p.pop("overnight", None)
                     p["updated_at"] = now
                     # Refresh TTL on each re-propose so live pending rows don't rot
                     # mid-brief; expire_stale still drops truly abandoned names.
@@ -408,6 +413,8 @@ def propose(
             "ai_source": "",
             "ai_at": 0.0,
         }
+        if overnight:
+            prop["overnight"] = dict(overnight)
         proposals.append(prop)
         data["proposals"] = proposals[-80:]
         _save(data)
