@@ -49,6 +49,46 @@ def test_etrade_entry_window_respects_early_close():
     assert blk is True
 
 
+def _decide(**kw):
+    base = dict(price=2.90, avg_cost=2.775, has_broker_stop=True, earnings_next=False, settings={})
+    base.update(kw)
+    return auto_cycle.et_eod_overnight_decision("AMC", **base)
+
+
+def test_eod_holds_stopped_winner():
+    action, why = _decide()
+    assert action == "hold"
+    assert "riding overnight" in why
+
+
+def test_eod_flattens_small_loser_like_amc():
+    action, why = _decide(price=2.765)
+    assert action == "flatten"
+    assert "hold bar" in why
+
+
+def test_eod_flattens_winner_without_stop():
+    assert _decide(has_broker_stop=False)[0] == "flatten"
+
+
+def test_eod_flattens_winner_into_earnings():
+    action, why = _decide(earnings_next=True)
+    assert action == "flatten"
+    assert "earnings" in why
+
+
+def test_eod_unknown_earnings_still_holds_on_stop():
+    assert _decide(earnings_next=None)[0] == "hold"
+
+
+def test_eod_flatten_all_mode():
+    assert _decide(settings={"et_eod_flatten_mode": "all"})[0] == "flatten"
+
+
+def test_eod_no_cost_basis_flattens():
+    assert _decide(avg_cost=0)[0] == "flatten"
+
+
 def test_small_book_peak_recovers_when_flat(monkeypatch):
     monkeypatch.setattr(scoring, "save_state", lambda force=False: None)
     scoring._equity_dd["COINBASE"] = {

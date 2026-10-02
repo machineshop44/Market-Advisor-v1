@@ -255,6 +255,8 @@ def load_settings():
         "use_limit_exits": True,
         "attach_protective_stops": True,
         "et_flatten_before_close": True,
+        "et_eod_flatten_mode": "smart",
+        "et_overnight_hold_min_roi_pct": 0.5,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -11625,10 +11627,23 @@ class MarketAdvisorGUI(QMainWindow):
         self.et_flatten_close_chk.setChecked(bool(self.settings.get("et_flatten_before_close", True)))
         self.et_flatten_close_chk.setToolTip(
             "At ~15:50 ET pre-close: market-sell ET equity holdings so you are not "
-            "naked overnight if the app is off or midnight reauth fails. "
+            "exposed overnight if the app is off or midnight reauth fails. "
+            "With 'Hold winners overnight' on, only losers / unstopped / earnings names are sold. "
             "RH uses resting protective stops; crypto is 24/7."
         )
         eod_opts.addWidget(self.et_flatten_close_chk)
+        self.et_hold_winners_chk = QCheckBox("Hold winners overnight")
+        self.et_hold_winners_chk.setChecked(
+            str(self.settings.get("et_eod_flatten_mode", "smart") or "smart").lower() != "all"
+        )
+        self.et_hold_winners_chk.setToolTip(
+            "Selective flatten: keep ET names up ≥ "
+            f"{float(self.settings.get('et_overnight_hold_min_roi_pct', 0.5) or 0.5):.1f}% "
+            "that have a live GTC broker stop and no earnings before the next open. "
+            "Losers, unstopped names and earnings names are still sold at ~15:50. "
+            "Off = flatten everything."
+        )
+        eod_opts.addWidget(self.et_hold_winners_chk)
         self.panic_halt_flatten_chk = QCheckBox("Panic Halt also flattens equities")
         self.panic_halt_flatten_chk.setChecked(bool(self.settings.get("panic_halt_flatten", True)))
         self.panic_halt_flatten_chk.setToolTip(
@@ -18046,6 +18061,80 @@ class MarketAdvisorGUI(QMainWindow):
             return qty, px, asset_type
         return None
 
+    @staticmethod
+    def _earnings_before_next_open(ticker, timeout=8.0):
+        """True if earnings fall today (after close) or by the next session day; None if unknown."""
+        def _lookup():
+            import yfinance as yf
+            from datetime import date as _date, timedelta as _td
+            from market_calendar import is_equity_session_day
+            from scoring import _trend_lock
+            with _trend_lock():
+                cal = yf.Ticker(str(ticker)).calendar
+            dates = []
+            if isinstance(cal, dict):
+                raw = cal.get("Earnings Date") or []
+                dates = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+            today = _date.today()
+            nxt = today + _td(days=1)
+            for _ in range(7):
+                if is_equity_session_day(nxt):
+                    break
+                nxt += _td(days=1)
+            for d in dates:
+                try:
+                    dd = d.date() if hasattr(d, "date") and callable(d.date) else d
+                except Exception:
+                    continue
+                if isinstance(dd, _date) and today <= dd <= nxt:
+                    return True
+            return False
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            return ex.submit(_lookup).result(timeout=timeout)
+        except Exception:
+            return None
+        finally:
+            ex.shutdown(wait=False)
+
+    def _et_eod_select_flatten(self, et_equity_rows):
+        """Selective flatten: return rows to sell; log why each is held or sold."""
+        from scoring import get_protective_order
+        out = []
+        for r in et_equity_rows:
+            t = r["ticker"]
+            info = get_protective_order("ETRADE", t) or {}
+            has_stop = bool(info.get("order_id")) and not info.get("paper")
+            cost = float(r.get("avg_cost") or 0)
+            if cost <= 0:
+                try:
+                    cost = float(self._avg_cost_for("E*TRADE", t) or 0)
+                except Exception:
+                    cost = 0.0
+            earn = None
+            mode = str(self.settings.get("et_eod_flatten_mode", "smart") or "smart").lower()
+            if mode != "all" and has_stop:
+                earn = self._earnings_before_next_open(t)
+            action, why = _auto_cycle.et_eod_overnight_decision(
+                t, price=r.get("price"), avg_cost=cost,
+                has_broker_stop=has_stop, earnings_next=earn, settings=self.settings,
+            )
+            if action == "hold":
+                note = "" if earn is not None else " (earnings lookup unavailable)"
+                self.log_event(f"[EOD] [{t}] HOLD overnight — {why}{note}")
+                try:
+                    self.send_discord_alert(
+                        f"[EOD] **E*TRADE** holding **{t}** overnight — {why}.",
+                        prefix="[EOD]", broker="E*TRADE",
+                    )
+                except Exception:
+                    pass
+            else:
+                self.log_event(f"[EOD] [{t}] flatten — {why}")
+                out.append(r)
+        return out
+
     def _run_eod_protective_pass(self):
         """
         ~15:50 ET pre-close checklist (equity only):
@@ -18157,7 +18246,7 @@ class MarketAdvisorGUI(QMainWindow):
 
                 if bool(self.settings.get("et_flatten_before_close", True)):
                     if et_armed:
-                        flatten_rows.extend(et_equity_rows)
+                        flatten_rows.extend(self._et_eod_select_flatten(et_equity_rows))
                     else:
                         self.log_event(
                             "[EOD] Flatten ON but E*TRADE is disarmed — warning only, not selling."
@@ -21948,6 +22037,10 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["attach_protective_stops"] = bool(self.attach_stops_chk.isChecked())
         if hasattr(self, "et_flatten_close_chk"):
             self.settings["et_flatten_before_close"] = bool(self.et_flatten_close_chk.isChecked())
+        if hasattr(self, "et_hold_winners_chk"):
+            self.settings["et_eod_flatten_mode"] = (
+                "smart" if self.et_hold_winners_chk.isChecked() else "all"
+            )
         if hasattr(self, "panic_halt_flatten_chk"):
             self.settings["panic_halt_flatten"] = bool(self.panic_halt_flatten_chk.isChecked())
         if hasattr(self, "daily_loss_flatten_chk"):

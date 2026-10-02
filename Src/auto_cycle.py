@@ -1908,6 +1908,47 @@ def etrade_entry_near_flatten_block(now_et=None, settings=None) -> tuple[bool, s
     )
 
 
+def et_eod_overnight_decision(
+    ticker,
+    *,
+    price,
+    avg_cost,
+    has_broker_stop: bool,
+    earnings_next: Optional[bool],
+    settings=None,
+) -> tuple[str, str]:
+    """
+    Selective EOD flatten for E*TRADE equities. Returns ("hold"|"flatten", reason).
+
+    Hold overnight only winners riding a live GTC broker stop with no earnings
+    before the next open — flattening winners burns PDT slots and caps gap-ups.
+    earnings_next=None (lookup failed) is treated as no earnings: the stop still covers.
+    """
+    s = settings or {}
+    mode = str(s.get("et_eod_flatten_mode", "smart") or "smart").lower()
+    if mode == "all":
+        return "flatten", "flatten-all mode"
+    try:
+        px = float(price or 0.0)
+        cost = float(avg_cost or 0.0)
+    except (TypeError, ValueError):
+        px, cost = 0.0, 0.0
+    if px <= 0 or cost <= 0:
+        return "flatten", "no price/cost basis to judge"
+    roi = (px - cost) / cost
+    try:
+        min_roi = float(s.get("et_overnight_hold_min_roi_pct", 0.5) or 0.0) / 100.0
+    except (TypeError, ValueError):
+        min_roi = 0.005
+    if not has_broker_stop:
+        return "flatten", f"no broker stop (ROI {roi*100:+.2f}%)"
+    if earnings_next:
+        return "flatten", f"earnings before next open (ROI {roi*100:+.2f}%)"
+    if roi < min_roi:
+        return "flatten", f"ROI {roi*100:+.2f}% < hold bar {min_roi*100:.1f}%"
+    return "hold", f"winner ROI {roi*100:+.2f}% on GTC stop — riding overnight"
+
+
 def equity_eod_action_for_holding(
     ticker,
     shares,
