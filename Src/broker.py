@@ -2337,12 +2337,14 @@ class CoinbaseAdapter(BaseBroker):
                 except (TypeError, ValueError):
                     want = 0.0
                 avail = self._available_base_qty(clean)
-                # A just-cancelled protective stop keeps its coins on hold for a moment.
-                tries = 0
-                while want > 0 and avail < want * 0.95 and tries < 5:
-                    time.sleep(0.8)
+                # A just-cancelled protective stop keeps its coins on hold for a while —
+                # BCH 10/1 needed ~9s; a 4s wait looped cancel→fail→re-attach for 65m.
+                deadline = time.time() + 15.0
+                delay = 0.8
+                while want > 0 and avail < want * 0.95 and time.time() < deadline:
+                    time.sleep(delay)
                     avail = max(avail, self._available_base_qty(clean))
-                    tries += 1
+                    delay = min(2.0, delay * 1.4)
                 if want > 0 and avail < want * 0.95:
                     avail_dust, _ = self.position_is_dust(clean, avail, price, asset_type)
                     want_dust, _ = self.position_is_dust(clean, want, price, asset_type)

@@ -1869,6 +1869,45 @@ def etrade_equity_session_ok(session: dict | None = None, *, broker=None) -> tup
     )
 
 
+def etrade_entry_near_flatten_block(now_et=None, settings=None) -> tuple[bool, str]:
+    """
+    Block NEW E*TRADE equity entries in the last N minutes before the EOD flatten
+    (close − 10m). AMC 10/2: breakout buy 15:17, flattened at market 15:50 for a
+    loss + a PDT day-trade slot — a multi-hour breakout edge has no runway in 30m.
+    Returns (blocked, reason).
+    """
+    s = settings or {}
+    if not bool(s.get("et_flatten_before_close", True)):
+        return False, ""
+    try:
+        window = float(s.get("et_no_entry_before_flatten_min", 60) or 0)
+    except (TypeError, ValueError):
+        window = 60.0
+    if window <= 0:
+        return False, ""
+    if now_et is None:
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            return False, ""
+    try:
+        from market_calendar import regular_close_hour
+        close_h = float(regular_close_hour(now_et.date()))
+    except Exception:
+        close_h = 16.0
+    flatten_h = close_h - 10.0 / 60.0
+    now_h = now_et.hour + now_et.minute / 60.0 + now_et.second / 3600.0
+    mins_left = (flatten_h - now_h) * 60.0
+    if mins_left > window or now_h >= close_h:
+        return False, ""
+    return True, (
+        f"EOD flatten in ~{max(0, int(mins_left))}m — no new ET entries in the last "
+        f"{int(window)}m (would round-trip fees + burn a PDT slot)"
+    )
+
+
 def equity_eod_action_for_holding(
     ticker,
     shares,

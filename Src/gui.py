@@ -300,6 +300,7 @@ def load_settings():
         "max_crypto_cluster_positions": 5,
         "entry_quality_rank_enabled": False,
         "scan_score_budget_sec": 75,
+        "et_no_entry_before_flatten_min": 60,
         "discord_heartbeat_skip_unchanged": True,
         "discord_heartbeat_max_quiet_hours": 4,
         "verbose_cycle_log": False,
@@ -3616,9 +3617,11 @@ class MarketAdvisorGUI(QMainWindow):
             pass
         # Don't journal session/eligibility skips — those are deferred and would spam Recent Trades
         st_l = st.lower()
-        if not filled:
+        exit_failed = ("Fail" in st) or ("Skipped" in st)
+        if not filled and exit_failed:
             # Protective stop was cancelled pre-sell to free shares — put it back when
             # the exit did not complete (Fail / overnight skip / hours mismatch).
+            # A working "submitted pending" sell already owns the shares (AMC 10/2 ET 1514).
             try:
                 rem_q = float(shares_val or 0)
                 if rem_q > 1e-6 and price and float(price) > 0:
@@ -17874,6 +17877,10 @@ class MarketAdvisorGUI(QMainWindow):
                     if gaps is not None:
                         gaps.pop(na_key, None)
                     return
+            if broker_name == "Coinbase" and hasattr(broker, "_available_base_qty"):
+                # spent/price ignores the CB fee taken in base — BCH 10/1 stop asked 0.05222
+                # vs 0.0521621 held → INSUFFICIENT_FUND, 30m unprotected until repair.
+                qty = self._coinbase_stop_qty(broker, ticker, qty)
             ok, oid, msg = broker.place_protective_stop(
                 ticker, asset_type, qty, price, stop_pct, trail_pct=trail_pct,
             )
@@ -17906,6 +17913,23 @@ class MarketAdvisorGUI(QMainWindow):
         except Exception as e:
             self.log_event(f"[{broker_name}] Protective stop error [{ticker}]: {e}")
             self._note_protective_gap(broker_name, ticker, str(e))
+
+    @staticmethod
+    def _coinbase_stop_qty(broker, ticker, est_qty, *, tries=4, delay=1.0):
+        """Size a CB stop to the sellable balance (fee-net, post-settle), not spent/price."""
+        avail = 0.0
+        for i in range(max(1, int(tries))):
+            try:
+                avail = float(broker._available_base_qty(ticker) or 0.0)
+            except Exception:
+                avail = 0.0
+            if avail >= est_qty * 0.98:
+                break
+            if i < tries - 1:
+                time.sleep(delay)
+        if avail > 0:
+            return min(float(est_qty), avail)
+        return float(est_qty) * 0.99
 
     def _note_protective_gap(self, broker_name, ticker, detail=""):
         detail_s = str(detail or "missing")[:120]
@@ -19530,6 +19554,25 @@ class MarketAdvisorGUI(QMainWindow):
                         score=cand_score, reason=f"hold_bias:{why_ce}",
                         posture=posture, open_count=open_count, max_open=max_positions,
                         is_crypto=True, regime_ok=True,
+                    )
+                    continue
+
+            if broker_name == "E*TRADE" and not is_crypto and tu not in held:
+                eod_blk, eod_why = _auto_cycle.etrade_entry_near_flatten_block(
+                    settings=self.settings,
+                )
+                if eod_blk:
+                    self._throttled_buy_skip_note(
+                        notes, broker_name, f"eodwin_{tu}",
+                        f"[{broker_name}] Skipped [{ticker}]: {eod_why}",
+                        cooldown_sec=600,
+                    )
+                    execute_skips.append(f"{ticker}: near EOD flatten")
+                    self._log_decision(
+                        broker=broker_name, ticker=ticker, action="SKIP",
+                        score=cand_score, reason="eod_flatten_window",
+                        posture=posture, open_count=open_count, max_open=max_positions,
+                        is_crypto=False, regime_ok=True,
                     )
                     continue
 

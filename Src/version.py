@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.48"
+__version__ = "1.42.49"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Sells run before buy scans; 75s scan budget + Finviz timeout; heartbeat skips unchanged "
-    "hours (4h max quiet); routine cycle lines dropped, slow cycles logged"
+    "No new ET entries in the hour before EOD flatten; CB stops sized fee-net; CB sell waits "
+    "15s for hold release; small-book DD peak recovers; loss streak expires after 24h"
 )
 
 

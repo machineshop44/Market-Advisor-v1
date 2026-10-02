@@ -65,12 +65,22 @@ def save() -> None:
             pass
 
 
+STREAK_STALE_SEC = 24 * 3600
+
+
 def record_exit_result(broker: str, *, was_loss: bool, now: Optional[float] = None) -> None:
-    """Call after a confirmed sell. Losses increment streak; wins reset."""
+    """Call after a confirmed sell. Losses increment streak; wins reset.
+
+    A streak older than STREAK_STALE_SEC restarts — FET 9/27 + XRP 9/28 + BCH 10/1
+    is not a "consecutive" losing run on a sparse crypto book.
+    """
     load()
     ts = float(now if now is not None else time.time())
     b = str(broker)
     entry = _streak.setdefault(b, {"count": 0, "paused_until": 0.0, "last_ts": 0.0})
+    last = float(entry.get("last_ts") or 0.0)
+    if last > 0 and ts - last > STREAK_STALE_SEC:
+        entry["count"] = 0
     if was_loss:
         entry["count"] = int(entry.get("count") or 0) + 1
     else:

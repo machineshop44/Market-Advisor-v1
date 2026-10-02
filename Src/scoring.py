@@ -1581,7 +1581,8 @@ def maybe_recover_peak_for_cash_heavy_book(
         pos_v = max(0.0, float(position_value or 0.0))
     except (TypeError, ValueError):
         return False, ""
-    if eq < 20.0:
+    # Small books (Coinbase ~$17) must still recover — a $20 floor left CB paused 19h on 10/1–10/2.
+    if eq < 5.0:
         return False, ""
     s = settings or {}
     try:

@@ -63,6 +63,7 @@
     "max_crypto_cluster_positions": 5,
     "entry_quality_rank_enabled": false,
     "scan_score_budget_sec": 75,
+    "et_no_entry_before_flatten_min": 60,
     "discord_heartbeat_skip_unchanged": true,
     "discord_heartbeat_max_quiet_hours": 4,
     "verbose_cycle_log": false,
