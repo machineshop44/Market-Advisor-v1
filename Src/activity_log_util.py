@@ -155,6 +155,24 @@ def explain_no_buys_after_rank(
     return line
 
 
+_NOISY_NOTE_BITS = (
+    "Wide spread", "Session size [", "already holds this coin",
+    "No buys executed after rank", "PDT entry guard", "Micro crypto park",
+    "trade lock active", "Equity buy engines wait for",
+)
+
+
+def noisy_note_key(note) -> str | None:
+    """
+    Shape key for repetitive buy-batch notes (digits stripped, ticker kept) — None if the
+    note should always log. 10/2–10/5: 'Wide spread' 3.5k and 'Session size' 3.3k lines.
+    """
+    s = str(note or "")
+    if not any(b in s for b in _NOISY_NOTE_BITS):
+        return None
+    return re.sub(r"\d+(?:\.\d+)?", "#", s)[:160]
+
+
 def sell_fail_ttl_for_status(status, *, default_ttl=1800) -> int:
     """Backoff length by fail class — session-stale should not park a sell for 30m."""
     low = str(status or "").lower()

@@ -41,11 +41,18 @@ def protective_stale_tickers(
     protective_rows: Iterable | None,
     *,
     broker_id: str = "",
+    now: Optional[float] = None,
+    grace_sec: float = 300.0,
 ) -> list[str]:
     """
     protective_rows: iterable of (broker_id, ticker) or (broker_id, ticker, info).
     Return tickers tracked for this broker_id that are no longer held.
+
+    Stops set within grace_sec are skipped: right after a fill the holdings API
+    often lags, and clearing then orphaned AERO's live CB stop 10/4 (33h hold loop).
     """
+    import time as _time
+    ts_now = float(now if now is not None else _time.time())
     bid = str(broker_id or "").upper().replace("*", "")
     stale: list[str] = []
     for row in protective_rows or []:
@@ -64,8 +71,16 @@ def protective_stale_tickers(
             if not same:
                 continue
         tu = _norm_ticker(t)
-        if tu and tu not in held:
-            stale.append(tu)
+        if not tu or tu in held:
+            continue
+        info = row[2] if len(row) > 2 and isinstance(row[2], dict) else {}
+        try:
+            set_at = float(info.get("set_at") or 0)
+        except (TypeError, ValueError):
+            set_at = 0.0
+        if set_at > 0 and ts_now - set_at < float(grace_sec):
+            continue
+        stale.append(tu)
     return sorted(set(stale))
 
 

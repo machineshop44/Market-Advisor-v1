@@ -1263,6 +1263,8 @@ def buy_status_should_backoff(status: str) -> bool:
         "market hours mismatch",
         "invalid product_id",
         "product_id",
+        # RH lists no crypto pair (AMP 10/2–10/5: 94 ranked-then-failed pulses)
+        "no rh crypto quote",
     )
     return any(n in low for n in needles)
 
@@ -1908,6 +1910,41 @@ def etrade_entry_near_flatten_block(now_et=None, settings=None) -> tuple[bool, s
     )
 
 
+def equity_opening_range_block(now_et=None, settings=None) -> tuple[bool, str]:
+    """
+    Block NEW equity entries in the first N minutes of the regular session.
+    AMC 10/5: 09:30 buy, TTP armed on a +3% opening tick and sold −0.92% at 09:33
+    (a PDT day trade) before AMC ran +4.6% into midday.
+    """
+    s = settings or {}
+    try:
+        window = float(s.get("equity_open_no_entry_min", 15) or 0)
+    except (TypeError, ValueError):
+        window = 15.0
+    if window <= 0:
+        return False, ""
+    if now_et is None:
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            return False, ""
+    try:
+        from market_calendar import is_equity_session_day
+        if not is_equity_session_day(now_et.date()):
+            return False, ""
+    except Exception:
+        pass
+    mins = (now_et.hour * 60 + now_et.minute + now_et.second / 60.0) - (9 * 60 + 30)
+    if 0 <= mins < window:
+        return True, (
+            f"opening range — no new equity entries until {int(window)}m after the open "
+            f"({int(window - mins)}m left)"
+        )
+    return False, ""
+
+
 def et_eod_overnight_decision(
     ticker,
     *,
@@ -1952,7 +1989,10 @@ def et_eod_overnight_decision(
         except (TypeError, ValueError):
             max_loss = 0.01
         if roi >= -max_loss:
-            return "hold", f"overnight-research entry, ROI {roi*100:+.2f}% — holding as planned"
+            return "hold", (
+                f"ROI {roi*100:+.2f}% on GTC stop — holding as planned "
+                f"(overnight-research entry or flatten would burn a PDT day trade)"
+            )
         return "flatten", (
             f"overnight entry broke down (ROI {roi*100:+.2f}% < −{max_loss*100:.1f}%)"
         )

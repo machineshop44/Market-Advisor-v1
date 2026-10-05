@@ -734,7 +734,12 @@ class ETradeAdapter(BaseBroker):
             use_limit = float(offset_pct or 0) > 0
             if use_limit:
                 price_type = "LIMIT"
-                limit_price = round(price * (1.0 - float(offset_pct)), 2)
+                # Floor to the cent and sit ≥1¢ under the quote: round() put AMC 10/5
+                # exits at/above the bid → "Limit unfilled" loops on every TTP exit.
+                limit_price = math.floor(price * (1.0 - float(offset_pct)) * 100.0) / 100.0
+                if limit_price > round(price - 0.01, 2):
+                    limit_price = round(price - 0.01, 2)
+                limit_price = max(0.01, limit_price)
             else:
                 price_type = "MARKET"
                 limit_price = None
@@ -753,6 +758,11 @@ class ETradeAdapter(BaseBroker):
             )
             preview = self.client.preview_equity_order(self.account_id_key, preview_xml)
             preview_id = _extract_preview_id(preview)
+            if preview_id is None and "1037" in str(preview):
+                # Shares still reserved by the stop we just cancelled (AMC 10/5 12:27).
+                time.sleep(3.0)
+                preview = self.client.preview_equity_order(self.account_id_key, preview_xml)
+                preview_id = _extract_preview_id(preview)
             if preview_id is None and sell_all:
                 # EOD flatten: stale share count often causes preview 400 — refresh live qty once.
                 try:

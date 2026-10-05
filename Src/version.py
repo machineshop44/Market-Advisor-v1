@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.51"
+__version__ = "1.42.52"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Last-hour ET buys allowed when overnight-hold research passes (gap history, trend, "
-    "close strength, earnings); advisor judges the overnight case; planned holds skip flatten"
+    "CB orphan-stop sweep; stale clock counts market minutes only; weekend crypto edge x1.5; "
+    "15m opening-range gate; PDT-aware EOD hold; ET limit/1037 fixes; Discord alerts; log noise"
 )
 
 

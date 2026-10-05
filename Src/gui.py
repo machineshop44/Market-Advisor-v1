@@ -258,6 +258,8 @@ def load_settings():
         "et_eod_flatten_mode": "smart",
         "et_overnight_hold_min_roi_pct": 0.5,
         "et_overnight_intent_max_loss_pct": 1.0,
+        "equity_open_no_entry_min": 15,
+        "crypto_weekend_edge_mult": 1.5,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -3741,7 +3743,8 @@ class MarketAdvisorGUI(QMainWindow):
                 mention = ""
                 if urgent and "REAUTH" in str(prefix or "").upper():
                     mention = "@here "
-                    body["allowed_mentions"] = {"parse": ["here"]}
+                    # Discord gates @here under "everyone"; "here" is invalid → HTTP 400.
+                    body["allowed_mentions"] = {"parse": ["everyone"]}
                 from activity_log_util import discord_safe_content
                 if embed:
                     body["embeds"] = [embed]
@@ -15264,6 +15267,24 @@ class MarketAdvisorGUI(QMainWindow):
                         "supports_protective": supports,
                     })
             health = protective_stop_health(prot_holdings, paper_mode=self.paper_mode)
+            # Exit in flight (stop cancelled to free shares) is not a missing-stop gap —
+            # AERO's sell loop tripped the watchdog every ~2.5m on 10/5.
+            try:
+                raw_missing = list(health.get("missing") or [])
+                keep = [
+                    m for m in raw_missing
+                    if not self._stop_repair_suppressed(
+                        self._broker_display_from_id(m.get("broker_id")), m.get("ticker"),
+                    )
+                ]
+                if len(keep) != len(raw_missing):
+                    health["missing"] = keep
+                    health["missing_count"] = max(
+                        0, int(health.get("missing_count") or 0) - (len(raw_missing) - len(keep)),
+                    )
+                    health["ok"] = health["missing_count"] == 0
+            except Exception:
+                pass
             try:
                 from scoring import set_cross_broker_crypto
                 crypto_by = {}
@@ -17151,6 +17172,19 @@ class MarketAdvisorGUI(QMainWindow):
             stale = br.protective_stale_tickers(held, prot, broker_id=bid)
             for t in stale:
                 try:
+                    # Cancel at the broker first — forgetting a live stop orphans its hold.
+                    info = next(
+                        (r[2] for r in prot if len(r) > 2 and str(r[1]).upper() == t
+                         and str(r[0]).upper().replace("*", "") == bid),
+                        {},
+                    ) or {}
+                    oid = info.get("order_id")
+                    brk = self.brokers.get(broker_name)
+                    if oid and not info.get("paper") and not str(oid).startswith("paper-") and brk:
+                        try:
+                            brk.cancel_order(oid, is_crypto=(broker_name == "Coinbase" or t in KNOWN_CRYPTOS))
+                        except Exception:
+                            pass
                     clear_protective_order(bid, t)
                     self._clear_protective_gap(broker_name, t)
                 except Exception:
@@ -18178,6 +18212,17 @@ class MarketAdvisorGUI(QMainWindow):
         rec = self._load_et_overnight_intent().get(str(ticker).upper())
         return bool(rec and rec.get("day") == day)
 
+    def _et_flatten_burns_pdt(self, ticker):
+        """True when flattening a same-day ET buy would count a PDT day trade (AMC 10/5 #3)."""
+        try:
+            import pdt_guard as pdt
+            if not pdt.would_be_day_trade("E*TRADE", ticker):
+                return False
+            eq, _, _ = self.get_effective_balances("E*TRADE", prefer_cache=True)
+            return bool(pdt.pdt_applies(eq, self.settings))
+        except Exception:
+            return False
+
     def _et_eod_select_flatten(self, et_equity_rows):
         """Selective flatten: return rows to sell; log why each is held or sold."""
         from scoring import get_protective_order
@@ -18199,7 +18244,9 @@ class MarketAdvisorGUI(QMainWindow):
             action, why = _auto_cycle.et_eod_overnight_decision(
                 t, price=r.get("price"), avg_cost=cost,
                 has_broker_stop=has_stop, earnings_next=earn, settings=self.settings,
-                overnight_intent=self._et_overnight_intent_today(t),
+                overnight_intent=(
+                    self._et_overnight_intent_today(t) or self._et_flatten_burns_pdt(t)
+                ),
             )
             if action == "hold":
                 note = "" if earn is not None else " (earnings lookup unavailable)"
@@ -19727,6 +19774,23 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                     continue
 
+            if not is_crypto and tu not in held:
+                or_blk, or_why = _auto_cycle.equity_opening_range_block(settings=self.settings)
+                if or_blk:
+                    self._throttled_buy_skip_note(
+                        notes, broker_name, f"openrng_{tu}",
+                        f"[{broker_name}] Skipped [{ticker}]: {or_why}",
+                        cooldown_sec=600,
+                    )
+                    execute_skips.append(f"{ticker}: opening range")
+                    self._log_decision(
+                        broker=broker_name, ticker=ticker, action="SKIP",
+                        score=cand_score, reason="opening_range",
+                        posture=posture, open_count=open_count, max_open=max_positions,
+                        is_crypto=False, regime_ok=True,
+                    )
+                    continue
+
             if broker_name == "E*TRADE" and not is_crypto and tu not in held:
                 eod_blk, eod_why = _auto_cycle.etrade_entry_near_flatten_block(
                     settings=self.settings,
@@ -20177,6 +20241,25 @@ class MarketAdvisorGUI(QMainWindow):
                             is_crypto=is_crypto, regime_ok=True,
                         )
                         break
+                    # Spread gate before proposing — RH crypto (~1.9% quote spread) was approved
+                    # by the advisor then rejected at execute, burning AI budget (10/4 "Execute missed").
+                    liq_why = self._entry_liquidity_reason(
+                        self.brokers.get(broker_name), ticker, asset_type, price,
+                    )
+                    if liq_why:
+                        self._throttled_buy_skip_note(
+                            notes, broker_name, f"liq_{tu}",
+                            f"[{broker_name}] Skipped [{ticker}]: {liq_why}",
+                            cooldown_sec=900,
+                        )
+                        execute_skips.append(f"{ticker}: spread/liquidity")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason=f"liquidity:{liq_why}",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=is_crypto, regime_ok=True,
+                        )
+                        break
                     prop = aq.propose(
                         broker=broker_name,
                         ticker=ticker,
@@ -20385,8 +20468,13 @@ class MarketAdvisorGUI(QMainWindow):
     def _on_buy_batch_done(self, payload, auto_mode=False, table=None):
         payload = payload or {}
         broker = payload.get("broker") or self.cycle_broker_name
+        from activity_log_util import noisy_note_key
         for note in payload.get("notes") or []:
-            self.log_event(note)
+            key = noisy_note_key(note)
+            if key:
+                self._throttled_log(f"bnote:{key}", note, cooldown_sec=900)
+            else:
+                self.log_event(note)
         # Main-thread only: start Advisor AI briefs (never from buy-batch worker)
         for ap in payload.get("advisor_proposals") or []:
             try:
@@ -21860,10 +21948,11 @@ class MarketAdvisorGUI(QMainWindow):
                 restore_to = prior_cycle
                 break
         try:
-            self.log_event(
-                f"[{broker}] Buy batch start — {n} candidate(s)"
-                f"{' · advisor gate' if advisor_gate else ''}"
-            )
+            if bool(self.settings.get("verbose_cycle_log", False)):
+                self.log_event(
+                    f"[{broker}] Buy batch start — {n} candidate(s)"
+                    f"{' · advisor gate' if advisor_gate else ''}"
+                )
         except Exception:
             pass
         try:
@@ -21871,9 +21960,10 @@ class MarketAdvisorGUI(QMainWindow):
             try:
                 props = len((out or {}).get("advisor_proposals") or [])
                 buys = int((out or {}).get("buys_done") or 0)
-                self.log_event(
-                    f"[{broker}] Buy batch done — buys={buys} proposals={props}"
-                )
+                if buys or props or bool(self.settings.get("verbose_cycle_log", False)):
+                    self.log_event(
+                        f"[{broker}] Buy batch done — buys={buys} proposals={props}"
+                    )
             except Exception:
                 pass
             return out

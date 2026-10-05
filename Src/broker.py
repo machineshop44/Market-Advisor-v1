@@ -2346,6 +2346,15 @@ class CoinbaseAdapter(BaseBroker):
                     avail = max(avail, self._available_base_qty(clean))
                     delay = min(2.0, delay * 1.4)
                 if want > 0 and avail < want * 0.95:
+                    # Still held: an untracked stop (AERO 10/4 orphan) owns the coins.
+                    swept = self.cancel_open_sells(clean)
+                    if swept:
+                        print(f"Coinbase: cancelled {swept} orphan open sell(s) on {clean}")
+                        deadline = time.time() + 12.0
+                        while avail < want * 0.95 and time.time() < deadline:
+                            time.sleep(1.5)
+                            avail = max(avail, self._available_base_qty(clean))
+                if want > 0 and avail < want * 0.95:
                     avail_dust, _ = self.position_is_dust(clean, avail, price, asset_type)
                     want_dust, _ = self.position_is_dust(clean, want, price, asset_type)
                     if avail_dust and not want_dust:
@@ -2458,6 +2467,44 @@ class CoinbaseAdapter(BaseBroker):
             return True, f"cancelled ({data})"
         except Exception as e:
             return False, str(e)
+
+    def cancel_open_sells(self, ticker):
+        """Cancel every OPEN sell order on this product (orphaned stops hold the coins)."""
+        if not self.client:
+            return 0
+        clean = str(ticker).replace("-USD", "").upper()
+        orders = []
+        for kwargs in (
+            {"product_ids": [f"{clean}-USD"], "order_status": ["OPEN"]},
+            {"product_ids": [f"{clean}-USD"]},
+        ):
+            try:
+                data = self._cb_payload(self._cb_call(self.client.list_orders, **kwargs))
+                orders = _as_list(data.get("orders"))
+            except Exception:
+                orders = []
+            if orders:
+                break
+        ids = []
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("status") or "OPEN").upper() not in ("OPEN", "PENDING", "QUEUED"):
+                continue
+            if str(o.get("side") or "").upper() != "SELL":
+                continue
+            if str(o.get("product_id") or "").upper() != f"{clean}-USD":
+                continue
+            oid = o.get("order_id")
+            if oid:
+                ids.append(str(oid))
+        if not ids:
+            return 0
+        try:
+            self._cb_call(self.client.cancel_orders, ids)
+        except Exception:
+            return 0
+        return len(ids)
 
     def place_protective_stop(self, ticker, asset_type, quantity, entry_price, stop_pct,
                               trail_pct=None):

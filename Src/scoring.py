@@ -762,13 +762,33 @@ def new_entry_clears_fees_ok(
     need = min_entry_edge_pct(
         broker_id, ticker, atype, equity=equity, settings=settings,
     )
+    tag = ""
+    if is_crypto and _is_et_weekend():
+        # Weekend alts drift ±1% in 2h — 10/3–10/4 CB entries (scores 94–96) all
+        # stale-exited at −1.2…−1.7%, i.e. pure fees. Demand more edge Sat/Sun.
+        try:
+            mult = float((settings or {}).get("crypto_weekend_edge_mult", 1.5) or 1.0)
+        except (TypeError, ValueError):
+            mult = 1.5
+        if mult > 1.0:
+            need *= mult
+            tag = f" weekend ×{mult:g}"
     edge = estimated_signal_edge_pct(score, is_crypto=bool(is_crypto))
     if edge + 1e-12 < need:
         return False, (
             f"DO NOT BUY (Fee gate: est edge {edge*100:.2f}% < "
-            f"need {need*100:.2f}% RT+edge)"
+            f"need {need*100:.2f}% RT+edge{tag})"
         )
     return True, ""
+
+
+def _is_et_weekend(now=None) -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        d = now or datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        d = now or datetime.now()
+    return d.weekday() >= 5
 
 
 def crypto_new_entry_ok(
@@ -1209,6 +1229,9 @@ CORRELATION_CLUSTERS = {
 }
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scoring_state.json")
+# Side-state JSONs (loss streak, PDT, working orders, profit lock, overnight intent) —
+# matches the modules' historical fallback so existing files stay where they are.
+STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 
 def _normalize_broker_id(broker_id):
@@ -2974,6 +2997,9 @@ def set_protective_order(broker_id, ticker, order_info):
         _protective_orders[bid] = {}
     key = str(ticker).upper()
     if order_info:
+        if isinstance(order_info, dict) and not order_info.get("set_at"):
+            order_info = dict(order_info)
+            order_info["set_at"] = time.time()
         _protective_orders[bid][key] = order_info
     else:
         _protective_orders[bid].pop(key, None)
@@ -4216,6 +4242,40 @@ def last_rotation_reject_reason():
 # PRIMARY EVALUATION ENGINES
 # =========================================================================
 
+def equity_session_minutes_between(t0, t1) -> float:
+    """Minutes of NYSE regular session (09:30–close ET, session days) between two epochs."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timedelta as _td
+        from market_calendar import is_equity_session_day, regular_close_hour
+        tz = ZoneInfo("America/New_York")
+        a = datetime.fromtimestamp(float(t0), tz)
+        b = datetime.fromtimestamp(float(t1), tz)
+    except Exception:
+        return max(0.0, (float(t1) - float(t0)) / 60.0)
+    if b <= a:
+        return 0.0
+    total = 0.0
+    day = a.date()
+    for _ in range(40):
+        if day > b.date():
+            break
+        if is_equity_session_day(day):
+            close_h = float(regular_close_hour(day))
+            o = datetime(day.year, day.month, day.day, 9, 30, tzinfo=tz)
+            c = datetime(day.year, day.month, day.day, int(close_h),
+                         int(round((close_h % 1) * 60)), tzinfo=tz)
+            lo = max(a, o)
+            hi = min(b, c)
+            if hi > lo:
+                total += (hi - lo).total_seconds() / 60.0
+        day = day + _td(days=1)
+    else:
+        # Held > ~40 calendar days: wall-clock is a fine approximation for "stale".
+        return max(total, (float(t1) - float(t0)) / 60.0 * (6.5 / 24.0))
+    return total
+
+
 def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", live_price=None,
                      exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0,
                      allow_flat_time_banks=False, equity=None, holding_value=None,
@@ -4279,6 +4339,13 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
 
     highest = _portfolio_memory[broker_id][ticker]['highest']
     held_time_minutes = (now - _portfolio_memory[broker_id][ticker]['buy_time']) / 60.0
+    is_crypto_hold = "crypto" in str(asset_type or "").lower() or str(ticker).upper() in CRYPTO_TICKERS
+    if not is_crypto_hold:
+        # Equities: time exits count regular-session minutes only — LCID 10/5 was
+        # "Stale > 3h" at 09:33 after a Fri 16:11 buy (weekend counted), then ran +2.8%.
+        held_time_minutes = equity_session_minutes_between(
+            _portfolio_memory[broker_id][ticker]['buy_time'], now,
+        )
     roi = (current_price - avg_cost) / avg_cost
     _pm = _portfolio_memory[broker_id][ticker]
     fees["hard_stop"] = anchored_hard_stop(_pm, fees["hard_stop"])

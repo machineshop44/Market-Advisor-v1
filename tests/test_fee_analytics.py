@@ -266,7 +266,8 @@ class FeeAnalyticsTests(unittest.TestCase):
                 "last_eval": time.time(),
             }
         }
-        with mock.patch("scoring.save_state"):
+        with mock.patch("scoring.save_state"), \
+                mock.patch("scoring.equity_session_minutes_between", return_value=90.0):
             with mock.patch("scoring.resolve_exit_fees", return_value=dict(low_arm_fees)):
                 with mock.patch(
                     "scoring._get_trend_data",
