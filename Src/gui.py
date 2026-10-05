@@ -3694,7 +3694,7 @@ class MarketAdvisorGUI(QMainWindow):
                 if _auto_cycle.etrade_reauth_quiet(settings=self.settings):
                     self._throttled_log(
                         "etrade_reauth_quiet",
-                        "[REAUTH] [E*TRADE] Discord alert held — off-session (reauth Monday / next session morning)",
+                        "[REAUTH] [E*TRADE] Discord alert held — Fri/Sat off-session (alerts resume the day before the next session)",
                         cooldown_sec=3600,
                     )
                     return

@@ -1912,9 +1912,9 @@ def etrade_entry_near_flatten_block(now_et=None, settings=None) -> tuple[bool, s
 
 def etrade_reauth_quiet(now_et=None, settings=None) -> bool:
     """
-    True when E*TRADE reauth alerts should stay off Discord: from the close before a
-    non-session day through 08:00 ET on the next session day. Andrew reauths Monday
-    morning (the 08:45 pre-open nag still fires), so weekend/holiday pings are noise.
+    True when E*TRADE reauth alerts should stay off Discord: when tomorrow is not a
+    session day and today's session is over (Fri after close, Sat). Sunday alerts stay
+    on so Andrew can reauth ahead of Monday's open; holidays shift the same way.
     """
     s = settings or {}
     if not bool(s.get("etrade_reauth_quiet_off_days", True)):
@@ -1936,14 +1936,11 @@ def etrade_reauth_quiet(now_et=None, settings=None) -> bool:
             return d.weekday() < 5
 
     today = now_et.date()
+    if _session(today + timedelta(days=1)):
+        return False
     if not _session(today):
         return True
-    sod = now_et.hour * 60 + now_et.minute
-    if sod < 8 * 60 and not _session(today - timedelta(days=1)):
-        return True
-    if sod >= 16 * 60 and not _session(today + timedelta(days=1)):
-        return True
-    return False
+    return now_et.hour * 60 + now_et.minute >= 16 * 60
 
 
 def equity_opening_range_block(now_et=None, settings=None) -> tuple[bool, str]:

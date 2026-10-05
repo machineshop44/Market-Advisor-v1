@@ -49,6 +49,24 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { /* optional — background poll still works without toast spam */ }
 
+    /** Authorize URL of the in-flight OAuth — reused on retry so the desk's request token stays valid. */
+    private var pendingAuthorizeUrl: String? = null
+
+    private val etradeAuth = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { res ->
+        val code = res.data?.getStringExtra(EtradeAuthActivity.EXTRA_CODE)?.trim().orEmpty()
+        if (res.resultCode == RESULT_OK && code.isNotBlank()) completeEtradeReauth(code)
+    }
+
+    private fun launchEtradeAuth(authorizeUrl: String) {
+        pendingAuthorizeUrl = authorizeUrl
+        etradeAuth.launch(
+            Intent(this, EtradeAuthActivity::class.java)
+                .putExtra(EtradeAuthActivity.EXTRA_URL, authorizeUrl),
+        )
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -789,30 +807,7 @@ class MainActivity : AppCompatActivity() {
                 ).show()
                 return@launch
             }
-            try {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(start.authorizeUrl)))
-            } catch (_: Exception) {
-                Toast.makeText(this@MainActivity, "No browser available", Toast.LENGTH_LONG).show()
-                return@launch
-            }
-            val input = EditText(this@MainActivity).apply {
-                hint = getString(R.string.reauth_paste_code)
-                setSingleLine()
-            }
-            AlertDialog.Builder(this@MainActivity)
-                .setTitle(R.string.reauth_title)
-                .setMessage(R.string.reauth_body)
-                .setView(input)
-                .setNegativeButton(android.R.string.cancel, null)
-                .setPositiveButton(R.string.reauth_complete) { _, _ ->
-                    val code = input.text?.toString()?.trim().orEmpty()
-                    if (code.isBlank()) {
-                        Toast.makeText(this@MainActivity, "Enter the verification code", Toast.LENGTH_SHORT).show()
-                        return@setPositiveButton
-                    }
-                    completeEtradeReauth(code)
-                }
-                .show()
+            launchEtradeAuth(start.authorizeUrl)
         }
     }
 
@@ -833,14 +828,19 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     "E*TRADE reauthed (arm from companion if needed)"
                 }
+                pendingAuthorizeUrl = null
                 Toast.makeText(this@MainActivity, note, Toast.LENGTH_LONG).show()
                 refreshStatus(force = true)
             } else {
-                Toast.makeText(
-                    this@MainActivity,
-                    result.error ?: "Reauth failed",
-                    Toast.LENGTH_LONG,
-                ).show()
+                val retryUrl = pendingAuthorizeUrl
+                val dlg = AlertDialog.Builder(this@MainActivity)
+                    .setTitle(R.string.reauth_title)
+                    .setMessage(result.error ?: "Reauth failed")
+                    .setNegativeButton(android.R.string.cancel, null)
+                if (!retryUrl.isNullOrBlank()) {
+                    dlg.setPositiveButton(R.string.reauth_retry) { _, _ -> launchEtradeAuth(retryUrl) }
+                }
+                dlg.show()
             }
         }
     }

@@ -43,6 +43,13 @@
     <string name="reauth_open_browser">Open authorize page</string>
     <string name="reauth_paste_code">Paste verification code</string>
     <string name="reauth_complete">Complete reauth</string>
+    <string name="reauth_web_status_login">Log in to E*TRADE below — the code is picked up automatically.</string>
+    <string name="reauth_web_status_accept">Tap Accept to show your verification code.</string>
+    <string name="reauth_web_status_return">Logged in — returning to the authorize page…</string>
+    <string name="reauth_web_status_code">Code found: %1$s</string>
+    <string name="reauth_web_reload">Reload authorize</string>
+    <string name="reauth_web_browser">Open in browser</string>
+    <string name="reauth_retry">Try again</string>
     <string name="reauth_notify_title">Broker needs reauth</string>
     <string name="reauth_notify_body">A connected broker needs reauthorization — open Companion to see which one.</string>
     <string name="reauth_notify_title_etrade">E*TRADE needs reauth</string>
