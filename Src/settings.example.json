@@ -99,6 +99,7 @@
     "et_overnight_intent_max_loss_pct": 1.0,
     "equity_open_no_entry_min": 15,
     "crypto_weekend_edge_mult": 1.5,
+    "etrade_reauth_quiet_off_days": true,
     "daily_loss_flatten": true,
     "panic_halt_flatten": true,
     "desk_focus_park_others": false,

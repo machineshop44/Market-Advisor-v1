@@ -260,6 +260,7 @@ def load_settings():
         "et_overnight_intent_max_loss_pct": 1.0,
         "equity_open_no_entry_min": 15,
         "crypto_weekend_edge_mult": 1.5,
+        "etrade_reauth_quiet_off_days": True,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -3685,6 +3686,20 @@ class MarketAdvisorGUI(QMainWindow):
         alert_lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         if alert_lvl == "Disabled Completely":
             return
+        if (
+            "REAUTH" in str(prefix or "").upper()
+            and "ETRADE" in str(broker or "").upper().replace("*", "")
+        ):
+            try:
+                if _auto_cycle.etrade_reauth_quiet(settings=self.settings):
+                    self._throttled_log(
+                        "etrade_reauth_quiet",
+                        "[REAUTH] [E*TRADE] Discord alert held — off-session (reauth Monday / next session morning)",
+                        cooldown_sec=3600,
+                    )
+                    return
+            except Exception:
+                pass
         # Important Only = critical/urgent + heartbeat; suppress routine trade spam
         if (
             is_trade

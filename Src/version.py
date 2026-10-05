@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.52"
+__version__ = "1.42.53"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "CB orphan-stop sweep; stale clock counts market minutes only; weekend crypto edge x1.5; "
-    "15m opening-range gate; PDT-aware EOD hold; ET limit/1037 fixes; Discord alerts; log noise"
+    "E*TRADE reauth Discord alerts held on weekends/holidays (Fri close → 08:00 next session); "
+    "Monday 08:45 pre-open reauth nag still pings"
 )
 
 

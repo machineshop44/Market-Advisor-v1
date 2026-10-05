@@ -98,6 +98,20 @@ def test_rh_no_quote_backs_off():
     )
 
 
+def test_etrade_reauth_quiet_weekend_window():
+    q = auto_cycle.etrade_reauth_quiet
+    assert q(datetime(2026, 10, 2, 23, 30, tzinfo=ET))       # Fri night token-expiry nudge
+    assert q(datetime(2026, 10, 3, 12, 0, tzinfo=ET))        # Saturday
+    assert q(datetime(2026, 10, 4, 23, 30, tzinfo=ET))       # Sunday night
+    assert q(datetime(2026, 10, 5, 0, 5, tzinfo=ET))         # Mon after midnight expiry
+    assert not q(datetime(2026, 10, 5, 8, 45, tzinfo=ET))    # Mon pre-open nag
+    assert not q(datetime(2026, 10, 5, 23, 30, tzinfo=ET))   # Mon night (Tue is a session)
+    assert not q(datetime(2026, 10, 6, 3, 0, tzinfo=ET))     # Tue early
+    assert not q(
+        datetime(2026, 10, 3, 12, 0, tzinfo=ET), settings={"etrade_reauth_quiet_off_days": False},
+    )
+
+
 def test_overnight_intent_message_says_as_planned():
     dec, why = auto_cycle.et_eod_overnight_decision(
         "AMC", price=4.00, avg_cost=4.03, has_broker_stop=True, earnings_next=False,
