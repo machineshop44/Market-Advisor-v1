@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.54"
+__version__ = "1.42.55"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "E*TRADE reauth Discord alerts held Fri after close and Sat (holidays shift the same); "
-    "Sunday alerts back on so you can reauth ahead of Monday's open"
+    "RH outage no longer drops holdings as external sells; soft-fail disarm self-recovers; "
+    "crypto fee gate learns from 7d realized results; quieter rank/frac/slow-cycle logs"
 )
 
 

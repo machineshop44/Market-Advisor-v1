@@ -40,6 +40,7 @@ def test_session_minutes_overnight_counts_only_rth():
 def test_weekend_crypto_needs_more_edge(monkeypatch):
     monkeypatch.setattr(scoring, "min_entry_edge_pct", lambda *a, **k: 0.04)
     monkeypatch.setattr(scoring, "estimated_signal_edge_pct", lambda s, is_crypto=False: 0.05)
+    monkeypatch.setattr(scoring, "realized_crypto_edge_mult", lambda *a, **k: (1.0, ""))
     monkeypatch.setattr(scoring, "_is_et_weekend", lambda now=None: False)
     ok, _ = scoring.new_entry_clears_fees_ok("COINBASE", "SOL-USD", 95, is_crypto=True)
     assert ok

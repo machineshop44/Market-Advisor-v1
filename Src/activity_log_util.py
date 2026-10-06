@@ -158,7 +158,7 @@ def explain_no_buys_after_rank(
 _NOISY_NOTE_BITS = (
     "Wide spread", "Session size [", "already holds this coin",
     "No buys executed after rank", "PDT entry guard", "Micro crypto park",
-    "trade lock active", "Equity buy engines wait for",
+    "trade lock active", "Equity buy engines wait for", "Frac policy [",
 )
 
 

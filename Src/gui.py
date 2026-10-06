@@ -261,6 +261,7 @@ def load_settings():
         "equity_open_no_entry_min": 15,
         "crypto_weekend_edge_mult": 1.5,
         "etrade_reauth_quiet_off_days": True,
+        "crypto_realized_edge_feedback": True,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -2634,7 +2635,22 @@ class MarketAdvisorGUI(QMainWindow):
                     self._holdings_empty_since[broker_name] = time.time()
                     since = self._holdings_empty_since[broker_name]
                 age = time.time() - since
-                if streak >= 3 or age >= 180.0:
+                # Empty holdings while balance/profile reads are failing is an outage, not a
+                # flat book (RH 10/6 15:41 dropped ETH/LINK/SHIB as "external sells").
+                bal_bad = int(
+                    (getattr(self, "_balance_bad_streak", {}) or {}).get(broker_name, 0) or 0
+                ) > 0 or bool(
+                    (getattr(self, "_broker_manual_auth_needed", {}) or {}).get(broker_name)
+                )
+                if bal_bad:
+                    assets = [dict(a, stale=True) for a in prev_rows if isinstance(a, dict)]
+                    self._throttled_log(
+                        f"{broker_name}:holdings_empty_outage",
+                        f"[{broker_name}] Holdings empty while balance fetch is failing — "
+                        f"keeping {len(prev_rows)} cached row(s) (not accepting a flat book)",
+                        cooldown_sec=600,
+                    )
+                elif streak >= 3 or age >= 180.0:
                     self._holdings_cache_by_broker[broker_name] = []
                     assets = []
                     self._throttled_log(
@@ -4705,6 +4721,10 @@ class MarketAdvisorGUI(QMainWindow):
                         )
                     )
                 ):
+                    if name != "E*TRADE":
+                        if not hasattr(self, "_soft_auth_dead_since"):
+                            self._soft_auth_dead_since = {}
+                        self._soft_auth_dead_since[name] = time.time()
                     self._handle_broker_auth_failure(
                         name,
                         f"{reason} (soft-fail streak {streak})",
@@ -16471,6 +16491,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._maybe_session_boundary_wakeup(now)
         self._maybe_etrade_midnight_handling(now)
         self._maybe_etrade_preopen_reauth_nag(now)
+        self._maybe_probe_soft_auth_recovery(now)
 
         for broker_name, enabled in self.auto_trade_enabled.items():
             if not enabled:
@@ -16701,6 +16722,99 @@ class MarketAdvisorGUI(QMainWindow):
             "for E*TRADE. Open Auto-Trader and check E*TRADE to run CORE/BREAKOUT.",
             cooldown_sec=1800,
         )
+    def _maybe_probe_soft_auth_recovery(self, now):
+        """
+        After a soft-fail disarm (RH 'profile unavailable' streak), retry the saved session
+        every 5m for up to 6h. RH API blips (10/6 15:40–15:50) otherwise left the desk
+        disarmed until a manual reauth even when the token was still good.
+        """
+        since_map = getattr(self, "_soft_auth_dead_since", None) or {}
+        if not since_map or self.paper_mode:
+            return
+        inflight = getattr(self, "_soft_probe_inflight", None)
+        if inflight is None:
+            self._soft_probe_inflight = inflight = {}
+        last_map = getattr(self, "_soft_probe_last", None)
+        if last_map is None:
+            self._soft_probe_last = last_map = {}
+        for name, since in list(since_map.items()):
+            if not (getattr(self, "_broker_manual_auth_needed", {}) or {}).get(name):
+                since_map.pop(name, None)
+                continue
+            if now - float(since or 0) > 6 * 3600:
+                since_map.pop(name, None)
+                continue
+            if inflight.get(name) or now - float(last_map.get(name, 0) or 0) < 300:
+                continue
+            last_map[name] = now
+            inflight[name] = True
+            self._start_soft_auth_probe(name)
+
+    def _start_soft_auth_probe(self, name):
+        cb_key = self.settings.get("cb_api_key", "")
+        try:
+            import credentials as cred_mod
+            cb_secret = cred_mod.resolve_cb_api_secret(self.settings)
+        except Exception:
+            cb_secret = self.settings.get("cb_api_secret", "")
+
+        def _bg():
+            try:
+                brk = self.brokers.get(name)
+                if name == "Robinhood":
+                    # Saved session only — never password/2FA on a worker thread.
+                    return brk.login({})
+                if name == "Coinbase" and cb_key and cb_secret:
+                    return brk.login({
+                        "api_key": cb_key,
+                        "api_secret": cb_secret,
+                        "live_trading_enabled": bool(
+                            self.settings.get("coinbase_live_trading", True)
+                        ),
+                    })
+                return False, "no silent path"
+            except Exception as e:
+                return False, str(e)
+
+        def _done(result):
+            self._soft_probe_inflight[name] = False
+            ok = bool(isinstance(result, (list, tuple)) and result and result[0])
+            if not ok:
+                self._throttled_log(
+                    f"{name}:soft_probe_fail",
+                    f"[{name}] Session probe still failing — reauth needed "
+                    f"(retrying saved session every 5m)",
+                    cooldown_sec=1800,
+                )
+                return
+            (getattr(self, "_soft_auth_dead_since", None) or {}).pop(name, None)
+            self._broker_manual_auth_needed[name] = False
+            if hasattr(self, "_balance_bad_streak"):
+                self._balance_bad_streak[name] = 0
+            if hasattr(self, "_reauth_nudge_sent"):
+                self._reauth_nudge_sent[name] = False
+            self._set_broker_status(name, "🟢 Connected", "color: #00E676; font-weight: bold;")
+            self.log_event(f"[{name}] Session recovered on its own (saved session valid again).")
+            self.send_discord_alert(
+                f"✅ [{name}] Session recovered without reauth — resuming.",
+                broker=name,
+            )
+            self._update_autotrade_ui()
+            self._after_broker_session_restored(name, source="soft_probe")
+            self._maybe_restore_broker_arm(name, source="soft_probe")
+            if hasattr(self, "_update_reauth_banner"):
+                self._update_reauth_banner()
+
+        def _fail(_err):
+            self._soft_probe_inflight[name] = False
+
+        task = BackgroundTask(_bg)
+        task.result_ready.connect(_done)
+        task.error_occurred.connect(_fail)
+        task.finished.connect(lambda: self.active_threads.remove(task) if task in self.active_threads else None)
+        self.active_threads.append(task)
+        task.start()
+
     def _try_reconnect_broker(self, broker_name):
         """Kick off silent re-login on a worker thread (never block director_tick)."""
         now = time.time()
@@ -16949,8 +17063,15 @@ class MarketAdvisorGUI(QMainWindow):
             task = getattr(self, "_cycle_task", "") or ""
             if bool(self.settings.get("verbose_cycle_log", False)):
                 self.log_event(f"[AUTO] Cycle finished for {finished_broker}")
-            elif took >= 30.0:
+            elif took >= 120.0:
                 self.log_event(f"[AUTO] Slow {task} cycle on {finished_broker}: {took:.0f}s")
+            elif took >= 60.0:
+                # RH crypto quotes routinely take 30–45s (10/6: 122 'slow' lines, avg 40s).
+                self._throttled_log(
+                    f"slowcycle:{finished_broker}:{task}",
+                    f"[AUTO] Slow {task} cycle on {finished_broker}: {took:.0f}s",
+                    cooldown_sec=1800,
+                )
         self.process_queue()
 
     # ---------------------------------------------------------
@@ -21588,9 +21709,8 @@ class MarketAdvisorGUI(QMainWindow):
             buy_candidates = affordable
         self._log_scan_buy_outcome("CRYPTO", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
-            self.log_event(
-                _auto_cycle.format_ranked_buys_note(self.cycle_broker_name, buy_candidates)
-            )
+            _rn = _auto_cycle.format_ranked_buys_note(self.cycle_broker_name, buy_candidates)
+            self._throttled_log(f"rank:{re.sub(r'[0-9.]+', '#', _rn)}", _rn, cooldown_sec=900)
             self._try_execute_scan_buys(
                 self.crypto_table, buy_candidates,
                 engine_label="CRYPTO",
@@ -21632,9 +21752,8 @@ class MarketAdvisorGUI(QMainWindow):
             buy_candidates = affordable
         self._log_scan_buy_outcome("BREAKOUT", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
-            self.log_event(
-                _auto_cycle.format_ranked_buys_note(self.cycle_broker_name, buy_candidates)
-            )
+            _rn = _auto_cycle.format_ranked_buys_note(self.cycle_broker_name, buy_candidates)
+            self._throttled_log(f"rank:{re.sub(r'[0-9.]+', '#', _rn)}", _rn, cooldown_sec=900)
             self._try_execute_scan_buys(
                 self.penny_table, buy_candidates,
                 engine_label="BREAKOUT",
@@ -21676,9 +21795,8 @@ class MarketAdvisorGUI(QMainWindow):
             buy_candidates = affordable
         self._log_scan_buy_outcome("CORE", results, buy_candidates, dropped)
         if buy_candidates and self._is_broker_auto_trading():
-            self.log_event(
-                _auto_cycle.format_ranked_buys_note(self.cycle_broker_name, buy_candidates)
-            )
+            _rn = _auto_cycle.format_ranked_buys_note(self.cycle_broker_name, buy_candidates)
+            self._throttled_log(f"rank:{re.sub(r'[0-9.]+', '#', _rn)}", _rn, cooldown_sec=900)
             self._try_execute_scan_buys(
                 self.core_table, buy_candidates,
                 engine_label="CORE",

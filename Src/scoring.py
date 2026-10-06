@@ -773,6 +773,11 @@ def new_entry_clears_fees_ok(
         if mult > 1.0:
             need *= mult
             tag = f" weekend ×{mult:g}"
+    if is_crypto:
+        rmult, rtag = realized_crypto_edge_mult(broker_id, settings)
+        if rmult > 1.0:
+            need *= rmult
+            tag += rtag
     edge = estimated_signal_edge_pct(score, is_crypto=bool(is_crypto))
     if edge + 1e-12 < need:
         return False, (
@@ -780,6 +785,58 @@ def new_entry_clears_fees_ok(
             f"need {need*100:.2f}% RT+edge{tag})"
         )
     return True, ""
+
+
+_realized_edge_cache: dict = {}
+
+
+def realized_crypto_edge_mult(broker_id, settings=None, *, rows=None, now=None) -> tuple[float, str]:
+    """
+    Fee-gate multiplier from this broker's last 7 days of closed crypto trades.
+    The score→edge map credits a 98 with ~5.8% edge; CB/RH crypto exits 10/2–10/6 were
+    mostly stale −1.2…−1.7% (fees). ≥6 exits with mean net ROI < 0 → ×1.5, win rate < 30% → ×2.
+    """
+    s = settings or {}
+    if not bool(s.get("crypto_realized_edge_feedback", True)):
+        return 1.0, ""
+    bid = str(broker_id or "").upper().replace("*", "")
+    ts = float(now if now is not None else time.time())
+    from_journal = rows is None
+    if from_journal:
+        hit = _realized_edge_cache.get(bid)
+        if hit and ts - hit[0] < 600:
+            return hit[1], hit[2]
+        try:
+            import journal as _j
+            rows = _j.read_since_days(7)
+        except Exception:
+            rows = []
+    nets = []
+    for r in rows or []:
+        try:
+            if str(r.get("side", "")).upper() != "SELL":
+                continue
+            if str(r.get("broker", "")).upper().replace("*", "") != bid:
+                continue
+            at = str(r.get("asset_type", "")).lower()
+            tick = str(r.get("ticker", "")).upper().replace("-USD", "")
+            if "crypto" not in at and tick not in CRYPTO_TICKERS:
+                continue
+            if r.get("roi_net") is None or r.get("paper"):
+                continue
+            nets.append(float(r["roi_net"]))
+        except (TypeError, ValueError):
+            continue
+    mult, tag = 1.0, ""
+    if len(nets) >= 6:
+        mean = sum(nets) / len(nets)
+        wr = sum(1 for n in nets if n > 0) / len(nets)
+        if mean < 0:
+            mult = 2.0 if wr < 0.30 else 1.5
+            tag = f" realized 7d {mean*100:+.2f}% avg/{wr*100:.0f}% WR ×{mult:g}"
+    if from_journal:
+        _realized_edge_cache[bid] = (ts, mult, tag)
+    return mult, tag
 
 
 def _is_et_weekend(now=None) -> bool:
