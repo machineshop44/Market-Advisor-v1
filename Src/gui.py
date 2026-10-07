@@ -262,6 +262,7 @@ def load_settings():
         "crypto_weekend_edge_mult": 1.5,
         "etrade_reauth_quiet_off_days": True,
         "crypto_realized_edge_feedback": True,
+        "pdt_defer_stale_day_trades": True,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -3441,6 +3442,18 @@ class MarketAdvisorGUI(QMainWindow):
                             "Skipped: PDT check blocked — equity read unavailable "
                             "(fail closed until balance refresh)"
                         )
+                if "stale" in reason_blob.lower():
+                    from scoring import get_protective_order
+                    _bid = (
+                        getattr(self.brokers.get(broker_name), "broker_id", None)
+                        or str(broker_name).upper()
+                    )
+                    defer, why_def = pdt.defer_stale_day_trade(
+                        broker_name, ticker, equity=eq, settings=self.settings,
+                        has_broker_stop=bool(get_protective_order(_bid, ticker)),
+                    )
+                    if defer:
+                        return f"Skipped: {why_def}"
                 ok_pdt, why_pdt = pdt.may_complete_day_trade(
                     broker_name, ticker, equity=eq, settings=self.settings, urgent=False,
                 )
@@ -16466,8 +16479,16 @@ class MarketAdvisorGUI(QMainWindow):
             stalled_for = now - self._queue_started_at
             if stalled_for >= 180 and not self._stall_alerted:
                 self._stall_alerted = True
+                where = " / ".join(
+                    x for x in (
+                        str(getattr(self, "_cycle_broker", "") or ""),
+                        str(getattr(self, "_cycle_task", "") or ""),
+                        str(getattr(self, "_cycle_phase", "") or ""),
+                    ) if x
+                )
                 msg = (
-                    f"⚠️ Cycle stall detected ({int(stalled_for)}s). "
+                    f"⚠️ Cycle stall detected ({int(stalled_for)}s"
+                    f"{' in ' + where if where else ''}). "
                     f"Forcing queue unlock (in-flight results ignored)."
                 )
                 self.log_event(msg)
@@ -16954,6 +16975,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._stall_alerted = False
         self._running_cycle_gen = int(getattr(self, "_cycle_gen", 0) or 0)
         broker_name, task = self.task_queue.pop(0)
+        self._cycle_phase = "scan/score"
         exit_only = task == "PORTFOLIO" and self._exits_managed(broker_name)
         if not self.auto_trade_enabled.get(broker_name) and not exit_only:
             self.log_event(f"[AUTO] Skipping {task} on {broker_name} (disarmed)")
@@ -20718,6 +20740,7 @@ class MarketAdvisorGUI(QMainWindow):
         fills = []
         notes = []
         deferred = []
+        self._cycle_phase = f"sell batch ({len(sell_list or [])})"
         try:
             for item in sell_list or []:
                 ticker = item.get("ticker")
@@ -20776,8 +20799,11 @@ class MarketAdvisorGUI(QMainWindow):
                         deferred.append(str(ticker).upper())
                         continue
 
-                # Hopeless sell backoff (e.g. BONK Fail / dust) — don't hammer every portfolio cycle
-                if self._sell_fail_should_skip(row_broker, ticker):
+                # Hopeless sell backoff (e.g. BONK Fail / dust) — don't hammer every portfolio cycle.
+                # Hard-stop / flatten exits bypass it (a PDT stale deferral must not park a hard stop).
+                if self._sell_fail_should_skip(row_broker, ticker) and not self._sell_force_market_reason(
+                    str(item.get("action") or item.get("reason") or "")
+                ):
                     deferred.append(str(ticker).upper())
                     continue
 
@@ -22068,6 +22094,7 @@ class MarketAdvisorGUI(QMainWindow):
     def _bg_buy_batch_safe(self, candidates, rank=False, advisor_gate=False):
         broker = getattr(self, "cycle_broker_name", "?")
         n = len(candidates or [])
+        self._cycle_phase = f"buy batch ({n})"
         # Advisor apply may temporarily switch _cycle_broker — always restore.
         prior_cycle = getattr(self, "_cycle_broker", None)
         restore_to = None

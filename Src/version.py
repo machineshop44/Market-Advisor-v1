@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.55"
+__version__ = "1.42.56"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "RH outage no longer drops holdings as external sells; soft-fail disarm self-recovers; "
-    "crypto fee gate learns from 7d realized results; quieter rank/frac/slow-cycle logs"
+    "Same-day stale exits wait for next session under PDT when a broker stop is on; "
+    "hard stops bypass sell backoff; cycle-stall alerts name the broker/task/phase"
 )
 
 

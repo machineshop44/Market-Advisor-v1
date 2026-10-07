@@ -195,6 +195,7 @@ def sell_fail_ttl_for_status(status, *, default_ttl=1800) -> int:
             "no rh crypto quote",
             "soft-dead",
             "api gap",
+            "pdt",
         )
     ):
         return max(int(default_ttl or 1800), 2 * 3600)  # ≥2h

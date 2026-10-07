@@ -1227,6 +1227,7 @@ def sell_status_should_backoff(status: str) -> bool:
             "no rh crypto quote",
             "soft-dead",
             "api gap",
+            "pdt",
         )
     ):
         return True

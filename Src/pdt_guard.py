@@ -275,6 +275,34 @@ def may_complete_day_trade(
     return True, ""
 
 
+def defer_stale_day_trade(
+    broker: str,
+    ticker: str,
+    *,
+    equity: float,
+    settings: Optional[dict] = None,
+    has_broker_stop: bool = False,
+) -> tuple[bool, str]:
+    """
+    (True, why) when a same-day 'stale' exit should wait for the next session instead.
+    RH AMC 10/7: bought 09:46, stale-sold 15:15 at −1.71% near the low (2.85 → 2.89 by
+    15:45) and burned day trade 2/3 while its broker trailing stop was still working.
+    """
+    s = settings or {}
+    if not bool(s.get("pdt_defer_stale_day_trades", True)):
+        return False, ""
+    if not has_broker_stop:
+        return False, ""
+    if not would_be_day_trade(broker, ticker):
+        return False, ""
+    if not pdt_applies(equity, settings):
+        return False, ""
+    return True, (
+        "PDT: stale exit deferred to next session — a same-day exit would burn a day trade; "
+        "holding under the broker stop"
+    )
+
+
 def may_open_equity_buy(
     broker: str,
     ticker: str,

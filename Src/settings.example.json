@@ -101,6 +101,7 @@
     "crypto_weekend_edge_mult": 1.5,
     "etrade_reauth_quiet_off_days": true,
     "crypto_realized_edge_feedback": true,
+    "pdt_defer_stale_day_trades": true,
     "daily_loss_flatten": true,
     "panic_halt_flatten": true,
     "desk_focus_park_others": false,
