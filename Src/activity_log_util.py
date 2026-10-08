@@ -267,6 +267,9 @@ def advisor_miss_park_spec(why: str) -> tuple[float, str] | None:
         or "not tradeable" in low
     ):
         return (60.0 * 60.0, "no_quote")
+    if "pdt entry guard" in low or "pdt entry skip" in low:
+        # Slots only free when a day trade rolls off — SMCI 10/8 re-fired 3× in 20s.
+        return (60.0 * 60.0, "pdt_guard")
     if "policy / size / empty after filter" in low:
         return (15.0 * 60.0, "policy_filtered")
     return None
@@ -300,10 +303,12 @@ _ADVISOR_INFO_NOTE_BITS = (
 )
 
 
-def advisor_miss_reason(notes, fills=None) -> str:
+def advisor_miss_reason(notes, fills=None, execute_skips=None) -> str:
     """
     Pick the note that explains why an approved advisor buy did not fill.
     Informational sizing notes (dollars cap, session size) are never the reason.
+    execute_skips is the fallback: throttled/once-per-session notes left SMCI 10/8
+    showing only 'buy did not fill' three times in 30s.
     """
     for fill in fills or []:
         st = str((fill or {}).get("status") or "")
@@ -322,6 +327,9 @@ def advisor_miss_reason(notes, fills=None) -> str:
             return s
     if reasons:
         return reasons[0]
+    skips = [str(s) for s in (execute_skips or []) if str(s or "").strip()]
+    if skips:
+        return f"buy skipped — {'; '.join(skips[:3])}"
     return "buy did not fill — proposal restored to pending"
 
 

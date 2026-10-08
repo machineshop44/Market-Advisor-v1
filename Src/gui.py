@@ -263,6 +263,8 @@ def load_settings():
         "etrade_reauth_quiet_off_days": True,
         "crypto_realized_edge_feedback": True,
         "pdt_defer_stale_day_trades": True,
+        "pdt_last_slot_min_roi_pct": 1.5,
+        "advisor_working_repropose_sec": 1800,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
         "desk_focus_park_others_auto_under": 500.0,
@@ -3442,18 +3444,27 @@ class MarketAdvisorGUI(QMainWindow):
                             "Skipped: PDT check blocked — equity read unavailable "
                             "(fail closed until balance refresh)"
                         )
+                from scoring import get_protective_order
+                _bid = (
+                    getattr(self.brokers.get(broker_name), "broker_id", None)
+                    or str(broker_name).upper()
+                )
+                _has_stop = bool(get_protective_order(_bid, ticker))
                 if "stale" in reason_blob.lower():
-                    from scoring import get_protective_order
-                    _bid = (
-                        getattr(self.brokers.get(broker_name), "broker_id", None)
-                        or str(broker_name).upper()
-                    )
                     defer, why_def = pdt.defer_stale_day_trade(
                         broker_name, ticker, equity=eq, settings=self.settings,
-                        has_broker_stop=bool(get_protective_order(_bid, ticker)),
+                        has_broker_stop=_has_stop,
                     )
                     if defer:
                         return f"Skipped: {why_def}"
+                _m_roi = re.search(r"(?:Exit|ROI):\s*([+-]?\d+(?:\.\d+)?)%", reason_blob)
+                reserve, why_res = pdt.reserve_last_day_trade(
+                    broker_name, ticker, equity=eq, settings=self.settings,
+                    roi_pct=float(_m_roi.group(1)) if _m_roi else None,
+                    has_broker_stop=_has_stop,
+                )
+                if reserve:
+                    return f"Skipped: {why_res}"
                 ok_pdt, why_pdt = pdt.may_complete_day_trade(
                     broker_name, ticker, equity=eq, settings=self.settings, urgent=False,
                 )
@@ -6929,6 +6940,8 @@ class MarketAdvisorGUI(QMainWindow):
                 self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
                 return
             new_items = dw.new_snags_for_alert(report, prev, min_severity=dw.SEV_WARN)
+            # [REAUTH] alerts own this (with off-day quiet) — watchdog echoed every 8:45 nag.
+            new_items = [s for s in new_items if s.get("code") != "reauth_log"]
             if not new_items:
                 self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
                 return
@@ -14109,7 +14122,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         buys_done = int(payload.get("buys_done") or 0)
         notes = payload.get("notes") or []
-        why = advisor_miss_reason(notes, payload.get("fills"))
+        why = advisor_miss_reason(notes, payload.get("fills"), payload.get("execute_skips"))
         for n in notes:
             if advisor_miss_park_spec(str(n)):
                 why = n
@@ -14150,6 +14163,26 @@ class MarketAdvisorGUI(QMainWindow):
             aq.complete(proposal_id, ok=buys_done > 0)
             if buys_done <= 0:
                 self.log_event(f"[Advisor] Execute missed: {why}")
+            else:
+                tick0 = str(prop0.get("ticker") or "").upper()
+                working0 = [
+                    f for f in (payload.get("fills") or [])
+                    if f.get("working") and not f.get("filled")
+                    and str(f.get("ticker") or "").replace("-USD", "").upper() == tick0
+                ]
+                # A resting order is not a position yet — re-proposing doubled SNAP 10/8.
+                if working0 and broker0 and tick0:
+                    try:
+                        aq.set_repropose_cooldown(
+                            broker0, tick0,
+                            seconds=float(
+                                self.settings.get("advisor_working_repropose_sec", 1800) or 1800
+                            ),
+                            reason="exec_working",
+                            verdict="wait",
+                        )
+                    except Exception:
+                        pass
         self._on_buy_batch_done(payload, auto_mode=False, table=None)
         self._refresh_advisor_card()
         self.publish_monitor_status()
@@ -20621,6 +20654,7 @@ class MarketAdvisorGUI(QMainWindow):
             "buys_done": buys_done,
             "broker": broker_name,
             "advisor_proposals": advisor_proposals,
+            "execute_skips": list(execute_skips),
         }
 
     def _on_buy_batch_done(self, payload, auto_mode=False, table=None):
@@ -20630,7 +20664,9 @@ class MarketAdvisorGUI(QMainWindow):
         for note in payload.get("notes") or []:
             key = noisy_note_key(note)
             if key:
-                self._throttled_log(f"bnote:{key}", note, cooldown_sec=900)
+                # PDT guard cannot change until a slot rolls off — 15m repeats ran all night.
+                cd = 3600 if "PDT entry guard" in str(note) else 900
+                self._throttled_log(f"bnote:{key}", note, cooldown_sec=cd)
             else:
                 self.log_event(note)
         # Main-thread only: start Advisor AI briefs (never from buy-batch worker)

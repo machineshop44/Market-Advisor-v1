@@ -102,6 +102,8 @@
     "etrade_reauth_quiet_off_days": true,
     "crypto_realized_edge_feedback": true,
     "pdt_defer_stale_day_trades": true,
+    "pdt_last_slot_min_roi_pct": 1.5,
+    "advisor_working_repropose_sec": 1800,
     "daily_loss_flatten": true,
     "panic_halt_flatten": true,
     "desk_focus_park_others": false,

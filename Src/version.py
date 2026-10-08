@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.56"
+__version__ = "1.42.57"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Same-day stale exits wait for next session under PDT when a broker stop is on; "
-    "hard stops bypass sell backoff; cycle-stall alerts name the broker/task/phase"
+    "Advisor misses show the real skip reason; resting advisor buys block re-propose; "
+    "last PDT slot kept for hard stops on small-gain exits"
 )
 
 

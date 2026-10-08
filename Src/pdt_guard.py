@@ -275,6 +275,42 @@ def may_complete_day_trade(
     return True, ""
 
 
+def reserve_last_day_trade(
+    broker: str,
+    ticker: str,
+    *,
+    equity: float,
+    settings: Optional[dict] = None,
+    roi_pct: Optional[float] = None,
+    has_broker_stop: bool = False,
+) -> tuple[bool, str]:
+    """
+    (True, why) when a discretionary same-day exit would spend the LAST day-trade slot
+    on a small gain. RH SNAP 10/8: TTP +0.61% used slot 3/3 and SNAP closed higher.
+    Unknown ROI, no broker stop, or ROI ≥ pdt_last_slot_min_roi_pct (1.5) → allowed.
+    """
+    s = settings or {}
+    if roi_pct is None or not has_broker_stop:
+        return False, ""
+    if not would_be_day_trade(broker, ticker):
+        return False, ""
+    if not pdt_applies(equity, settings):
+        return False, ""
+    cap = max_day_trades(settings)
+    if cap <= 0 or _gate_day_trade_count(broker) != cap - 1:
+        return False, ""
+    try:
+        floor = float(s.get("pdt_last_slot_min_roi_pct", 1.5) or 0.0)
+    except (TypeError, ValueError):
+        floor = 1.5
+    if floor <= 0 or float(roi_pct) >= floor:
+        return False, ""
+    return True, (
+        f"PDT: last day-trade slot reserved for a hard stop — exit ROI {float(roi_pct):+.2f}% "
+        f"< {floor:g}%; holding under the broker stop"
+    )
+
+
 def defer_stale_day_trade(
     broker: str,
     ticker: str,
