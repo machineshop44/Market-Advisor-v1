@@ -65,7 +65,9 @@ class EtradeAuthActivity : AppCompatActivity() {
         }
         val reload = Button(this).apply {
             text = getString(R.string.reauth_web_reload)
-            setOnClickListener { web.loadUrl(authorizeUrl) }
+            // The authorize URL carries a one-time request token (~5 min); reloading a used or
+            // expired one shows the same error page forever. Ask MainActivity for a fresh one.
+            setOnClickListener { restart() }
         }
         val browser = Button(this).apply {
             text = getString(R.string.reauth_web_browser)
@@ -143,6 +145,8 @@ class EtradeAuthActivity : AppCompatActivity() {
                         status.text = getString(R.string.reauth_web_status_return)
                         view.loadUrl(authorizeUrl)
                     }
+                    sawLogin && isEtrade(url) ->
+                        status.text = getString(R.string.reauth_web_status_stuck)
                 }
             }
         }
@@ -157,6 +161,13 @@ class EtradeAuthActivity : AppCompatActivity() {
         if (delivered) return
         delivered = true
         setResult(Activity.RESULT_OK, Intent().putExtra(EXTRA_CODE, c))
+        finish()
+    }
+
+    private fun restart() {
+        if (delivered) return
+        delivered = true
+        setResult(RESULT_RESTART)
         finish()
     }
 
@@ -182,6 +193,7 @@ class EtradeAuthActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_URL = "authorize_url"
         const val EXTRA_CODE = "verifier"
+        const val RESULT_RESTART = Activity.RESULT_FIRST_USER
         private const val MAX_RELOADS = 2
 
         private fun isEtrade(url: String): Boolean =

@@ -56,7 +56,10 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.StartActivityForResult(),
     ) { res ->
         val code = res.data?.getStringExtra(EtradeAuthActivity.EXTRA_CODE)?.trim().orEmpty()
-        if (res.resultCode == RESULT_OK && code.isNotBlank()) completeEtradeReauth(code)
+        when {
+            res.resultCode == EtradeAuthActivity.RESULT_RESTART -> startEtradeReauth()
+            res.resultCode == RESULT_OK && code.isNotBlank() -> completeEtradeReauth(code)
+        }
     }
 
     private fun launchEtradeAuth(authorizeUrl: String) {
@@ -832,15 +835,14 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, note, Toast.LENGTH_LONG).show()
                 refreshStatus(force = true)
             } else {
-                val retryUrl = pendingAuthorizeUrl
-                val dlg = AlertDialog.Builder(this@MainActivity)
+                // A failed verifier usually means the request token is spent — retry fresh.
+                pendingAuthorizeUrl = null
+                AlertDialog.Builder(this@MainActivity)
                     .setTitle(R.string.reauth_title)
                     .setMessage(result.error ?: "Reauth failed")
                     .setNegativeButton(android.R.string.cancel, null)
-                if (!retryUrl.isNullOrBlank()) {
-                    dlg.setPositiveButton(R.string.reauth_retry) { _, _ -> launchEtradeAuth(retryUrl) }
-                }
-                dlg.show()
+                    .setPositiveButton(R.string.reauth_retry) { _, _ -> startEtradeReauth() }
+                    .show()
             }
         }
     }
