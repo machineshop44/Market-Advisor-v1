@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.57"
+__version__ = "1.42.58"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Advisor misses show the real skip reason; resting advisor buys block re-propose; "
-    "last PDT slot kept for hard stops on small-gain exits"
+    "8:45 pre-open reauth nag covers every dead broker (not only E*TRADE); watchdog no "
+    "longer echoes reauth or slow-cycle pings to Discord"
 )
 
 

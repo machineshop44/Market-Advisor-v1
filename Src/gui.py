@@ -6940,8 +6940,7 @@ class MarketAdvisorGUI(QMainWindow):
                 self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
                 return
             new_items = dw.new_snags_for_alert(report, prev, min_severity=dw.SEV_WARN)
-            # [REAUTH] alerts own this (with off-day quiet) — watchdog echoed every 8:45 nag.
-            new_items = [s for s in new_items if s.get("code") != "reauth_log"]
+            new_items = dw.discord_worthy_snags(new_items)
             if not new_items:
                 self._desk_snag_alert_keys = dw.current_snag_alert_keys(report)
                 return
@@ -13659,8 +13658,8 @@ class MarketAdvisorGUI(QMainWindow):
             self._handle_broker_auth_failure("E*TRADE", msg, source="midnight_et")
 
     def _maybe_etrade_preopen_reauth_nag(self, now_ts=None):
-        """Once per trading day, 8:45–9:30 ET: ping Discord if E*TRADE is meant to be armed but auth is dead."""
-        if self.paper_mode or "E*TRADE" not in self.brokers:
+        """Once per trading day, 8:45–9:30 ET: ping Discord for each broker whose auth is dead."""
+        if self.paper_mode:
             return
         try:
             from zoneinfo import ZoneInfo
@@ -13682,18 +13681,29 @@ class MarketAdvisorGUI(QMainWindow):
                 return
         except Exception:
             pass
-        if not bool(self.settings.get("etrade_arm_intent", False)):
-            return
-        auth_dead = bool(getattr(self, "_broker_manual_auth_needed", {}).get("E*TRADE"))
-        if not auth_dead or self.auto_trade_enabled.get("E*TRADE"):
-            return
         self._etrade_preopen_nag_day = day_key
-        msg = (
-            "⏰ E*TRADE still needs reauth and the open is at 9:30 ET — "
-            "reauthorize in Settings (or Companion) so it re-arms for the session."
-        )
-        self.log_event(f"[REAUTH] [E*TRADE] {msg}")
-        self.send_discord_alert(msg, urgent=True, prefix="[REAUTH]", broker="E*TRADE")
+        manual = getattr(self, "_broker_manual_auth_needed", {}) or {}
+        soft_dead = getattr(self, "_soft_auth_dead_since", {}) or {}
+        # RH sat dead 10/9 6pm → 10/13 with one Friday ping; nag every broker, not only E*TRADE.
+        for name in BROKER_NAMES:
+            if name not in self.brokers or self.auto_trade_enabled.get(name):
+                continue
+            if name == "E*TRADE":
+                if not bool(self.settings.get("etrade_arm_intent", False)):
+                    continue
+                if not manual.get(name):
+                    continue
+                how = "reauthorize in Settings (or Companion)"
+            else:
+                if not (manual.get(name) or soft_dead.get(name)):
+                    continue
+                how = "log in again in Settings → Brokers"
+            msg = (
+                f"⏰ {name} still needs reauth and the open is at 9:30 ET — "
+                f"{how} so it re-arms for the session."
+            )
+            self.log_event(f"[REAUTH] [{name}] {msg}")
+            self.send_discord_alert(msg, urgent=True, prefix="[REAUTH]", broker=name)
 
     def panic_halt_all(self, flatten=None):
         """Disarm every broker, clear queues, urgent Discord — Panic Halt All.

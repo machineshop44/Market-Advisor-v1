@@ -45,6 +45,17 @@ def _snag(
     }
 
 
+# [REAUTH] alerts own reauth (with off-day quiet); the 180s [RISK] stall alert owns hangs.
+# 10/9–10/10: watchdog echoed every REAUTH ping, leaked a Friday-midnight E*TRADE alert,
+# and WARNed on a 148s scan that finished.
+_DISCORD_SKIP_CODES = frozenset({"reauth", "reauth_log", "cycle_slow"})
+
+
+def discord_worthy_snags(items: list[dict]) -> list[dict]:
+    """Drop snags another Discord channel already reports."""
+    return [s for s in (items or []) if s.get("code") not in _DISCORD_SKIP_CODES]
+
+
 def _ranked_then_stop_still_open(log_lines: list[str], ranked_line: str) -> bool:
     """True only if Ranked appears without a later Buy batch done/start for that broker."""
     try:

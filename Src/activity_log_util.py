@@ -382,6 +382,9 @@ def buy_fail_ttl_for_status(status, *, default_ttl=900) -> int:
         return max(int(default_ttl or 900), 30 * 60)
     if "empty response" in low or "returned empty" in low:
         return max(int(default_ttl or 900), 2 * 3600)
+    if "no rh crypto quote" in low:
+        # Per-coin gap (AMP 10/9 re-ranked hourly 03:06–08:00 while other coins quoted).
+        return max(int(default_ttl or 900), 3 * 3600)
     return int(default_ttl or 900)
 
 
