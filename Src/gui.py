@@ -79,6 +79,7 @@ from activity_log_util import (  # noqa: E402
     tail_activity_log_file as _tail_activity_log_file_impl,
     rotate_activity_log_if_needed as _rotate_activity_log_if_needed_impl,
     explain_no_buys_after_rank as _explain_no_buys_after_rank_impl,
+    drop_just_sold_rows as _drop_just_sold_rows,
     sell_fail_should_skip as _sell_fail_should_skip_impl,
     record_sell_fail_backoff as _record_sell_fail_backoff_impl,
     buy_fail_should_skip as _buy_fail_should_skip_impl,
@@ -2612,6 +2613,9 @@ class MarketAdvisorGUI(QMainWindow):
             assets = normalized
         elif not isinstance(assets, list):
             assets = list(assets) if assets else []
+        assets = _drop_just_sold_rows(
+            assets, broker_name, getattr(self, "_recent_full_exit", None) or {}, time.time(),
+        )
         # Cache live pulls; never wipe a non-empty cache with a single empty API lag
         if not hasattr(self, "_holdings_cache_by_broker"):
             self._holdings_cache_by_broker = _blank_broker_map(list)
@@ -20989,6 +20993,13 @@ class MarketAdvisorGUI(QMainWindow):
                     clear_scale_in_count(bid, ticker)
                 except Exception:
                     pass
+                st_low = str(status).lower()
+                if "sell-all" in st_low and "filled" in st_low:
+                    if not hasattr(self, "_recent_full_exit"):
+                        self._recent_full_exit = {}
+                    self._recent_full_exit[
+                        (str(broker), str(ticker or "").upper().replace("-USD", ""))
+                    ] = time.time()
             why_exit = _auto_cycle.exit_reason_label(fill.get("action"))
             self.log_event(
                 f"[{broker}] Execution [{ticker}]: {status}"
@@ -22004,7 +22015,7 @@ class MarketAdvisorGUI(QMainWindow):
                 syms = []
         if syms:
             self._throttled_log(
-                f"news_radar:{','.join(syms[:5])}",
+                f"news_radar:{','.join(sorted(syms[:5]))}",
                 f"[NEWS RADAR] Breakouts scan adds: {', '.join(syms[:5])}",
                 cooldown_sec=3600,
             )

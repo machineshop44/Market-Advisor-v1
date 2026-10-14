@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.59"
+__version__ = "1.42.60"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "News Radar adds trending/headline names to Breakouts; equity entries skip earnings "
-    "days and offering/halt/dilution headlines; Reports tracks news-catalyst win rate"
+    "Just-sold crypto no longer reappears as a ghost portfolio row with a phantom hard stop; "
+    "AI advisor keeps half its daily budget for trade proposals and parses messy replies"
 )
 
 

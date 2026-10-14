@@ -131,6 +131,12 @@ def inventory_vwap_from_journal(
             cost_sum += qty * px
             shares += qty
         elif side == "SELL":
+            # A full exit is flat whatever the journal qty says — leftover drift seeded
+            # Coinbase DOGE @ 0.0928 (real 0.0859) on 10/14.
+            if "sell-all" in str(row.get("status") or "").lower():
+                shares = 0.0
+                cost_sum = 0.0
+                continue
             if shares <= 1e-12:
                 shares = 0.0
                 cost_sum = 0.0

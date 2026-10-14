@@ -205,6 +205,27 @@ def sell_fail_ttl_for_status(status, *, default_ttl=1800) -> int:
     return int(default_ttl or 1800)
 
 
+JUST_SOLD_HIDE_SEC = 300.0
+
+
+def drop_just_sold_rows(rows, broker, recent_exits, now, *, hide_sec=JUST_SOLD_HIDE_SEC):
+    """
+    Hide holdings rows for a ticker sold-all within hide_sec. Coinbase still listed DOGE
+    (balance on hold) 40s after a filled Sell-All 10/14, which re-seeded basis from an
+    old journal VWAP and fired a phantom −8.97% hard stop.
+    """
+    if not recent_exits:
+        return rows
+    out = []
+    for r in rows or []:
+        tu = str((r or {}).get("ticker") or "").upper().replace("-USD", "")
+        ts = recent_exits.get((str(broker), tu))
+        if ts is not None and now - float(ts) < hide_sec:
+            continue
+        out.append(r)
+    return out
+
+
 def sell_is_ghost_insufficient(status) -> bool:
     """True when broker says we cannot sell what the book thinks we hold."""
     low = str(status or "").lower()

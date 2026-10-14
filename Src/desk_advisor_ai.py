@@ -164,7 +164,7 @@ def _ai_budget_ok(
         slot["day_count"] = _ai_day_count
     per_min, per_day = _ai_budget_limits(settings, p)
     now = time.time()
-    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    day = _budget_day()
     if day != slot["day_key"]:
         slot["day_key"] = day
         slot["day_count"] = 0
@@ -179,6 +179,29 @@ def _ai_budget_ok(
         return False, f"{p or 'ai'} per-minute budget ({per_min}/min)"
     _sync_legacy_budget_globals(slot)
     return True, ""
+
+
+def _budget_day() -> str:
+    """Budget day in ET — the PC clock may be UTC, which reset the count at 8pm ET."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _background_budget_ok(settings: dict | None, provider: str | None) -> bool:
+    """
+    Background digests (desk health every 15m) may use at most half a provider's daily
+    budget — 10/14 Gemini's 20/day was gone by 00:41 and trade proposals fell to local.
+    """
+    p = normalize_cloud_provider(provider) or resolve_ai_source(settings)
+    _per_min, per_day = _ai_budget_limits(settings, p)
+    slot = _budget_slot(p)
+    day = _budget_day()
+    used = int(slot["day_count"] or 0) if slot["day_key"] == day else 0
+    return used < per_day // 2
 
 
 def _ai_budget_record(provider: str | None = None):
@@ -664,23 +687,49 @@ def local_analyze_proposal(proposal: dict, context: dict | None = None) -> dict:
     )
 
 
+def _json_dict(s: str) -> dict | None:
+    for cand in (s, re.sub(r",\s*([}\]])", r"\1", s)):
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
 def _extract_json_object(text: str) -> dict | None:
+    """
+    Verdict JSON from a model reply. Groq/OpenRouter free models wrap it in fences, add a
+    second {...}, leave trailing commas, or hit max_tokens mid-object (10/14 'not JSON').
+    """
     if not text:
         return None
-    text = text.strip()
-    try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        pass
-    m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text.strip(), flags=re.I)
+    text = re.sub(r"```(?:json)?", "", text, flags=re.I).strip()
+    obj = _json_dict(text)
+    if obj is not None:
+        return obj
+    # Balanced-brace candidates, first that parses wins (greedy match spans two objects).
+    starts = [i for i, ch in enumerate(text) if ch == "{"]
+    for st in starts:
+        depth = 0
+        for j in range(st, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    obj = _json_dict(text[st:j + 1])
+                    if obj is not None:
+                        return obj
+                    break
+    # Truncated reply: keep the verdict if it made it out.
+    m = re.search(r'"verdict"\s*:\s*"([A-Za-z_]+)"', text)
+    if m:
+        d = re.search(r'"detail"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+        return {"verdict": m.group(1), "detail": (d.group(1) if d else "")[:500]}
+    return None
 
 
 def _proposal_prompt(
@@ -852,15 +901,16 @@ def _gemini_http_error_detail(err: requests.HTTPError) -> str:
 
 def _call_gemini(api_key: str, model: str, prompt: str, timeout: float = 45.0) -> str:
     global _last_gemini_model_used
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 512},
-    }
     headers = _gemini_headers(api_key)
     last_err: Exception | None = None
     tried: list[str] = []
     for m in _pick_gemini_models(api_key, model):
         tried.append(m)
+        gen = {"temperature": 0.2, "maxOutputTokens": 1024}
+        if "2.5-flash" in m.lower():
+            # 2.5-flash thinking tokens count against maxOutputTokens and cut the JSON off.
+            gen["thinkingConfig"] = {"thinkingBudget": 0}
+        body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen}
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{m}:generateContent"
@@ -1029,7 +1079,8 @@ def _call_openai(
     body = {
         "model": model,
         "temperature": 0.2,
-        "max_tokens": 512,
+        # 512 truncated reasoning-style free models before the closing brace.
+        "max_tokens": 1024,
         "messages": [
             {"role": "system", "content": "Reply with JSON only. No markdown."},
             {"role": "user", "content": prompt},
@@ -1377,7 +1428,8 @@ def analyze_proposal(
             _ai_budget_record(provider)
             parsed = _extract_json_object(raw)
             if not parsed:
-                errors.append(f"{provider}: response not JSON")
+                snippet = " ".join(str(raw or "").split())[:80]
+                errors.append(f"{provider}: response not JSON ({snippet or 'empty'})")
                 continue
             verdict = _clamp_verdict(parsed.get("verdict"))
             detail = str(parsed.get("detail") or "")[:500]
@@ -1454,7 +1506,7 @@ def analyze_desk_health(
     if ai_configured(settings):
         for provider in cloud_provider_chain(settings):
             ok_budget, _why = _ai_budget_ok(settings, provider=provider)
-            if not ok_budget:
+            if not ok_budget or not _background_budget_ok(settings, provider):
                 continue
             try:
                 key = resolve_provider_api_key(provider, settings)

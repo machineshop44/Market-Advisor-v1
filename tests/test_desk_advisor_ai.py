@@ -352,7 +352,7 @@ def test_equity_ignores_btc_regime_blocker():
 def test_budget_exhausted_falls_back_local(monkeypatch):
     dai.reset_ai_budgets()
     slot = dai._budget_slot("gemini")
-    slot["day_key"] = time.strftime("%Y-%m-%d")
+    slot["day_key"] = dai._budget_day()
     slot["day_count"] = 99
 
     def boom(*_a, **_k):
