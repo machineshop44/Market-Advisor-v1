@@ -1,0 +1,26 @@
+---
+description: Mandatory full audit whenever Andrew sends an activity log and/or Discord feed
+alwaysApply: true
+---
+
+# Log + Discord audit (Andrew) — run ALL of it, every time
+
+When Andrew pastes an `activity_log (N).txt` path and/or a Discord feed, do the full audit
+without being asked. Never stop at "the trades that happened".
+
+1. **Window**: slice the log to the period since the previous audit (save to `%TEMP%`).
+2. **Every executed trade vs market** (yfinance, 5m bars, crypto as `SYM-USD`): entry/exit
+   price path, was the exit right (what happened 1–4h / next session after), was the entry right.
+3. **Every decision NOT taken vs market**: all `Ranked N buys` candidates, fee-gate / spread /
+   PDT / news / hold-bias skips, advisor approve/skip/park, missed executions. Forward 1h/2h/4h
+   return, best-high (MFE) and worst-low within 4h, vs broker round-trip cost
+   (RH crypto ~1.9%, Coinbase ~2.4%). Score bands vs outcome.
+4. **Advisor AI**: cloud vs local verdicts, budget/provider errors, approvals that lost.
+5. **Rolling study**: run the same forward-return check across the whole log (all weeks
+   available) so conclusions aren't from one night.
+6. **Discord feed**: cross-check alerts against the log (missing, duplicate, wrong-day,
+   quiet-hours leaks, stale versions, broker down durations).
+7. **Crash log / errors / stalls / ghosts / cost-basis anomalies.**
+8. Per-broker verdicts in the report, with evidence from the market data.
+9. Fix everything found (no matter how small) → tests → bump `Src/version.py` → publish →
+   commit/push → report Drive paths + SHA256 (see publish-and-sync rule).

@@ -91,9 +91,9 @@ class TestCryptoHoldBias(unittest.TestCase):
 
     def test_strong_thin_ticket_clears_when_edge_ok(self):
         import scoring
-        # score 80 → edge (80-40)*0.001 = 4.0%; RH crypto need ≈ 2.9%
+        # score 115 → edge (115-40)*0.0004 = 3.0%; RH crypto need ≈ 2.9%
         ok, why = scoring.crypto_new_entry_ok(
-            "ROBINHOOD", "SOL", score=80.0, notional=5.0, skip_turbulence=True
+            "ROBINHOOD", "SOL", score=115.0, notional=5.0, skip_turbulence=True
         )
         self.assertTrue(ok, why)
         self.assertEqual(why, "")

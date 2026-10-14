@@ -729,18 +729,104 @@ def net_roi_after_fees(gross_roi, broker_id, ticker=None, asset_type=""):
     return g - float(estimate_round_trip_fee_pct(broker_id, ticker, asset_type))
 
 
-def estimated_signal_edge_pct(score, *, is_crypto=False):
+CRYPTO_EDGE_PER_PT = 0.0004
+
+
+def estimated_signal_edge_pct(score, *, is_crypto=False, settings=None):
     """
     Map buy_rank score → rough expected edge for fee gates.
-    Conservative: crypto needs more score points to clear ~2% RT.
+    Crypto slope comes from 9/30–10/14 forward returns: 883 ranked picks had
+    corr(score, 4h) ≈ 0.03 and mean best-4h-high ~1.1%, so 0.10%/pt (score 98 ≈ 5.8%)
+    was ~5× too generous. 0.04%/pt only lets rare 120+ scores clear RT + buffer.
     """
     try:
         sc = float(score or 0.0)
     except (TypeError, ValueError):
         sc = 0.0
     base = 40.0
-    per_pt = 0.0010 if is_crypto else 0.0005
+    if is_crypto:
+        try:
+            per_pt = float(
+                (settings or {}).get("crypto_edge_per_pt", CRYPTO_EDGE_PER_PT)
+                or CRYPTO_EDGE_PER_PT
+            )
+        except (TypeError, ValueError):
+            per_pt = CRYPTO_EDGE_PER_PT
+    else:
+        per_pt = 0.0005
     return max(0.0, (sc - base) * per_pt)
+
+
+def _parse_hour_range(spec, default=(0, 6)):
+    try:
+        a, b = str(spec).split("-", 1)
+        return int(a), int(b)
+    except (TypeError, ValueError):
+        return default
+
+
+def crypto_overnight_entry_ok(settings=None, now=None):
+    """
+    Block NEW crypto buys midnight–6am ET. 283 overnight picks (9/30–10/14) averaged
+    −0.33% at 4h and only 8% ever touched +2.4% — thin books, pure fee bleed.
+    """
+    s = settings or {}
+    if not bool(s.get("crypto_overnight_block", True)):
+        return True, ""
+    lo, hi = _parse_hour_range(s.get("crypto_overnight_block_hours", "0-6"))
+    try:
+        from zoneinfo import ZoneInfo
+        d = now or datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        d = now or datetime.now()
+    if lo <= d.hour < hi:
+        return False, f"DO NOT BUY (Crypto overnight {lo:02d}:00–{hi:02d}:00 ET — no edge after fees)"
+    return True, ""
+
+
+_btc_drop_cache: dict = {}
+_BTC_DROP_TTL = 180
+
+
+def _btc_1h_return(now=None):
+    """BTC % change over the last ~60 min on 5m bars; None when unavailable."""
+    ts = float(now if now is not None else time.time())
+    hit = _btc_drop_cache.get("btc")
+    if hit and ts - hit[0] < _BTC_DROP_TTL:
+        return hit[1]
+    ret = None
+    try:
+        df = _get_yf().Ticker("BTC-USD").history(period="1d", interval="5m")
+        if df is not None and len(df) >= 13:
+            p0 = float(df["Close"].iloc[-13])
+            p1 = float(df["Close"].iloc[-1])
+            if p0 > 0:
+                ret = p1 / p0 - 1.0
+    except Exception:
+        ret = None
+    _btc_drop_cache["btc"] = (ts, ret)
+    return ret
+
+
+def crypto_btc_drop_ok(settings=None, *, ret_fn=None):
+    """
+    Block NEW crypto buys while BTC is falling fast (all postures). 10/2 08:35–10:50 the
+    advisor approved ~30 alts during a broad dump; nearly all lost 2–3% in 4h.
+    Fail-open when BTC data is unavailable.
+    """
+    s = settings or {}
+    try:
+        lim = float(s.get("crypto_btc_drop_block_pct", 0.01) or 0.0)
+    except (TypeError, ValueError):
+        lim = 0.01
+    if lim <= 0:
+        return True, ""
+    ret = (ret_fn or _btc_1h_return)()
+    if ret is None:
+        return True, ""
+    if ret <= -lim:
+        return False, f"DO NOT BUY (BTC falling {ret*100:+.2f}% in 1h — wait for alts to settle)"
+    return True, ""
 
 
 def new_entry_clears_fees_ok(
@@ -774,11 +860,17 @@ def new_entry_clears_fees_ok(
             need *= mult
             tag = f" weekend ×{mult:g}"
     if is_crypto:
+        ok, why = crypto_overnight_entry_ok(settings)
+        if not ok:
+            return False, why
+        ok, why = crypto_btc_drop_ok(settings)
+        if not ok:
+            return False, why
         rmult, rtag = realized_crypto_edge_mult(broker_id, settings)
         if rmult > 1.0:
             need *= rmult
             tag += rtag
-    edge = estimated_signal_edge_pct(score, is_crypto=bool(is_crypto))
+    edge = estimated_signal_edge_pct(score, is_crypto=bool(is_crypto), settings=settings)
     if edge + 1e-12 < need:
         return False, (
             f"DO NOT BUY (Fee gate: est edge {edge*100:.2f}% < "
@@ -880,7 +972,7 @@ def crypto_new_entry_ok(
     need = min_entry_edge_pct(
         broker_id, ticker, "cryptocurrency", equity=equity, settings=settings,
     )
-    edge = estimated_signal_edge_pct(sc, is_crypto=True)
+    edge = estimated_signal_edge_pct(sc, is_crypto=True, settings=settings)
     floor = broker_min_notional(broker_id, is_crypto=True)
     try:
         notion = float(notional) if notional is not None else None

@@ -14,12 +14,13 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.60"
+__version__ = "1.42.61"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Just-sold crypto no longer reappears as a ghost portfolio row with a phantom hard stop; "
-    "AI advisor keeps half its daily budget for trade proposals and parses messy replies"
+    "Crypto entries recalibrated from 2 weeks of market data: no midnight–6am buys, "
+    "no buys while BTC is falling, score edge cut; advisor sends crypto to cloud AI "
+    "and budget fallback skips scores under 90"
 )
 
 

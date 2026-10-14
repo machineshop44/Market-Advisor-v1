@@ -1331,11 +1331,41 @@ def _sanitize_ai_brief(brief: str, *, detail: str = "", verdict: str = "") -> st
     return text[:500]
 
 
+def _is_crypto_proposal(proposal: dict) -> bool:
+    asset_l = str(proposal.get("asset_type") or "").lower()
+    engine_l = str(proposal.get("engine") or "").lower()
+    tick = str(proposal.get("ticker") or "").upper().replace("-USD", "")
+    try:
+        from crypto_symbols import KNOWN_CRYPTOS as _known
+    except Exception:
+        _known = frozenset({"BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "DOT", "AVAX", "LINK"})
+    return "crypto" in asset_l or engine_l == "crypto" or tick in _known
+
+
+FALLBACK_MIN_APPROVE_SCORE = 90.0
+
+
 def _local_fallback_guard(out: dict, proposal: dict) -> dict:
-    """Budget/cloud fallback must not auto-approve marginal regime overrides."""
+    """Budget/cloud fallback must not auto-approve marginal regime overrides or weak scores."""
     if out.get("source") != "local_fallback":
         return _with_retry_after(out, proposal=proposal)
     tick = str(proposal.get("ticker") or "?").upper()
+    try:
+        score = float(proposal.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if out.get("verdict") == VERDICT_APPROVE and score < FALLBACK_MIN_APPROVE_SCORE:
+        # 35 fallback approves under 90 (9/30–10/14) averaged −1.0% (crypto, 4h) / −0.6% (stocks, 24h).
+        out["verdict"] = VERDICT_SKIP
+        out["brief"] = (
+            f"Skip {tick}: score {score:.0f} < {FALLBACK_MIN_APPROVE_SCORE:.0f} and cloud AI "
+            f"unavailable — local rules alone don't approve marginal setups."
+        )[:420]
+        out["retry_after_min"] = default_retry_after_min(
+            verdict=VERDICT_SKIP, proposal=proposal,
+            reasons=["budget fallback", "score below fallback bar"],
+        )
+        return _with_retry_after(out, proposal=proposal)
     if bool(proposal.get("regime_caution")) and out.get("verdict") == VERDICT_APPROVE:
         out["verdict"] = VERDICT_WAIT
         out["brief"] = (
@@ -1387,10 +1417,13 @@ def analyze_proposal(
                 str(local.get("detail") or "") + " · cloud skipped (clear local skip)"
             ).strip(" ·")[:500]
             return local
+        # Crypto never takes the shortcut: 65 local crypto approves (9/30–10/14) averaged
+        # −0.01% at 4h with a ~1.1% best high — under RT fees. Let the cloud judge them.
         if (
             local.get("verdict") == VERDICT_APPROVE
             and score >= 90
             and not bool(proposal.get("regime_caution"))
+            and not _is_crypto_proposal(proposal)
         ):
             local["detail"] = (
                 str(local.get("detail") or "") + " · cloud skipped (clear local approve)"

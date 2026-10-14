@@ -49,8 +49,13 @@ def test_fee_gate_applies_feedback(monkeypatch):
     monkeypatch.setattr(scoring, "min_entry_edge_pct", lambda *a, **k: 0.0415)
     monkeypatch.setattr(scoring, "_is_et_weekend", lambda now=None: False)
     monkeypatch.setattr(scoring, "realized_crypto_edge_mult", lambda *a, **k: (1.0, ""))
-    ok, _ = scoring.new_entry_clears_fees_ok("COINBASE", "BCH-USD", 98, is_crypto=True)
+    old_slope = {"crypto_edge_per_pt": 0.001}
+    ok, _ = scoring.new_entry_clears_fees_ok(
+        "COINBASE", "BCH-USD", 98, is_crypto=True, settings=old_slope,
+    )
     assert ok
     monkeypatch.setattr(scoring, "realized_crypto_edge_mult", lambda *a, **k: (1.5, " realized"))
-    ok, why = scoring.new_entry_clears_fees_ok("COINBASE", "BCH-USD", 98, is_crypto=True)
+    ok, why = scoring.new_entry_clears_fees_ok(
+        "COINBASE", "BCH-USD", 98, is_crypto=True, settings=old_slope,
+    )
     assert not ok and "realized" in why
