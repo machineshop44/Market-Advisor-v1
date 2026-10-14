@@ -264,6 +264,12 @@ def load_settings():
         "crypto_realized_edge_feedback": True,
         "pdt_defer_stale_day_trades": True,
         "pdt_last_slot_min_roi_pct": 1.5,
+        "entry_earnings_block": True,
+        "entry_news_veto": True,
+        "entry_news_veto_hours": 24,
+        "news_shadow_tag": True,
+        "news_radar_enabled": True,
+        "news_radar_max": 5,
         "advisor_working_repropose_sec": 1800,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
@@ -2955,6 +2961,9 @@ class MarketAdvisorGUI(QMainWindow):
                 for k in ("rvol", "vwap_stretch_pct", "rs_pct"):
                     if q.get(k) is not None:
                         entry[k] = q[k]
+                tag = (getattr(self, "_news_catalyst", None) or {}).get(str(ticker).upper())
+                if tag is not None:
+                    entry["news_catalyst"] = bool(tag)
             else:
                 from scoring import position_excursion
                 exc = position_excursion(broker_id, ticker)
@@ -3069,6 +3078,9 @@ class MarketAdvisorGUI(QMainWindow):
         liq_why = self._entry_liquidity_reason(broker_obj, ticker, asset_type, price)
         if liq_why:
             return f"Skipped: {liq_why}", 0.0
+        news_why = self._entry_news_reason(ticker, asset_type)
+        if news_why:
+            return f"Skipped: {news_why}", 0.0
         if broker_name == "E*TRADE":
             ok, why = _auto_cycle.etrade_equity_session_ok(
                 sess, broker=self.brokers.get("E*TRADE"),
@@ -13416,6 +13428,39 @@ class MarketAdvisorGUI(QMainWindow):
         broker_name = broker_name or self.cycle_broker_name
         return self.auto_trade_enabled.get(broker_name, False)
 
+    def _entry_news_reason(self, ticker, asset_type):
+        """Equity-only earnings/headline veto; records the shadow catalyst tag for _log_decision."""
+        tu = str(ticker or "").upper()
+        if (
+            not tu
+            or "crypto" in str(asset_type or "").lower()
+            or tu in KNOWN_CRYPTOS
+            or self.paper_mode
+        ):
+            return None
+        import news_guard as ng
+
+        earn_cache = getattr(self, "_entry_earnings_cache", None)
+        if earn_cache is None:
+            earn_cache = self._entry_earnings_cache = {}
+
+        def _earnings(t):
+            hit = earn_cache.get(t)
+            if hit and time.time() - hit[0] < 6 * 3600:
+                return hit[1]
+            val = self._earnings_before_next_open(t, timeout=6.0)
+            if val is not None:
+                earn_cache[t] = (time.time(), val)
+            return val
+
+        why, catalyst = ng.entry_news_check(tu, settings=self.settings, earnings_fn=_earnings)
+        tags = getattr(self, "_news_catalyst", None)
+        if tags is None:
+            tags = self._news_catalyst = {}
+        if catalyst is not None:
+            tags[tu] = bool(catalyst)
+        return why
+
     def _entry_liquidity_reason(self, broker_obj, ticker, asset_type, price):
         """Spread / dollar-volume gate at place time ('' = OK or data unavailable)."""
         try:
@@ -18951,6 +18996,12 @@ class MarketAdvisorGUI(QMainWindow):
                     pass
             if row.get("action"):
                 row["action"] = str(row["action"]).upper()
+            if row.get("action") in ("BUY", "BUY_WORKING") and "news_catalyst" not in row:
+                tag = (getattr(self, "_news_catalyst", None) or {}).get(
+                    str(row.get("ticker") or "").upper()
+                )
+                if tag is not None:
+                    row["news_catalyst"] = bool(tag)
             journal_mod.log_decision(row)
         except Exception:
             pass
@@ -20461,6 +20512,21 @@ class MarketAdvisorGUI(QMainWindow):
                             is_crypto=is_crypto, regime_ok=True,
                         )
                         break
+                    news_why = self._entry_news_reason(ticker, asset_type)
+                    if news_why:
+                        self._throttled_buy_skip_note(
+                            notes, broker_name, f"news_{tu}",
+                            f"[{broker_name}] Skipped [{ticker}]: {news_why}",
+                            cooldown_sec=1800,
+                        )
+                        execute_skips.append(f"{ticker}: {news_why}")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason=f"news:{news_why}",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=is_crypto, regime_ok=True,
+                        )
+                        break
                     prop = aq.propose(
                         broker=broker_name,
                         ticker=ticker,
@@ -21905,6 +21971,45 @@ class MarketAdvisorGUI(QMainWindow):
         # carries crypto classification without poisoning equity/regime lookups.
         return universe
 
+    def _news_radar_symbols(self, max_sh=0.0):
+        """Trending / headline-tagged tickers for Breakouts; afford-filtered on small books."""
+        if not bool(self.settings.get("news_radar_enabled", True)):
+            return []
+        try:
+            import news_guard as ng
+            syms = ng.discover_tickers(max_n=int(self.settings.get("news_radar_max", 5) or 5))
+        except Exception:
+            return []
+        if syms and max_sh > 0:
+            try:
+                import yfinance as yf
+                from scoring import _trend_lock
+                with _trend_lock():
+                    df = yf.download(
+                        syms, period="5d", interval="1d", progress=False,
+                        auto_adjust=False, threads=False,
+                    )
+                closes = df["Close"] if "Close" in df else None
+                keep = []
+                for s in syms:
+                    try:
+                        col = closes[s] if hasattr(closes, "columns") else closes
+                        px = float(col.dropna().iloc[-1])
+                    except Exception:
+                        continue
+                    if 0 < px <= max_sh * 1.15:
+                        keep.append(s)
+                syms = keep
+            except Exception:
+                syms = []
+        if syms:
+            self._throttled_log(
+                f"news_radar:{','.join(syms[:5])}",
+                f"[NEWS RADAR] Breakouts scan adds: {', '.join(syms[:5])}",
+                cooldown_sec=3600,
+            )
+        return syms
+
     def _bg_scan_penny(self):
         finviz_syms, rh_syms, yahoo_syms = [], [], []
         Overview = _get_overview_class()
@@ -21996,9 +22101,12 @@ class MarketAdvisorGUI(QMainWindow):
                 list(do.EXTENDED_MICRO_BREAKOUTS),
                 max_share_price=max_sh,
             )
+        news_syms = self._news_radar_symbols(max_sh)
         discovered = desk_radar.merge_breakout_universe(
             finviz_syms, rh_syms, yahoo_syms,
             extended_micro=extended_micro,
+            news=news_syms,
+            max_news=int(self.settings.get("news_radar_max", 5) or 0),
             max_total=20,
         )
         if not discovered:

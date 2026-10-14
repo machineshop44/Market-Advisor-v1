@@ -441,6 +441,7 @@ def summarize_round_trips(rows: list[dict], *, broker: str | None = None) -> dic
                     "score": row.get("score"), "engine": infer_engine(row),
                     "rvol": row.get("rvol"), "vwap": row.get("vwap_stretch_pct"),
                     "rs": row.get("rs_pct"),
+                    "news": row.get("news_catalyst"),
                 }
             t["qty"] += qty
             t["cost"] += px * qty
@@ -464,7 +465,7 @@ def summarize_round_trips(rows: list[dict], *, broker: str | None = None) -> dic
         exit_ts = _parse_ts(row)
         net = t["pnl"] - t["fees"]
         trips.append({
-            **{k: t[k] for k in ("broker", "ticker", "score", "engine", "rvol", "vwap", "rs")},
+            **{k: t[k] for k in ("broker", "ticker", "score", "engine", "rvol", "vwap", "rs", "news")},
             "net": net,
             "r": (net / t["risk"]) if t["risk"] > 1e-9 else None,
             "entry_hour": t["entry_ts"].hour if t["entry_ts"] else None,
@@ -481,7 +482,7 @@ def summarize_round_trips(rows: list[dict], *, broker: str | None = None) -> dic
     total = _stat_bucket()
     groups: dict[str, dict[str, dict]] = {
         "by_hour": {}, "by_exit": {}, "by_score": {}, "by_engine": {},
-        "by_rvol": {}, "by_vwap": {}, "by_rs": {},
+        "by_rvol": {}, "by_vwap": {}, "by_rs": {}, "by_news": {},
     }
     mfe_vals, mae_vals = [], []
     for tr in trips:
@@ -493,6 +494,10 @@ def summarize_round_trips(rows: list[dict], *, broker: str | None = None) -> dic
             "by_rvol": _band(tr.get("rvol"), ((0.8, "<0.8x"), (1.5, "0.8-1.5x")), "≥1.5x"),
             "by_vwap": _band(tr.get("vwap"), ((0.0, "below VWAP"), (1.0, "0-1% over")), ">1% over"),
             "by_rs": _band(tr.get("rs"), ((0.0, "lagging"),), "leading"),
+            "by_news": (
+                "n/a" if tr.get("news") is None
+                else ("fresh news" if tr.get("news") else "no news")
+            ),
         }
         for bkt in [total] + [groups[g].setdefault(lbl, _stat_bucket()) for g, lbl in labels.items()]:
             bkt["n"] += 1
@@ -563,6 +568,7 @@ def format_round_trip_report(summary: dict, *, money_fmt=None) -> str:
         ("By entry RVOL (shadow)", "by_rvol"),
         ("By VWAP stretch (shadow)", "by_vwap"),
         ("By rel. strength (shadow)", "by_rs"),
+        ("By news catalyst (shadow)", "by_news"),
     ):
         grp = s.get(key) or {}
         if not grp or set(grp) == {"n/a"}:

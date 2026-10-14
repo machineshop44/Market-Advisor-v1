@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.58"
+__version__ = "1.42.59"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "8:45 pre-open reauth nag covers every dead broker (not only E*TRADE); watchdog no "
-    "longer echoes reauth or slow-cycle pings to Discord"
+    "News Radar adds trending/headline names to Breakouts; equity entries skip earnings "
+    "days and offering/halt/dilution headlines; Reports tracks news-catalyst win rate"
 )
 
 

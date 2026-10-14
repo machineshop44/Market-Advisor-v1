@@ -137,11 +137,15 @@ def merge_breakout_universe(
     yahoo_gainers: list[str] | None = None,
     *,
     extended_micro: list[str] | None = None,
+    news: list[str] | None = None,
+    max_news: int = 5,
     max_total: int = 16,
 ) -> list[dict]:
     """
     Multi-source Breakouts list with source tags (deduped, first source wins).
   extended_micro: afford-filtered tickers for extended-hours micro books (1.40).
+  news: News Radar names (1.42.59) — capped and placed after Finviz so RH/Yahoo
+  movers cannot crowd them out of max_total.
     """
     seen: set[str] = set()
     out: list[dict] = []
@@ -161,6 +165,11 @@ def merge_breakout_universe(
 
     for s in finviz or []:
         _add(s, "Finviz Breakout")
+    n_before = len(out)
+    for s in news or []:
+        if len(out) - n_before >= max(0, int(max_news)):
+            break
+        _add(s, "News Radar")
     for s in rh_movers or []:
         _add(s, "RH Top Mover")
     for s in yahoo_gainers or []:
