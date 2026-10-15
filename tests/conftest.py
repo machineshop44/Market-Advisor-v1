@@ -22,4 +22,6 @@ def _neutral_crypto_time_gates(request, monkeypatch):
 
     monkeypatch.setattr(scoring, "crypto_overnight_entry_ok", lambda settings=None, now=None: (True, ""))
     monkeypatch.setattr(scoring, "crypto_btc_drop_ok", lambda settings=None, **k: (True, ""))
+    # Soft SPY gate with no snapshot falls back to the (usually patched) strict gate.
+    monkeypatch.setattr(scoring, "_spy_soft_snapshot", lambda: None)
     yield

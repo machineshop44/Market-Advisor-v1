@@ -666,10 +666,59 @@ def equity_regime_required(posture=None):
     return bool(get_risk_posture_profile(posture).get("require_equity_regime", True))
 
 
+EQUITY_REGIME_MODE = "soft"
+SPY_SOFT_EMA_FLOOR = -0.005
+SPY_SOFT_DAY_FLOOR = -0.01
+_spy_soft_cache: dict = {}
+
+
+def _spy_soft_snapshot():
+    """(dist_from_1h_ema20, day_return) for SPY on closed 1H bars; None when Yahoo is dark."""
+    now = time.time()
+    hit = _spy_soft_cache.get("spy")
+    if hit and now - hit[0] < 90.0:
+        return hit[1]
+    snap = None
+    try:
+        df = _closed_bars(_get_yf().Ticker("SPY").history(period="1mo", interval="60m"))
+        if df is not None and len(df) >= 22:
+            close = df["Close"]
+            ema = close.ewm(span=20, adjust=False).mean()
+            dist = float(close.iloc[-1]) / float(ema.iloc[-1]) - 1.0
+            dates = [ix.date() for ix in df.index]
+            last_day = dates[-1]
+            prior = [float(c) for c, d in zip(close, dates) if d < last_day]
+            day_ret = float(close.iloc[-1]) / prior[-1] - 1.0 if prior else 0.0
+            snap = (dist, day_ret)
+    except Exception:
+        snap = None
+    _spy_soft_cache["spy"] = (now, snap)
+    return snap
+
+
+def spy_soft_regime_ok(snapshot_fn=None):
+    """
+    Small-book equity gate: block only when SPY is clearly falling. The strict
+    2-closes-above-EMA20 gate was shut 62% of RTH hours (9/15–10/15, all of 10/13–10/15)
+    while a 3-month small-cap basket did only ~0.14pt better on 2h returns when it was
+    open. Falls back to the strict gate when Yahoo is unavailable.
+    """
+    snap = (snapshot_fn or _spy_soft_snapshot)()
+    if snap is None:
+        return market_regime_ok(is_crypto=False)
+    dist, day_ret = snap
+    if dist < SPY_SOFT_EMA_FLOOR:
+        return False, f"DO NOT BUY (Regime: SPY {dist*100:+.2f}% vs 1H trend)"
+    if day_ret <= SPY_SOFT_DAY_FLOOR:
+        return False, f"DO NOT BUY (Regime: SPY {day_ret*100:+.2f}% on the day)"
+    return True, ""
+
+
 def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False, ticker=None):
     """
     Hard gate for NEW entries (scan + execute). Matches evaluate_* posture rules:
-      - Equities: SPY regime unless ticker is a BTC-proxy (IBIT/MSTR/…) → BTC
+      - Equities: SPY soft regime (clearly-falling only) unless ticker is a
+        BTC-proxy (IBIT/MSTR/…) → BTC strict
       - Crypto: BTC turbulence pause (all postures); BTC regime when
         posture.require_crypto_regime (Safer + Balanced)
     Returns (ok: bool, reason: str). Override setting defaults OFF for live.
@@ -687,6 +736,8 @@ def entry_regime_ok(is_crypto=False, posture=None, *, allow_when_blocked=False, 
             return True, ""
     elif not equity_regime_required(posture):
         return True, ""
+    if not use_btc and EQUITY_REGIME_MODE == "soft":
+        return spy_soft_regime_ok()
     return market_regime_ok(is_crypto=bool(use_btc))
 
 
@@ -4684,7 +4735,7 @@ def stock_avg_dollar_volume(ticker) -> float | None:
     return adv
 
 
-def entry_liquidity_block(ticker, *, is_crypto=False, bid_ask=None, price=0.0) -> str:
+def entry_liquidity_block(ticker, *, is_crypto=False, bid_ask=None, price=0.0, broker_id=None) -> str:
     """'' when liquid enough to enter; else a DO NOT BUY reason. Unknown data passes."""
     cfg = _liquidity_cfg
     if not cfg.get("enabled", True):
@@ -4692,8 +4743,14 @@ def entry_liquidity_block(ticker, *, is_crypto=False, bid_ask=None, price=0.0) -
     if bid_ask:
         sp = spread_pct(*bid_ask)
         cap = float(cfg["spread_crypto"] if is_crypto else cfg["spread_stock"])
-        if sp is not None and sp > cap:
-            return f"DO NOT BUY (Wide spread {sp:.2f}% > {cap:.2f}%)"
+        markup = 0.0
+        if is_crypto and broker_id and _normalize_broker_id(broker_id) == "ROBINHOOD":
+            # RH quotes bake its ~1.9% RT markup into bid/ask (10/15: every coin 1.80–1.99%).
+            # The fee gate already charges that markup — only judge spread beyond it.
+            markup = float(estimate_round_trip_fee_pct("ROBINHOOD", ticker, "cryptocurrency")) * 100.0
+        if sp is not None and sp - markup > cap:
+            extra = f" beyond {markup:.2f}% RH markup" if markup else ""
+            return f"DO NOT BUY (Wide spread {sp:.2f}%{extra} > {cap:.2f}%)"
     if is_crypto:
         return ""
     try:

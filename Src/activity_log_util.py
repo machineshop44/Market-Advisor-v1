@@ -124,6 +124,7 @@ def explain_no_buys_after_rank(
     orig_n,
     ranked_n,
     broker_name,
+    advisor_tickers=None,
 ):
     """
     Append a trail line when ranked candidates produced zero buys and notes
@@ -131,6 +132,14 @@ def explain_no_buys_after_rank(
     """
     if buys_done != 0 or orig_n <= 0:
         return None
+    adv = [str(t).upper() for t in (advisor_tickers or []) if t]
+    if adv and not execute_skips:
+        line = (
+            f"[{broker_name}] No direct buys after rank ({ranked_n}/{orig_n} candidate(s)) — "
+            f"sent to advisor: {', '.join(adv[:3])}"
+        )
+        notes.append(line)
+        return line
     outcome_bits = (
         "Regime blocked", "Skipping buys", "SCALE-IN skipped", "Max open",
         "Skipped [", "Deferring buy", "Buy cap", "Frac policy",
@@ -159,6 +168,7 @@ _NOISY_NOTE_BITS = (
     "Wide spread", "Session size [", "already holds this coin",
     "No buys executed after rank", "PDT entry guard", "Micro crypto park",
     "trade lock active", "Equity buy engines wait for", "Frac policy [",
+    "Hold bias skip [", "Regime blocked buy [",
 )
 
 

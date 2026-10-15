@@ -13482,7 +13482,10 @@ class MarketAdvisorGUI(QMainWindow):
                 raw = broker_obj.get_bid_ask(ticker, asset_type)
                 if isinstance(raw, tuple) and len(raw) == 2:
                     ba = raw
-            return entry_liquidity_block(ticker, is_crypto=is_c, bid_ask=ba, price=price)
+            return entry_liquidity_block(
+                ticker, is_crypto=is_c, bid_ask=ba, price=price,
+                broker_id=getattr(broker_obj, "broker_id", None),
+            )
         except Exception:
             return ""
 
@@ -13658,6 +13661,12 @@ class MarketAdvisorGUI(QMainWindow):
             self._set_engine_banner(f"🤖 ⚡ {broker_name} re-armed — spinning up…")
             QTimer.singleShot(0, self.director_tick)
             self._update_autotrade_ui()
+
+    def _reopen_rearm_discord(self, broker_name):
+        """A REAUTH alert went out — the next re-arm must post even inside the 1h cooldown."""
+        store = getattr(self, "_buy_skip_throttle", None)
+        if store is not None:
+            store.pop(f"{broker_name}:rearm_discord", None)
 
     def _maybe_restore_etrade_arm(self, *, source=""):
         """Backward-compatible alias — restores E*TRADE from arm intent."""
@@ -15114,6 +15123,7 @@ class MarketAdvisorGUI(QMainWindow):
                 prefix="[REAUTH]",
                 broker=broker_name,
             )
+            self._reopen_rearm_discord(broker_name)
 
         if hasattr(self, "_update_reauth_banner"):
             self._update_reauth_banner()
@@ -15231,6 +15241,7 @@ class MarketAdvisorGUI(QMainWindow):
                     prefix="[REAUTH]",
                     broker="E*TRADE",
                 )
+                self._reopen_rearm_discord("E*TRADE")
             return
 
         # Connected E*TRADE nearing midnight token expiry
@@ -19197,9 +19208,11 @@ class MarketAdvisorGUI(QMainWindow):
             filtered.append(c)
         if not filtered:
             if auto_mode:
-                self.log_event(
+                self._throttled_log(
+                    f"tradelock:{self.cycle_broker_name}",
                     f"[{self.cycle_broker_name}] No buys executed — "
-                    f"{len(candidates)} candidate(s) trade-locked"
+                    f"{len(candidates)} candidate(s) trade-locked",
+                    cooldown_sec=900,
                 )
                 self.set_working_state(False)
                 self.cycle_finished()
@@ -20731,6 +20744,9 @@ class MarketAdvisorGUI(QMainWindow):
                 notes, execute_skips,
                 buys_done=buys_done, orig_n=orig_n, ranked_n=len(ranked),
                 broker_name=broker_name,
+                advisor_tickers=[
+                    ap.get("ticker") for ap in (advisor_proposals or []) if isinstance(ap, dict)
+                ],
             )
         return {
             "fills": fills,
@@ -21391,6 +21407,13 @@ class MarketAdvisorGUI(QMainWindow):
                 try:
                     if tu in held:
                         meta = holdings_by_ticker.get(tu) or {}
+                        if float(meta.get("avg_cost") or 0) <= 0:
+                            from scoring import broker_min_notional
+                            if float(meta.get("value") or 0) < float(
+                                broker_min_notional(broker_id, is_crypto=is_crypto)
+                            ):
+                                # Basis-less dust (RH SHIB ~$1.30): nothing to scale into.
+                                continue
                         if live_px <= 0:
                             try:
                                 live_px = float(broker.get_live_price(ticker) if broker else 0.0) or 0.0

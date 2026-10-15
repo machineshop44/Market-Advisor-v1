@@ -14,13 +14,13 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.61"
+__version__ = "1.42.62"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Crypto entries recalibrated from 2 weeks of market data: no midnight–6am buys, "
-    "no buys while BTC is falling, score edge cut; advisor sends crypto to cloud AI "
-    "and budget fallback skips scores under 90"
+    "Stock buys only blocked when SPY is clearly falling (was shut 62% of the session); "
+    "RH crypto spread judged beyond its built-in markup; E*TRADE 404s no longer force a "
+    "false reauth and re-arm always posts after a reauth alert; crypto dust ignored; quieter logs"
 )
 
 

@@ -404,6 +404,14 @@ class ETradeAdapter(BaseBroker):
         except ETradeAPIError:
             try:
                 return _renew_and_probe()
+            except ETradeAPIError as e:
+                code = getattr(e, "status_code", None)
+                if code is not None and code not in (401, 403):
+                    # 10/14 16:29: fresh token + /balance 404 twice → false REAUTH + disarm;
+                    # session was fine at 16:36. Only 401/403 mean the token is dead.
+                    return False, f"E*TRADE API error ({code}) — session kept, will retry"
+                self.is_connected = False
+                return False, f"Reauthorization required ({e})"
             except Exception as e:
                 self.is_connected = False
                 return False, f"Reauthorization required ({e})"
