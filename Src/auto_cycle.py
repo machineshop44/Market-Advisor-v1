@@ -1266,6 +1266,9 @@ def buy_status_should_backoff(status: str) -> bool:
         "product_id",
         # RH lists no crypto pair (AMP 10/2–10/5: 94 ranked-then-failed pulses)
         "no rh crypto quote",
+        # RH position cap (GRAB/AMC 10/16: retried every cycle from 07:23–09:18).
+        "only purchase",
+        "can only purchase",
     )
     return any(n in low for n in needles)
 

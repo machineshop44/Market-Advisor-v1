@@ -17477,6 +17477,21 @@ class MarketAdvisorGUI(QMainWindow):
                 if not t:
                     continue
                 if px <= 0:
+                    try:
+                        mv = float(row.get("market_value") or 0)
+                    except (TypeError, ValueError):
+                        mv = 0.0
+                    try:
+                        from scoring import broker_min_notional
+                        bid = {"Robinhood": "ROBINHOOD", "Coinbase": "COINBASE", "E*TRADE": "ETRADE"}.get(
+                            broker_name, str(broker_name).upper(),
+                        )
+                        floor = float(broker_min_notional(bid, is_crypto=True))
+                    except Exception:
+                        floor = 1.0
+                    # Dust (RH SHIB ~$1.30) has no avg and cannot be a ticket. Don't nag.
+                    if 0 < mv < floor:
+                        continue
                     missing_no_broker.append(str(t))
                     continue
                 try:
@@ -19895,6 +19910,21 @@ class MarketAdvisorGUI(QMainWindow):
                 execute_skips.append(f"{ticker}: buy API backoff")
                 continue
 
+            # A queued buy is not a holding yet. GRAB 10/15 16:49–16:54 placed four
+            # ~$15 tickets before any fill showed up.
+            try:
+                import working_orders as _wo
+                if _wo.has_open_buy(broker_name, ticker):
+                    self._throttled_buy_skip_note(
+                        notes, broker_name, f"working_buy_{tu}",
+                        f"[{broker_name}] Skip [{ticker}] — working buy already open",
+                        cooldown_sec=900,
+                    )
+                    execute_skips.append(f"{ticker}: working buy already open")
+                    continue
+            except Exception:
+                pass
+
             # Same-day equity re-entry after a counted PDT day-trade exit
             if not is_crypto:
                 try:
@@ -20782,7 +20812,7 @@ class MarketAdvisorGUI(QMainWindow):
             status = fill.get("status") or ""
             filled = bool(fill.get("filled")) if "filled" in fill else bool(fill.get("ok"))
             working = bool(fill.get("working"))
-            if filled and not fill.get("rotate_sell"):
+            if (filled or working) and not fill.get("rotate_sell"):
                 self.set_lock(ticker, is_crypto=bool(
                     "crypto" in str(fill.get("asset_type") or "").lower()
                     or str(ticker or "").upper() in KNOWN_CRYPTOS

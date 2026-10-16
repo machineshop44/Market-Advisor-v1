@@ -140,6 +140,18 @@ def open_orders(broker: Optional[str] = None) -> list[dict]:
     return out
 
 
+def has_open_buy(broker: str, ticker: str) -> bool:
+    """True when a BUY for this name is still working (not filled or cancelled)."""
+    expire_stale()
+    tu = str(ticker or "").upper().replace("-USD", "")
+    for o in open_orders(broker):
+        if str(o.get("side") or "").upper() != "BUY":
+            continue
+        if str(o.get("ticker") or "").upper().replace("-USD", "") == tu:
+            return True
+    return False
+
+
 def open_notional(broker: Optional[str] = None) -> float:
     """Sum of dollars on open BUY working orders (BP tied estimate)."""
     expire_stale()

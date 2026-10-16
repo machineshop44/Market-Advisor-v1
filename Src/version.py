@@ -14,13 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.62"
+__version__ = "1.42.63"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Stock buys only blocked when SPY is clearly falling (was shut 62% of the session); "
-    "RH crypto spread judged beyond its built-in markup; E*TRADE 404s no longer force a "
-    "false reauth and re-arm always posts after a reauth alert; crypto dust ignored; quieter logs"
+    "A working equity buy blocks a second ticket on the same name; Robinhood one-share "
+    "rejects back off for the session; dust positions skip the missing cost-basis log"
 )
 
 

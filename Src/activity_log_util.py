@@ -168,7 +168,7 @@ _NOISY_NOTE_BITS = (
     "Wide spread", "Session size [", "already holds this coin",
     "No buys executed after rank", "PDT entry guard", "Micro crypto park",
     "trade lock active", "Equity buy engines wait for", "Frac policy [",
-    "Hold bias skip [", "Regime blocked buy [",
+    "Hold bias skip [", "Regime blocked buy [", "working buy already open",
 )
 
 
@@ -416,6 +416,8 @@ def buy_fail_ttl_for_status(status, *, default_ttl=900) -> int:
     if "no rh crypto quote" in low:
         # Per-coin gap (AMP 10/9 re-ranked hourly 03:06–08:00 while other coins quoted).
         return max(int(default_ttl or 900), 3 * 3600)
+    if "only purchase" in low or "can only purchase" in low:
+        return max(int(default_ttl or 900), 6 * 3600)
     return int(default_ttl or 900)
 
 

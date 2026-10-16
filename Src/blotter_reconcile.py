@@ -137,11 +137,36 @@ def missing_basis_tickers(
             if val > 0:
                 broker_cost = val
                 break
+        market_value = 0.0
+        for key in ("value", "equity", "market_value"):
+            raw = h.get(key)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                market_value = val
+                break
+        if market_value <= 0:
+            for key in ("price", "last_price", "mark"):
+                raw = h.get(key)
+                if raw is None:
+                    continue
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if val > 0:
+                    market_value = shares * val
+                    break
         need.append({
             "broker": b,
             "ticker": t,
             "shares": shares,
             "broker_cost": broker_cost,
+            "market_value": market_value,
             # legacy key kept as alias of broker_cost only (never mark)
             "price": broker_cost,
         })
