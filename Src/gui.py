@@ -5346,7 +5346,17 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 healthy = False
             if healthy:
+                self._monitor_probe_miss_at = 0.0
                 return
+        action, miss_at = monitor.monitor_probe_action(
+            getattr(self, "_monitor_probe_miss_at", 0.0),
+            now,
+            healthy=healthy,
+            running=running,
+        )
+        self._monitor_probe_miss_at = miss_at
+        if action != "restart":
+            return
         last = float(getattr(self, "_monitor_watchdog_at", 0.0) or 0.0)
         if (now - last) < 20.0:
             return
@@ -19218,7 +19228,11 @@ class MarketAdvisorGUI(QMainWindow):
             asset_type = c.get("asset_type") or ""
             is_crypto = "crypto" in str(asset_type).lower() or str(ticker).upper() in KNOWN_CRYPTOS
             if self.is_locked(ticker, is_crypto=is_crypto):
-                self.log_event(f"[{self.cycle_broker_name}] Skipped [{ticker}]: trade lock active")
+                self._throttled_log(
+                    f"tradelock:{self.cycle_broker_name}:{str(ticker).upper()}",
+                    f"[{self.cycle_broker_name}] Skipped [{ticker}]: trade lock active",
+                    cooldown_sec=900,
+                )
                 continue
             filtered.append(c)
         if not filtered:

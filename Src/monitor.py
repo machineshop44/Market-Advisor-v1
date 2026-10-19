@@ -249,6 +249,25 @@ def is_running() -> bool:
     return True
 
 
+def monitor_probe_action(miss_at, now, *, healthy, running, confirm_sec=45, forget_sec=600):
+    """
+    One slow TLS probe is not a dead server. A thread that is up but fails health
+    twice, at least confirm_sec apart, is a zombie. A dead thread restarts immediately.
+    Returns (action, new_miss_at) with action in ok / wait / restart.
+    """
+    now = float(now or 0)
+    if healthy:
+        return "ok", 0.0
+    if not running:
+        return "restart", 0.0
+    miss_at = float(miss_at or 0)
+    if miss_at <= 0 or (now - miss_at) > float(forget_sec):
+        return "wait", now
+    if (now - miss_at) < float(confirm_sec):
+        return "wait", miss_at
+    return "restart", 0.0
+
+
 def probe_localhost(timeout_sec: float = 1.5) -> bool:
     """
     True when the local monitor accepts an HTTP(S) request on loopback.

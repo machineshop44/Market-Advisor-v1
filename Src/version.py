@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.63"
+__version__ = "1.42.64"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "A working equity buy blocks a second ticket on the same name; Robinhood one-share "
-    "rejects back off for the session; dust positions skip the missing cost-basis log"
+    "Companion monitor restarts only after a second failed health check; "
+    "a trade-lock skip is logged once per name per session"
 )
 
 
