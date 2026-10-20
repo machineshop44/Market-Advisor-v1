@@ -169,6 +169,7 @@ _NOISY_NOTE_BITS = (
     "No buys executed after rank", "PDT entry guard", "Micro crypto park",
     "trade lock active", "Equity buy engines wait for", "Frac policy [",
     "Hold bias skip [", "Regime blocked buy [", "working buy already open",
+    "profit lock —",
 )
 
 

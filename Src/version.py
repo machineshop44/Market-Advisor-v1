@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.64"
+__version__ = "1.42.65"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Companion monitor restarts only after a second failed health check; "
-    "a trade-lock skip is logged once per name per session"
+    "Profit-lock skip lines log once per broker for the session "
+    "after a green day gives back its peak"
 )
 
 

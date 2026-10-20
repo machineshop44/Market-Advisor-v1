@@ -25,6 +25,13 @@ def test_dead_thread_restarts_immediately():
     assert action == "restart"
 
 
+def test_profit_lock_note_is_throttled():
+    from activity_log_util import noisy_note_key
+    a = noisy_note_key("[E*TRADE] profit lock — day P&L $1.18 gave back ≥40% of +$2.06 peak; no new buys until tomorrow — skipping buy batch")
+    b = noisy_note_key("[E*TRADE] profit lock — day P&L $1.18 gave back ≥40% of +$2.06 peak; no new buys until tomorrow — skipping buy batch")
+    assert a and a == b
+
+
 def test_healthy_clears_the_miss():
     action, miss = monitor.monitor_probe_action(1000, 1010, healthy=True, running=True)
     assert action == "ok" and miss == 0

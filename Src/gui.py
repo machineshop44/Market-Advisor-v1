@@ -20809,7 +20809,8 @@ class MarketAdvisorGUI(QMainWindow):
             key = noisy_note_key(note)
             if key:
                 # PDT guard cannot change until a slot rolls off — 15m repeats ran all night.
-                cd = 3600 if "PDT entry guard" in str(note) else 900
+                note_s = str(note)
+                cd = 3600 if ("PDT entry guard" in note_s or "profit lock" in note_s) else 900
                 self._throttled_log(f"bnote:{key}", note, cooldown_sec=cd)
             else:
                 self.log_event(note)
