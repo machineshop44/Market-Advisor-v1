@@ -19463,13 +19463,16 @@ class MarketAdvisorGUI(QMainWindow):
         # Coinbase (crypto-only): skip equity-wide crypto book cap — BP util is the cash rail
         crypto_only_broker = not bool(getattr(broker, "supports_equities", True))
         crypto_held_map = {}
+        equity_held_map = {}
         try:
             by_b = {}
-            for bname in ("Robinhood", "Coinbase"):
+            for bname in ("Robinhood", "Coinbase", "E*TRADE"):
                 by_b[bname] = self.get_broker_holdings(bname) or []
             crypto_held_map = _auto_cycle.crypto_held_across_brokers(by_b)
+            equity_held_map = _auto_cycle.equity_held_across_brokers(by_b)
         except Exception:
             crypto_held_map = {}
+            equity_held_map = {}
         if broker_name == "E*TRADE" and broker and hasattr(broker, "prefetch_quotes"):
             try:
                 broker.prefetch_quotes([
@@ -20058,24 +20061,44 @@ class MarketAdvisorGUI(QMainWindow):
                     )
                     continue
 
+            # Cross-broker: don't stack the same name on a second venue (IONQ 10/21
+            # RH $16 then ET $32 within 3m). Crypto already used this rail; equities too.
+            if tu not in held:
+                if is_crypto:
+                    other = _auto_cycle.crypto_held_on_other_broker(
+                        ticker, broker_name, crypto_held_map,
+                    )
+                    if other:
+                        notes.append(
+                            f"[{broker_name}] Skipped [{ticker}]: {other} already holds this coin"
+                        )
+                        execute_skips.append(f"{ticker}: held on {other}")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason=f"crypto_venue:{other}",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=True, regime_ok=True,
+                        )
+                        continue
+                else:
+                    other = _auto_cycle.equity_held_on_other_broker(
+                        ticker, broker_name, equity_held_map,
+                    )
+                    if other:
+                        notes.append(
+                            f"[{broker_name}] Skipped [{ticker}]: {other} already holds this name"
+                        )
+                        execute_skips.append(f"{ticker}: held on {other}")
+                        self._log_decision(
+                            broker=broker_name, ticker=ticker, action="SKIP",
+                            score=cand_score, reason=f"equity_venue:{other}",
+                            posture=posture, open_count=open_count, max_open=max_positions,
+                            is_crypto=False, regime_ok=True,
+                        )
+                        continue
             # FinRL hold-bias: crypto new entries (not scale-in) must clear score bar
             # before we burn a cycle on sizing / rotate (thin-ticket check after size).
             if is_crypto and tu not in held:
-                other = _auto_cycle.crypto_held_on_other_broker(
-                    ticker, broker_name, crypto_held_map,
-                )
-                if other:
-                    notes.append(
-                        f"[{broker_name}] Skipped [{ticker}]: {other} already holds this coin"
-                    )
-                    execute_skips.append(f"{ticker}: held on {other}")
-                    self._log_decision(
-                        broker=broker_name, ticker=ticker, action="SKIP",
-                        score=cand_score, reason=f"crypto_venue:{other}",
-                        posture=posture, open_count=open_count, max_open=max_positions,
-                        is_crypto=True, regime_ok=True,
-                    )
-                    continue
                 ok_ce, why_ce = crypto_new_entry_ok(
                     broker_id, ticker, score=cand_score, notional=None, skip_turbulence=True,
                     equity=equity, settings=self.settings,

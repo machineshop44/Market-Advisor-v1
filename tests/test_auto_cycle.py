@@ -451,6 +451,23 @@ class TestCycleBookExtract(unittest.TestCase):
         self.assertEqual(ac.crypto_held_on_other_broker("BTC", "Robinhood", held), "Coinbase")
         self.assertIsNone(ac.crypto_held_on_other_broker("ETH", "Coinbase", held))
 
+    def test_equity_held_across_brokers(self):
+        held = ac.equity_held_across_brokers({
+            "Robinhood": [
+                {"ticker": "IONQ", "shares": 0.49, "type": "stock"},
+                {"ticker": "BTC", "shares": 0.01, "type": "crypto"},
+            ],
+            "E*TRADE": [{"ticker": "IONQ", "shares": 1.0, "type": "equity"}],
+        })
+        self.assertEqual(held.get("IONQ"), {"Robinhood", "E*TRADE"})
+        self.assertNotIn("BTC", held)
+        self.assertEqual(
+            ac.equity_held_on_other_broker("IONQ", "E*TRADE", held), "Robinhood",
+        )
+        self.assertIsNone(ac.equity_held_on_other_broker("IONQ", "Robinhood", {
+            "IONQ": {"Robinhood"},
+        }))
+
     def test_equity_eod_action_fractional_flatten(self):
         action = ac.equity_eod_action_for_holding(
             "AMC", 0.5, 5.0, "stock", broker_name="Robinhood",

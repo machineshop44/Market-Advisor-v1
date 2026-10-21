@@ -2072,8 +2072,8 @@ def equity_eod_action_for_holding(
     return "keep"
 
 
-def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
-    """Map crypto ticker -> set of broker names holding it (multi-venue safe)."""
+def _held_across_brokers(holdings_by_broker: dict, *, crypto_only: bool) -> dict:
+    """Map ticker -> set of broker names holding it (multi-venue safe)."""
     out: dict = {}
     for broker, rows in (holdings_by_broker or {}).items():
         for h in rows or []:
@@ -2084,7 +2084,9 @@ def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
                 continue
             at = str(h.get("type") or h.get("asset_type") or "")
             is_c = "crypto" in at.lower() or t in DEFAULT_CRYPTO_TICKERS
-            if not is_c:
+            if crypto_only and not is_c:
+                continue
+            if not crypto_only and is_c:
                 continue
             try:
                 sh = float(h.get("shares") or 0)
@@ -2094,6 +2096,16 @@ def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
                 continue
             out.setdefault(t, set()).add(str(broker))
     return out
+
+
+def crypto_held_across_brokers(holdings_by_broker: dict) -> dict:
+    """Map crypto ticker -> set of broker names holding it (multi-venue safe)."""
+    return _held_across_brokers(holdings_by_broker, crypto_only=True)
+
+
+def equity_held_across_brokers(holdings_by_broker: dict) -> dict:
+    """Map equity ticker -> set of broker names holding it (blocks double-booking)."""
+    return _held_across_brokers(holdings_by_broker, crypto_only=False)
 
 
 def crypto_held_on_other_broker(ticker, broker_name, held_map: dict) -> Optional[str]:
@@ -2109,6 +2121,10 @@ def crypto_held_on_other_broker(ticker, broker_name, held_map: dict) -> Optional
     except TypeError:
         return None
     return others[0] if others else None
+
+
+# Equities use the same owner lookup as crypto.
+equity_held_on_other_broker = crypto_held_on_other_broker
 
 
 def format_discord_settings_summary(*, webhook_set: bool, level: str) -> str:
