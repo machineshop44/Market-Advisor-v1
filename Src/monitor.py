@@ -67,6 +67,16 @@ _halt_handler = None
 _advisor_handler = None
 _eod_handler = None
 _etrade_oauth_handler = None
+_robinhood_login_handler = None
+_CONTROL_POST_PATHS = (
+    "/api/auto",
+    "/api/halt",
+    "/api/eod/run",
+    "/api/advisor/approve",
+    "/api/etrade/oauth/start",
+    "/api/etrade/oauth/complete",
+    "/api/robinhood/login/start",
+)
 _server = None
 _thread = None
 _tls_enabled = False
@@ -142,6 +152,12 @@ def set_etrade_oauth_handler(handler):
     """
     global _etrade_oauth_handler
     _etrade_oauth_handler = handler
+
+
+def set_robinhood_login_handler(handler):
+    """Companion asks the desktop to start a Robinhood login (push 2FA stays in the RH app)."""
+    global _robinhood_login_handler
+    _robinhood_login_handler = handler
 
 
 def configure_controls(enabled: bool):
@@ -903,14 +919,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in (
-            "/api/auto",
-            "/api/halt",
-            "/api/eod/run",
-            "/api/advisor/approve",
-            "/api/etrade/oauth/start",
-            "/api/etrade/oauth/complete",
-        ):
+        if path not in _CONTROL_POST_PATHS:
             self.send_response(404)
             self.end_headers()
             return
@@ -1007,6 +1016,22 @@ class _Handler(BaseHTTPRequestHandler):
             verifier = str(data.get("verifier") or "").strip()
             try:
                 result = handler(action, verifier)
+            except Exception as e:
+                self._json_response(500, {"ok": False, "error": str(e)})
+                return
+            if not isinstance(result, dict):
+                result = {"ok": bool(result)}
+            code = 200 if result.get("ok") else 400
+            self._json_response(code, result)
+            return
+
+        if path == "/api/robinhood/login/start":
+            handler = _robinhood_login_handler
+            if handler is None:
+                self._json_response(503, {"ok": False, "error": "Robinhood login handler not ready"})
+                return
+            try:
+                result = handler()
             except Exception as e:
                 self._json_response(500, {"ok": False, "error": str(e)})
                 return

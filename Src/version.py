@@ -14,12 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.67"
+__version__ = "1.42.68"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "After a Robinhood or Coinbase reauth on the PC, re-arm if that "
-    "broker was armed before the session died"
+    "Companion can start a Robinhood reauth; approve the prompt in the Robinhood app"
 )
 
 

@@ -38,6 +38,7 @@
     <string name="pull_to_refresh">Pull down to refresh</string>
     <string name="compat_note">Desktop 1.42.14+</string>
     <string name="reauth_etrade">Reauth E*TRADE</string>
+    <string name="reauth_robinhood">Reauth Robinhood</string>
     <string name="reauth_title">E*TRADE reauthorization</string>
     <string name="reauth_body">Open E*TRADE in the browser, approve access, then paste the verification code here.</string>
     <string name="reauth_open_browser">Open authorize page</string>
@@ -56,7 +57,7 @@
     <string name="reauth_notify_title_etrade">E*TRADE needs reauth</string>
     <string name="reauth_notify_body_etrade">Midnight token expired — open Companion and complete E*TRADE OAuth.</string>
     <string name="reauth_notify_title_robinhood">Robinhood needs reauth</string>
-    <string name="reauth_notify_body_robinhood">Robinhood session expired — open Market Advisor on the PC and reconnect, then re-arm.</string>
+    <string name="reauth_notify_body_robinhood">Tap Reauth Robinhood here, then approve the prompt in the Robinhood app.</string>
     <string name="reauth_notify_title_coinbase">Coinbase needs reauth</string>
     <string name="reauth_notify_body_coinbase">Coinbase session expired — open Market Advisor on the PC and reconnect, then re-arm.</string>
     <string name="reauth_notify_title_multi">Brokers need reauth</string>

@@ -1502,6 +1502,8 @@ class MarketAdvisorGUI(QMainWindow):
     _monitor_control_req = pyqtSignal(object)
     # Monitor HTTP thread → main: E*TRADE OAuth start/complete from companion
     _monitor_etrade_oauth_req = pyqtSignal(object)
+    # Monitor HTTP thread → main: companion asked the desktop to start Robinhood login
+    _monitor_rh_login_req = pyqtSignal(object)
     _monitor_advisor_req = pyqtSignal(object)
     _monitor_eod_req = pyqtSignal(object)
     _monitor_halt_req = pyqtSignal(object)
@@ -1520,6 +1522,7 @@ class MarketAdvisorGUI(QMainWindow):
         self._rh_sms_prompt.connect(self._on_rh_sms_prompt)
         self._monitor_control_req.connect(self._on_monitor_control_req)
         self._monitor_etrade_oauth_req.connect(self._on_monitor_etrade_oauth_req)
+        self._monitor_rh_login_req.connect(self._on_monitor_rh_login_req)
         self._monitor_advisor_req.connect(self._on_monitor_advisor_req)
         self._monitor_eod_req.connect(self._on_monitor_eod_req)
         self._monitor_halt_req.connect(self._on_monitor_halt_req)
@@ -5282,6 +5285,7 @@ class MarketAdvisorGUI(QMainWindow):
         monitor.set_advisor_handler(self._monitor_advisor_from_http)
         monitor.set_eod_handler(self._monitor_eod_from_http)
         monitor.set_etrade_oauth_handler(self._monitor_etrade_oauth_from_http)
+        monitor.set_robinhood_login_handler(self._monitor_robinhood_login_from_http)
 
         self._monitor_start_gen = getattr(self, "_monitor_start_gen", 0) + 1
         gen = self._monitor_start_gen
@@ -7046,6 +7050,67 @@ class MarketAdvisorGUI(QMainWindow):
         if not req["event"].wait(timeout=20.0):
             return {"ok": False, "error": "Timed out waiting for desktop app"}
         return req.get("result") or {"ok": False, "error": "No result"}
+
+    def _monitor_robinhood_login_from_http(self):
+        """Companion tap: start RH login on the desktop. Returns once the worker is queued."""
+        req = {
+            "event": threading.Event(),
+            "result": {"ok": False, "error": "timeout"},
+        }
+        self._monitor_rh_login_req.emit(req)
+        if not req["event"].wait(timeout=8.0):
+            return {"ok": False, "error": "Timed out waiting for desktop app"}
+        return req.get("result") or {"ok": False, "error": "No result"}
+
+    def _saved_rh_credentials(self):
+        email = ""
+        if hasattr(self, "rh_email_input"):
+            email = self.rh_email_input.text().strip()
+        if not email:
+            email = str(self.settings.get("rh_email") or "").strip()
+        password = ""
+        if hasattr(self, "rh_pass_input"):
+            password = self.rh_pass_input.text()
+        if not str(password or "").strip():
+            try:
+                import credentials as cred_mod
+                password = cred_mod.resolve_rh_password(self.settings) or ""
+            except Exception:
+                password = self.settings.get("rh_password") or ""
+        return email, str(password or "")
+
+    def _on_monitor_rh_login_req(self, req):
+        try:
+            if not bool(self.settings.get("monitor_controls_enabled", False)):
+                req["result"] = {"ok": False, "error": "Companion controls disabled"}
+                return
+            if getattr(self, "_rh_login_in_flight", False):
+                req["result"] = {
+                    "ok": True,
+                    "status": "already_running",
+                    "message": "Robinhood login already in progress — approve the prompt in the Robinhood app",
+                }
+                return
+            email, password = self._saved_rh_credentials()
+            if not email or not password:
+                req["result"] = {
+                    "ok": False,
+                    "error": "Robinhood email or password is not saved on the desktop",
+                }
+                return
+            self._begin_rh_login(email, password, source="companion")
+            req["result"] = {
+                "ok": True,
+                "status": "started",
+                "message": "Approve the login in the Robinhood app",
+            }
+        except Exception as e:
+            req["result"] = {"ok": False, "error": str(e)}
+        finally:
+            try:
+                req["event"].set()
+            except Exception:
+                pass
 
     def _companion_etrade_creds(self):
         """Build E*TRADE creds from saved settings (no Settings dialog widgets required)."""
@@ -13003,10 +13068,6 @@ class MarketAdvisorGUI(QMainWindow):
         if not email or not password:
             QMessageBox.warning(self, "Robinhood", "Enter email and password.")
             return
-
-        self._rh_login_in_flight = True
-        if hasattr(self, "rh_connect_btn"):
-            self.rh_connect_btn.setEnabled(False)
         QMessageBox.information(
             self,
             "Robinhood — check your phone",
@@ -13015,6 +13076,16 @@ class MarketAdvisorGUI(QMainWindow):
             "authenticator approval. Complete that prompt so login can finish.\n\n"
             "A code entry box will appear here if SMS verification is required.",
         )
+        self._begin_rh_login(email, password, source="desktop")
+
+    def _begin_rh_login(self, email, password, *, source="desktop"):
+        """Queue Robinhood login. Companion starts the same worker without a desktop dialog."""
+        if getattr(self, "_rh_login_in_flight", False):
+            self.log_event("Robinhood: login already in progress.")
+            return
+        self._rh_login_in_flight = True
+        if hasattr(self, "rh_connect_btn"):
+            self.rh_connect_btn.setEnabled(False)
         self._set_broker_status(
             "Robinhood",
             "🟡 Connecting — watch phone for 2FA / SMS…",
@@ -13023,9 +13094,14 @@ class MarketAdvisorGUI(QMainWindow):
         self.set_working_state(
             True, "Connecting Robinhood — check phone for 2FA / SMS prompt…"
         )
-        self.log_event(
-            "Robinhood: connecting — watch phone for SMS / push / authenticator prompt…"
-        )
+        if source == "companion":
+            self.log_event(
+                "[Companion] Robinhood login started — approve the prompt in the Robinhood app"
+            )
+        else:
+            self.log_event(
+                "Robinhood: connecting — watch phone for SMS / push / authenticator prompt…"
+            )
 
         def _bg():
             original_input = builtins.input
@@ -15128,9 +15204,19 @@ class MarketAdvisorGUI(QMainWindow):
             self._reauth_nudge_sent = _blank_broker_map(False)
         if not self._reauth_nudge_sent.get(broker_name):
             self._reauth_nudge_sent[broker_name] = True
+            if broker_name == "Robinhood":
+                reauth_body = (
+                    "Robinhood needs reauthorization — auto-trader disarmed. "
+                    "Tap Reauth Robinhood in the Companion app, then approve the "
+                    "prompt in the Robinhood app."
+                )
+            else:
+                reauth_body = (
+                    f"{broker_name} needs reauthorization — auto-trader disarmed. "
+                    f"Open Home → Reauth / Settings → Brokers, then re-arm."
+                )
             self.send_discord_alert(
-                f"{broker_name} needs reauthorization — auto-trader disarmed. "
-                f"Open Home → Reauth / Settings → Brokers, then re-arm.",
+                reauth_body,
                 urgent=True,
                 prefix="[REAUTH]",
                 broker=broker_name,

@@ -105,7 +105,10 @@ class MainActivity : AppCompatActivity() {
                 confirmAuto(row.name, checked, row.binding.brokerSwitch)
             }
             row.binding.btnReauth.setOnClickListener {
-                if (row.name == "E*TRADE") startEtradeReauth()
+                when (row.name) {
+                    "E*TRADE" -> startEtradeReauth()
+                    "Robinhood" -> startRobinhoodReauth()
+                }
             }
         }
 
@@ -605,10 +608,16 @@ class MainActivity : AppCompatActivity() {
                         setPill(row.binding.brokerPill, armed)
                     }
 
-                    val showReauth = row.name == "E*TRADE" &&
-                        status.controlsEnabled &&
-                        (info?.reauthNeeded == true)
+                    val showReauth = status.controlsEnabled &&
+                        (info?.reauthNeeded == true) &&
+                        (row.name == "E*TRADE" || row.name == "Robinhood")
                     row.binding.btnReauth.visibility = if (showReauth) View.VISIBLE else View.GONE
+                    if (showReauth) {
+                        row.binding.btnReauth.text = getString(
+                            if (row.name == "Robinhood") R.string.reauth_robinhood
+                            else R.string.reauth_etrade,
+                        )
+                    }
 
                     val balLine = brokerBalanceLine(status.brokerBalances[row.name])
                     if (balLine.isNotBlank()) {
@@ -789,6 +798,25 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG,
             ).show()
             refreshStatus(force = true)
+        }
+    }
+
+    private fun startRobinhoodReauth() {
+        lifecycleScope.launch {
+            val url = Prefs.baseUrl(this@MainActivity)
+            val user = Prefs.username(this@MainActivity)
+            val pass = Prefs.password(this@MainActivity)
+            val pin = Prefs.fingerprint(this@MainActivity)
+            val start = withContext(Dispatchers.IO) {
+                runCatching { MonitorApi.robinhoodLoginStart(url, user, pass, pin) }
+                    .getOrElse { MonitorApi.RhLoginStartResult(false, error = it.message) }
+            }
+            val note = when {
+                start.ok -> start.message ?: "Approve the login in the Robinhood app"
+                else -> start.error ?: "Could not start Robinhood login"
+            }
+            Toast.makeText(this@MainActivity, note, Toast.LENGTH_LONG).show()
+            if (start.ok) refreshStatus(force = true)
         }
     }
 

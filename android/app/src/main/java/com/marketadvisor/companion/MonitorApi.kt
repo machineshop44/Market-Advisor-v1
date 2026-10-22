@@ -820,6 +820,38 @@ object MonitorApi {
         val error: String? = null,
     )
 
+    data class RhLoginStartResult(
+        val ok: Boolean,
+        val message: String? = null,
+        val error: String? = null,
+    )
+
+    fun robinhoodLoginStart(
+        baseUrl: String,
+        user: String,
+        pass: String,
+        pinFp: String,
+    ): RhLoginStartResult {
+        val conn = open("${baseUrl.trimEnd('/')}/api/robinhood/login/start", user, pass, "POST", pinFp)
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write("{}") }
+        val code = conn.responseCode
+        val text = readBody(conn, code)
+        return try {
+            val json = JSONObject(text.ifBlank { "{}" })
+            RhLoginStartResult(
+                ok = json.optBoolean("ok", code in 200..299),
+                message = json.optString("message", "").takeIf { it.isNotBlank() },
+                error = json.optString("error", "").takeIf { it.isNotBlank() }
+                    ?: if (code !in 200..299) parseErrorMessage(text, code).first else null,
+            )
+        } catch (_: Exception) {
+            val (msg, _) = parseErrorMessage(text, code)
+            RhLoginStartResult(ok = false, error = msg)
+        }
+    }
+
     fun etradeOauthStart(
         baseUrl: String,
         user: String,
