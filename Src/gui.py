@@ -13128,6 +13128,7 @@ class MarketAdvisorGUI(QMainWindow):
                     "Robinhood connected, but no session pickle found — next launch may require Connect again."
                 )
             self._after_broker_session_restored("Robinhood", source="connect")
+            self._maybe_restore_broker_arm("Robinhood", source="connect")
         else:
             self._set_broker_status("Robinhood", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
             self.set_working_state(False)
@@ -13212,6 +13213,7 @@ class MarketAdvisorGUI(QMainWindow):
             self.set_working_state(False, "Coinbase connected")
             self.log_event("Coinbase connected.")
             self._after_broker_session_restored("Coinbase", source="connect")
+            self._maybe_restore_broker_arm("Coinbase", source="connect")
         else:
             self._set_broker_status("Coinbase", "🔴 Disconnected", "color: #FF5252; font-weight: bold;")
             self.set_working_state(False)

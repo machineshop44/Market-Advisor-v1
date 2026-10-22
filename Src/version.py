@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.66"
+__version__ = "1.42.67"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Skip a second-broker equity buy when another venue already holds "
-    "the same name (IONQ stacked Robinhood then etrade)"
+    "After a Robinhood or Coinbase reauth on the PC, re-arm if that "
+    "broker was armed before the session died"
 )
 
 
