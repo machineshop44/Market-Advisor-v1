@@ -462,6 +462,105 @@ def test_all_providers_exhausted_local(monkeypatch):
     assert out["source"] == "local_fallback"
     assert "gemini" in str(out.get("error") or "")
     assert "openai" in str(out.get("error") or "")
+def _second_prop():
+    return {
+        "ticker": "SOL",
+        "broker": "Robinhood",
+        "dollars": 12.0,
+        "price": 80.0,
+        "score": 96.0,
+        "engine": "CRYPTO",
+        "asset_type": "cryptocurrency",
+    }
+
+
+def _second_settings():
+    return {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key_gemini": "g",
+        "advisor_ai_api_key_groq": "q",
+        "advisor_ai_failover_order": "gemini,groq",
+        "advisor_ai_failover_enabled": True,
+        "advisor_ai_local_when_clear": False,
+        "advisor_ai_second_opinion": True,
+    }
+
+
+def test_second_opinion_requires_a_different_provider(monkeypatch):
+    dai.reset_ai_budgets()
+    calls = []
+
+    def gemini(*_a, **_k):
+        calls.append("gemini")
+        return '{"verdict":"approve","brief":"Gemini likes the setup","detail":"first"}'
+
+    def groq(*_a, **_k):
+        calls.append("groq")
+        return '{"verdict":"approve","brief":"Groq agrees with the entry","detail":"second"}'
+
+    monkeypatch.setattr(dai, "_call_gemini", gemini)
+    monkeypatch.setattr(dai, "_call_groq", groq)
+    out = dai.analyze_proposal(_second_prop(), {"buying_power": 40.0}, _second_settings())
+    assert calls == ["gemini", "groq"]
+    assert out["verdict"] == "approve"
+    assert out["source"] == "gemini+groq"
+    assert "2nd:groq agree" in str(out.get("detail") or "")
+
+
+def test_second_opinion_holds_when_the_other_advisor_disagrees(monkeypatch):
+    dai.reset_ai_budgets()
+
+    def gemini(*_a, **_k):
+        return '{"verdict":"approve","brief":"Gemini likes the setup","detail":"first"}'
+
+    def groq(*_a, **_k):
+        return '{"verdict":"skip","brief":"Groq says pass on this coin","detail":"no"}'
+
+    monkeypatch.setattr(dai, "_call_gemini", gemini)
+    monkeypatch.setattr(dai, "_call_groq", groq)
+    out = dai.analyze_proposal(_second_prop(), {"buying_power": 40.0}, _second_settings())
+    assert out["verdict"] == "wait"
+    assert out["source"] == "gemini+groq"
+    assert "Held" in str(out.get("brief") or "")
+
+
+def test_second_opinion_skips_on_a_wait(monkeypatch):
+    dai.reset_ai_budgets()
+    calls = []
+
+    def gemini(*_a, **_k):
+        calls.append("gemini")
+        return '{"verdict":"wait","brief":"Gemini wants to wait here","detail":"wait"}'
+
+    def groq(*_a, **_k):
+        calls.append("groq")
+        raise AssertionError("second advisor should not be asked")
+
+    monkeypatch.setattr(dai, "_call_gemini", gemini)
+    monkeypatch.setattr(dai, "_call_groq", groq)
+    out = dai.analyze_proposal(_second_prop(), {"buying_power": 40.0}, _second_settings())
+    assert calls == ["gemini"]
+    assert out["verdict"] == "wait"
+    assert out["source"] == "gemini"
+
+
+def test_approve_stands_when_no_other_advisor_is_up(monkeypatch):
+    dai.reset_ai_budgets()
+
+    def gemini(*_a, **_k):
+        return '{"verdict":"approve","brief":"Gemini likes the setup","detail":"first"}'
+
+    def groq(*_a, **_k):
+        raise RuntimeError("groq down")
+
+    monkeypatch.setattr(dai, "_call_gemini", gemini)
+    monkeypatch.setattr(dai, "_call_groq", groq)
+    out = dai.analyze_proposal(_second_prop(), {"buying_power": 40.0}, _second_settings())
+    assert out["verdict"] == "approve"
+    assert out["source"] == "gemini"
+    assert "2nd opinion unavailable" in str(out.get("detail") or "")
+
+
 def test_connection_reports_every_keyed_provider(monkeypatch):
     calls = []
 

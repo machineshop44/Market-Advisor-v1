@@ -14,11 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.69"
+__version__ = "1.42.70"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "A sub-dollar crypto remnant no longer blocks that coin on the other broker"
+    "A cloud approve needs a second advisor on this portfolio before the buy"
 )
 
 

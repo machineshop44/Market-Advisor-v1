@@ -292,6 +292,7 @@ def load_settings():
         "advisor_ai_api_key_xai": "",
         "advisor_ai_failover_order": "gemini,groq,openrouter,openai,xai",
         "advisor_ai_failover_enabled": True,
+        "advisor_ai_second_opinion": True,
         "advisor_ai_model": "",
         "advisor_ai_auto_reject_skip": True,
         "advisor_ai_auto_apply_approve": True,
@@ -6814,6 +6815,10 @@ class MarketAdvisorGUI(QMainWindow):
             self.settings["advisor_ai_failover_enabled"] = bool(
                 self.advisor_ai_failover_chk.isChecked()
             )
+        if hasattr(self, "advisor_ai_second_chk"):
+            self.settings["advisor_ai_second_opinion"] = bool(
+                self.advisor_ai_second_chk.isChecked()
+            )
         # Per-provider keys (plus legacy single field if still present)
         key_widgets = (
             ("gemini", "advisor_ai_key_gemini_edit"),
@@ -11170,6 +11175,15 @@ class MarketAdvisorGUI(QMainWindow):
             "When preferred fails or hits its soft budget, try the next key, then local rules."
         )
         failover_row.addWidget(self.advisor_ai_failover_chk)
+        self.advisor_ai_second_chk = QCheckBox("2nd opinion on approve")
+        self.advisor_ai_second_chk.setChecked(
+            bool(self.settings.get("advisor_ai_second_opinion", True))
+        )
+        self.advisor_ai_second_chk.setToolTip(
+            "When one cloud advisor approves, the next saved key must agree. "
+            "A skip or wait holds the trade. Skips from the first advisor stay one call."
+        )
+        failover_row.addWidget(self.advisor_ai_second_chk)
         failover_row.addWidget(QLabel("Order:"))
         self.advisor_ai_failover_edit = QLineEdit()
         self.advisor_ai_failover_edit.setPlaceholderText(

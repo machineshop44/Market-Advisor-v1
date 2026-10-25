@@ -1379,6 +1379,91 @@ def _local_fallback_guard(out: dict, proposal: dict) -> dict:
     return _with_retry_after(out, proposal=proposal)
 
 
+def _cloud_ask(provider, settings, proposal, context, research):
+    """One provider call. (result, "") or (None, error). Empty error means no key."""
+    ok_budget, budget_why = _ai_budget_ok(settings, provider=provider)
+    if not ok_budget:
+        return None, budget_why
+    key = resolve_provider_api_key(provider, settings)
+    if not key:
+        return None, ""
+    model = _model(settings, provider=provider)
+    live_research = provider == "xai" and bool(
+        (settings or {}).get("advisor_ai_xai_live_research", True)
+    )
+    prompt = _proposal_prompt(
+        proposal, context, research=research, live_research=live_research,
+    )
+    try:
+        raw = _call_provider(
+            provider, key, model, prompt, live_research=live_research,
+        )
+    except Exception as e:
+        return None, f"{provider}: {str(e)[:120]}"
+    _ai_budget_record(provider)
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        snippet = " ".join(str(raw or "").split())[:80]
+        return None, f"{provider}: response not JSON ({snippet or 'empty'})"
+    verdict = _clamp_verdict(parsed.get("verdict"))
+    detail = str(parsed.get("detail") or "")[:500]
+    brief = _sanitize_ai_brief(
+        parsed.get("brief") or "", detail=detail, verdict=verdict,
+    )
+    return {
+        "verdict": verdict,
+        "brief": brief,
+        "detail": detail,
+        "retry_after_min": parsed.get("retry_after_min"),
+        "provider": provider,
+        "live_research": bool(live_research),
+    }, ""
+
+
+def _apply_second_opinion(first, chain, settings, proposal, context, research, *, skip=()):
+    """
+    A cloud approve needs a different provider to agree. Skips and waits stay one call.
+    If every other key is down, the first approve stands.
+    """
+    if first.get("verdict") != VERDICT_APPROVE:
+        return first
+    if not bool((settings or {}).get("advisor_ai_second_opinion", True)):
+        return first
+    asked = str(first.get("provider") or "")
+    already = {asked, *[str(p) for p in (skip or ())]}
+    second = None
+    notes: list[str] = []
+    for provider in chain:
+        if provider in already:
+            continue
+        result, err = _cloud_ask(provider, settings, proposal, context, research)
+        if result:
+            second = result
+            break
+        if err:
+            notes.append(err)
+    detail = str(first.get("detail") or "")
+    if second is None:
+        note = "2nd opinion unavailable"
+        if notes:
+            note = f"{note} ({'; '.join(notes)[:120]})"
+        first["detail"] = (f"{detail} · {note}" if detail else note)[:500]
+        return first
+    other = str(second.get("provider") or "")
+    sv = str(second.get("verdict") or VERDICT_WAIT)
+    if sv == VERDICT_APPROVE:
+        first["detail"] = (f"{detail} · 2nd:{other} agree" if detail else f"2nd:{other} agree")[:500]
+        first["provider"] = f"{asked}+{other}"
+        return first
+    first["verdict"] = VERDICT_WAIT
+    first["brief"] = f"Held: {asked} approved, {other} said {sv}."[:420]
+    first["detail"] = (f"{detail} · 2nd:{other} {sv}" if detail else f"2nd:{other} {sv}")[:500]
+    if second.get("retry_after_min") is not None:
+        first["retry_after_min"] = second.get("retry_after_min")
+    first["provider"] = f"{asked}+{other}"
+    return first
+
+
 def analyze_proposal(
     proposal: dict,
     context: dict | None = None,
@@ -1439,57 +1524,36 @@ def analyze_proposal(
         return _local_fallback_guard(out, proposal)
 
     errors: list[str] = []
+    tried: list[str] = []
     for provider in chain:
-        ok_budget, budget_why = _ai_budget_ok(settings, provider=provider)
-        if not ok_budget:
-            errors.append(budget_why)
+        tried.append(provider)
+        result, err = _cloud_ask(provider, settings, proposal, context, research)
+        if result is None:
+            if err:
+                errors.append(err)
             continue
-        key = resolve_provider_api_key(provider, settings)
-        if not key:
-            continue
-        model = _model(settings, provider=provider)
-        live_research = provider == "xai" and bool(
-            (settings or {}).get("advisor_ai_xai_live_research", True)
+        if len(chain) > 1 and provider != chain[0]:
+            detail = str(result.get("detail") or "")
+            result["detail"] = (
+                f"{detail} · failover:{provider}" if detail else f"failover:{provider}"
+            )[:500]
+        result = _apply_second_opinion(
+            result, chain, settings, proposal, context, research, skip=tried,
         )
-        prompt = _proposal_prompt(
-            proposal, context, research=research, live_research=live_research,
+        return _with_retry_after(
+            {
+                "verdict": result["verdict"],
+                "brief": result["brief"],
+                "detail": result.get("detail") or "",
+                "retry_after_min": result.get("retry_after_min"),
+                "source": result["provider"],
+                "ok": True,
+                "research": research,
+                "live_research": bool(result.get("live_research")),
+                "failover_chain": list(chain),
+            },
+            proposal=proposal,
         )
-        try:
-            raw = _call_provider(
-                provider, key, model, prompt, live_research=live_research,
-            )
-            _ai_budget_record(provider)
-            parsed = _extract_json_object(raw)
-            if not parsed:
-                snippet = " ".join(str(raw or "").split())[:80]
-                errors.append(f"{provider}: response not JSON ({snippet or 'empty'})")
-                continue
-            verdict = _clamp_verdict(parsed.get("verdict"))
-            detail = str(parsed.get("detail") or "")[:500]
-            brief = _sanitize_ai_brief(
-                parsed.get("brief") or "", detail=detail, verdict=verdict,
-            )
-            if len(chain) > 1 and provider != chain[0]:
-                detail = (
-                    f"{detail} · failover:{provider}" if detail else f"failover:{provider}"
-                )[:500]
-            return _with_retry_after(
-                {
-                    "verdict": verdict,
-                    "brief": brief,
-                    "detail": detail,
-                    "retry_after_min": parsed.get("retry_after_min"),
-                    "source": provider,
-                    "ok": True,
-                    "research": research,
-                    "live_research": bool(live_research),
-                    "failover_chain": list(chain),
-                },
-                proposal=proposal,
-            )
-        except Exception as e:
-            errors.append(f"{provider}: {str(e)[:120]}")
-            continue
 
     out = local_analyze_proposal(proposal, context)
     out["source"] = "local_fallback"
