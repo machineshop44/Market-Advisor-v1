@@ -73,7 +73,7 @@ class TestPdtEntryGuard(unittest.TestCase):
             pdt._day_trades.append({
                 "broker": "Robinhood",
                 "ticker": f"T{i}",
-                "day": pdt._day_key(),
+                "day": "2026-10-23",
                 "ts": 1.0,
             })
         ok, why = pdt.may_open_equity_buy(

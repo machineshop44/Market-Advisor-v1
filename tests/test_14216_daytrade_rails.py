@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Src")
 if SRC not in sys.path:
@@ -29,10 +30,12 @@ class TestPdtGuard(unittest.TestCase):
     def test_blocks_fourth_day_trade_under_25k(self):
         pdt = self.pdt
         settings = {"pdt_guard_enabled": True, "pdt_max_day_trades": 3, "pdt_equity_threshold": 25000}
+        # A Saturday stamp is outside the business-day window, so pin a Friday.
+        ts = datetime(2026, 10, 23, 15, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
         for i in range(3):
             t = f"T{i}"
-            pdt.record_buy("E*TRADE", t, qty=1)
-            self.assertTrue(pdt.record_sell("E*TRADE", t, qty=1))
+            pdt.record_buy("E*TRADE", t, qty=1, ts=ts)
+            self.assertTrue(pdt.record_sell("E*TRADE", t, qty=1, ts=ts))
         self.assertEqual(pdt.count_day_trades("E*TRADE"), 3)
         pdt.record_buy("E*TRADE", "NEW", qty=1)
         ok, why = pdt.may_complete_day_trade(

@@ -2094,6 +2094,11 @@ def _held_across_brokers(holdings_by_broker: dict, *, crypto_only: bool) -> dict
                 sh = 0.0
             if sh <= 0:
                 continue
+            # A sub-$1 remnant (RH ETH ~0.0003 sh) is not a position. It must not
+            # block a fresh buy of that coin on the other broker.
+            locked, why = classify_locked_holding(h, broker_name=str(broker))
+            if locked and "dust" in str(why).lower():
+                continue
             out.setdefault(t, set()).add(str(broker))
     return out
 

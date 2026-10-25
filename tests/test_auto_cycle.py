@@ -451,6 +451,22 @@ class TestCycleBookExtract(unittest.TestCase):
         self.assertEqual(ac.crypto_held_on_other_broker("BTC", "Robinhood", held), "Coinbase")
         self.assertIsNone(ac.crypto_held_on_other_broker("ETH", "Coinbase", held))
 
+    def test_dust_crypto_does_not_block_the_other_broker(self):
+        held = ac.crypto_held_across_brokers({
+            "Robinhood": [{
+                "ticker": "ETH", "shares": 0.000317, "price": 2362.0, "type": "crypto",
+            }],
+        })
+        self.assertNotIn("ETH", held)
+        real = ac.crypto_held_across_brokers({
+            "Robinhood": [{
+                "ticker": "ETH", "shares": 0.01, "price": 2362.0, "type": "crypto",
+            }],
+        })
+        self.assertEqual(
+            ac.crypto_held_on_other_broker("ETH", "Coinbase", real), "Robinhood",
+        )
+
     def test_equity_held_across_brokers(self):
         held = ac.equity_held_across_brokers({
             "Robinhood": [
