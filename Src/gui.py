@@ -17537,6 +17537,37 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 local_ticks = []
             ghosts = br.ghost_local_tickers(held, local_ticks)
+            # Only a live book can prove the shares are gone. A disconnected
+            # broker or a single-broker view has no rows for the others, and
+            # treating that hole as a fill would invent a day trade.
+            broker_obj = (getattr(self, "brokers", {}) or {}).get(broker_name)
+            book_is_live = bool(broker_obj and getattr(broker_obj, "is_connected", False))
+            view_covers = self.view_mode == "All" or self.view_mode == broker_name
+            try:
+                import working_orders as _wo
+                implied = (
+                    br.day_trades_implied_by_ghosts(ghosts, _wo.open_orders(broker_name))
+                    if book_is_live and view_covers
+                    else []
+                )
+            except Exception:
+                implied = []
+            for row in implied:
+                t = row.get("ticker")
+                try:
+                    import pdt_guard as pdt
+                    if row.get("record_buy"):
+                        pdt.record_buy(broker_name, t, qty=float(row.get("qty") or 0))
+                    import working_orders as _wo
+                    for oid in row.get("order_ids") or []:
+                        _wo.resolve(broker_name, oid, "filled")
+                    self._after_confirmed_sell_fill(
+                        broker_name, t, "stock", 0.0, float(row.get("qty") or 0),
+                        "working sell filled (position gone)",
+                        full_exit=True,
+                    )
+                except Exception:
+                    pass
             for t in ghosts:
                 try:
                     cache = self.cost_basis_cache.get(broker_name)
@@ -20005,6 +20036,14 @@ class MarketAdvisorGUI(QMainWindow):
             price = float(c.get("price") or 0.0)
             is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
             tu = ticker.upper()
+            if is_crypto and not self._broker_supports(broker_name, "supports_crypto"):
+                self._throttled_buy_skip_note(
+                    notes, broker_name, f"no_crypto_{tu}",
+                    f"[{broker_name}] Skipped [{ticker}]: broker has no crypto",
+                    cooldown_sec=1800,
+                )
+                execute_skips.append(f"{ticker}: broker has no crypto")
+                continue
             is_held = tu in held
             if buys_done >= max_buys:
                 notes.append(f"[{broker_name}] Buy cap reached ({max_buys}/cycle) — stopping this pulse")

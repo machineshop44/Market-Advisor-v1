@@ -173,6 +173,47 @@ def missing_basis_tickers(
     return need
 
 
+def day_trades_implied_by_ghosts(ghosts, orders) -> list[dict]:
+    """
+    A same-day equity round trip that filled while the order was still 'pending'.
+    E*TRADE market sells return pending, then the position vanishes. Count the day
+    trade only when a working SELL matches a ghost. Record the buy first when that
+    buy is also still marked pending (it never got a Filled status).
+    """
+    ghost_set = {_norm_ticker(t) for t in (ghosts or []) if _norm_ticker(t)}
+    by_ticker: dict[str, dict] = {}
+    for o in orders or []:
+        if not isinstance(o, dict):
+            continue
+        t = _norm_ticker(o.get("ticker"))
+        if t not in ghost_set:
+            continue
+        side = str(o.get("side") or "").upper()
+        if side not in ("BUY", "SELL"):
+            continue
+        row = by_ticker.setdefault(t, {"ticker": t, "record_buy": False, "order_ids": [], "qty": 0.0})
+        oid = str(o.get("order_id") or "")
+        if oid:
+            row["order_ids"].append(oid)
+        if side == "BUY":
+            row["record_buy"] = True
+        else:
+            try:
+                row["qty"] = float(o.get("qty") or row["qty"] or 0)
+            except (TypeError, ValueError):
+                pass
+    out = []
+    for row in by_ticker.values():
+        if not any(
+            str(o.get("side") or "").upper() == "SELL" and _norm_ticker(o.get("ticker")) == row["ticker"]
+            for o in (orders or [])
+            if isinstance(o, dict)
+        ):
+            continue
+        out.append(row)
+    return out
+
+
 def format_reconcile_summary(
     broker: str,
     *,

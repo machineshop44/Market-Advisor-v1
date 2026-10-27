@@ -63,3 +63,28 @@ def test_quality_rank_only_applies_when_enabled():
         finally:
             scoring.configure_entry_filters({"entry_quality_rank_enabled": False})
     assert boosted - base == pytest.approx(15.0)
+
+
+def test_pending_sell_ghost_implies_a_day_trade():
+    import blotter_reconcile as br
+    orders = [
+        {"broker": "E*TRADE", "order_id": "b1", "side": "BUY", "ticker": "OKLO", "qty": 1},
+        {"broker": "E*TRADE", "order_id": "s1", "side": "SELL", "ticker": "OKLO", "qty": 1},
+        {"broker": "E*TRADE", "order_id": "s2", "side": "SELL", "ticker": "AMC", "qty": 4},
+    ]
+    rows = br.day_trades_implied_by_ghosts(["OKLO", "AMC", "SOUN"], orders)
+    by = {r["ticker"]: r for r in rows}
+    assert by["OKLO"]["record_buy"] is True
+    assert "b1" in by["OKLO"]["order_ids"] and "s1" in by["OKLO"]["order_ids"]
+    assert by["AMC"]["record_buy"] is False
+    assert "SOUN" not in by
+
+
+def test_equity_only_broker_skips_crypto_before_propose():
+    import inspect
+    import gui
+    src = inspect.getsource(gui.MarketAdvisorGUI._bg_buy_batch)
+    assert "broker has no crypto" in src
+    assert "supports_crypto" in src
+    rec = inspect.getsource(gui.MarketAdvisorGUI._maybe_blotter_reconcile)
+    assert "book_is_live" in rec and "view_covers" in rec

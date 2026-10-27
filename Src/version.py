@@ -14,11 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.70"
+__version__ = "1.42.71"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "A cloud approve needs a second advisor on this portfolio before the buy"
+    "Count an etrade pending sell as a pdt day trade once the shares are gone, "
+    "and do not propose crypto on an equity-only broker"
 )
 
 
