@@ -67,3 +67,29 @@ def test_etrade_sell_skips_fractional_dust():
          mock.patch.object(ETradeAdapter, "_regular_session_required", return_value=(True, "")):
         st, oid = a.place_sell_order("PLUG", "stock", 2.0, 0.25, 0.1, False)
     assert st.startswith("Skipped: Dust") and oid is None
+
+
+def test_major_plays_keeps_a_win_and_the_daily_snapshot():
+    from activity_log_util import discord_alert_allowed
+    lvl = "Major Plays + Daily Snapshot"
+    assert discord_alert_allowed(lvl, message="🎉 BIG WIN SELL JOBY: +4.5%", is_trade=True, urgent=True)
+    assert discord_alert_allowed(lvl, prefix="[REPORTS]", message="Daily scoreboard")
+    assert discord_alert_allowed(lvl, prefix="[REAUTH]", message="E*TRADE needs reauthorization")
+    assert discord_alert_allowed(
+        lvl, prefix="[RISK]", message="MAX DAILY $-LOSS LIMIT HIT. DISARMING AUTO-TRADER",
+    )
+    assert not discord_alert_allowed(lvl, prefix="[HEARTBEAT]", message="Hourly Check-in")
+    assert not discord_alert_allowed(lvl, prefix="[ADVISOR]", message="AMC wait")
+    assert not discord_alert_allowed(lvl, is_trade=True, message="SELL AMC: filled")
+    assert not discord_alert_allowed(lvl, prefix="[DESK]", message="Auto-Trader ARMED")
+    assert discord_alert_allowed(
+        "Important Only (Critical Alerts & Hourly Heartbeat)",
+        prefix="[HEARTBEAT]",
+        message="Hourly Check-in",
+    )
+    assert not discord_alert_allowed(
+        "Important Only (Critical Alerts & Hourly Heartbeat)",
+        is_trade=True,
+        urgent=False,
+        message="SELL AMC: filled",
+    )

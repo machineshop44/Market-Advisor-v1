@@ -14,12 +14,11 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.71"
+__version__ = "1.42.72"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Count an etrade pending sell as a pdt day trade once the shares are gone, "
-    "and do not propose crypto on an equity-only broker"
+    "Discord can stay on major plays and one daily snapshot for the session"
 )
 
 

@@ -1109,6 +1109,7 @@ class FirstRunWizardDialog(QDialog):
         self.wiz_alert_combo.addItems([
             "All Alerts (Every Trade & Heartbeat)",
             "Important Only (Critical Alerts & Hourly Heartbeat)",
+            "Major Plays + Daily Snapshot",
             "Disabled Completely",
         ])
         saved_lvl = (getattr(parent, "settings", {}) or {}).get(
@@ -3750,6 +3751,18 @@ class MarketAdvisorGUI(QMainWindow):
         alert_lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         if alert_lvl == "Disabled Completely":
             return
+        try:
+            from activity_log_util import discord_alert_allowed
+            if not discord_alert_allowed(
+                alert_lvl,
+                is_trade=is_trade,
+                urgent=urgent,
+                prefix=prefix,
+                message=message,
+            ):
+                return
+        except Exception:
+            pass
         if (
             "REAUTH" in str(prefix or "").upper()
             and "ETRADE" in str(broker or "").upper().replace("*", "")
@@ -3764,14 +3777,6 @@ class MarketAdvisorGUI(QMainWindow):
                     return
             except Exception:
                 pass
-        # Important Only = critical/urgent + heartbeat; suppress routine trade spam
-        if (
-            is_trade
-            and not urgent
-            and "Important Only" in str(alert_lvl)
-        ):
-            return
-
         # Soft client-side rate limit — Discord 429 spam from Advisor/snag bursts
         try:
             now = time.time()
@@ -3978,6 +3983,12 @@ class MarketAdvisorGUI(QMainWindow):
     def _maybe_send_heartbeat(self, now_ts):
         if not any(self.auto_trade_enabled.values()):
             return
+        try:
+            from activity_log_util import discord_level_is_major_plays
+            if discord_level_is_major_plays(self.settings.get("discord_alert_level")):
+                return
+        except Exception:
+            pass
         if not self._heartbeat_is_due(now_ts):
             return
 
@@ -11479,11 +11490,14 @@ class MarketAdvisorGUI(QMainWindow):
         self.discord_lvl_combo.addItems([
             "All Alerts (Every Trade & Heartbeat)",
             "Important Only (Critical Alerts & Hourly Heartbeat)",
+            "Major Plays + Daily Snapshot",
             "Disabled Completely"
         ])
         self.discord_lvl_combo.setToolTip(
             "Important Only: critical alerts, big-win sells, day profit/loss limits, "
-            "and hourly heartbeat (routine trade fills are suppressed)."
+            "and hourly heartbeat (routine trade fills are suppressed). "
+            "Major Plays + Daily Snapshot: a big-win sell, reauth, a day-limit halt, "
+            "and the 4pm scoreboard. No hourly check-in."
         )
         saved_lvl = self.settings.get("discord_alert_level", "Important Only (Critical Alerts & Hourly Heartbeat)")
         index = self.discord_lvl_combo.findText(saved_lvl)
@@ -11517,7 +11531,7 @@ class MarketAdvisorGUI(QMainWindow):
         discord_outer.addLayout(hb_box)
 
         big_win_box = QHBoxLayout()
-        big_win_box.addWidget(QLabel("Big-win ROI % (Important Only):"))
+        big_win_box.addWidget(QLabel("Big-win ROI % (major-play alerts):"))
         self.discord_big_win_spin = QDoubleSpinBox()
         self.discord_big_win_spin.setRange(0.1, 100.0)
         self.discord_big_win_spin.setSingleStep(0.5)

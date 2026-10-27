@@ -469,6 +469,44 @@ _DISCORD_BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
 DISCORD_CONTENT_LIMIT = 2000
 
 
+MAJOR_PLAYS_LEVEL = "Major Plays + Daily Snapshot"
+
+
+def discord_level_is_major_plays(level) -> bool:
+    return "Major Plays" in str(level or "")
+
+
+def discord_alert_allowed(level, *, is_trade=False, urgent=False, prefix=None, message="") -> bool:
+    """Which Discord posts a notification level keeps.
+
+    Major Plays + Daily Snapshot keeps a big-win sell, the 4pm/weekly
+    scoreboard, a reauth, and a day-limit halt. Hourly heartbeats, advisor
+    chatter, arm/disarm, and routine fills stay in the log.
+    """
+    lvl = str(level or "")
+    if "Disabled Completely" in lvl:
+        return False
+    if discord_level_is_major_plays(lvl):
+        pfx = str(prefix or "").upper()
+        msg = str(message or "").upper()
+        if "HEARTBEAT" in pfx:
+            return False
+        if "REPORTS" in pfx:
+            return True
+        if "REAUTH" in pfx:
+            return True
+        if "BIG WIN" in msg:
+            return True
+        if "RISK" in pfx and any(
+            k in msg for k in ("LOSS LIMIT", "PROFIT TARGET", "DISARM")
+        ):
+            return True
+        return False
+    if is_trade and not urgent and "Important Only" in lvl:
+        return False
+    return True
+
+
 def discord_safe_content(text, limit=DISCORD_CONTENT_LIMIT):
     """Strip HTML error pages and cap to Discord's 2000-char content limit (else HTTP 400)."""
     s = str(text or "")
