@@ -19967,6 +19967,14 @@ class MarketAdvisorGUI(QMainWindow):
             asset_type = fund.get("asset_type") or (
                 "cryptocurrency" if fund.get("is_crypto") else "stock"
             )
+            if self._sell_fail_should_skip(broker_name, ft):
+                self._throttled_buy_skip_note(
+                    notes, broker_name, f"rotate_backoff_{ftu}",
+                    f"[{broker_name}] [ROTATE] Sell {ftu} backed off — "
+                    "last sell is still working or the broker rejected it",
+                    cooldown_sec=1800,
+                )
+                return False
             notes.append(
                 _auto_cycle.format_rotate_sell_note(
                     broker_name, ft, candidate_ticker,
@@ -19995,7 +20003,17 @@ class MarketAdvisorGUI(QMainWindow):
                 )
             finally:
                 self._pending_journal_meta = None
-            ok = "Fail" not in str(status) and "Skipped" not in str(status)
+            st = str(status or "")
+            working_sell = _auto_cycle.buy_order_is_working_unfilled(st)
+            if working_sell or _auto_cycle.sell_status_should_backoff(st):
+                self._record_sell_fail_backoff(broker_name, ft, st, notes)
+            if working_sell:
+                notes.append(
+                    f"[{broker_name}] [ROTATE] Sell {ftu} left working — "
+                    "cash stays put until that order fills"
+                )
+                return False
+            ok = "Fail" not in st and "Skipped" not in st
             fills.append({
                 "ticker": ft,
                 "status": status,

@@ -14,11 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.72"
+__version__ = "1.42.73"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Discord can stay on major plays and one daily snapshot for the session"
+    "Back off a rotate sell on a portfolio name when the broker says "
+    "not enough shares"
 )
 
 

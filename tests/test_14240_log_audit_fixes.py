@@ -94,6 +94,18 @@ def test_cb_hold_not_released_retries_quickly():
     assert alu.sell_fail_ttl_for_status(st) <= 5 * 60
 
 
+def test_not_enough_shares_parks_the_rotate_sell():
+    st = "Fail: {'detail': 'Not enough shares to sell.'}"
+    assert alu.sell_fail_ttl_for_status(st) >= 2 * 3600
+    pending = "Sell-All market after limit timeout Pending/queued (5)"
+    assert alu.sell_fail_ttl_for_status(pending) >= 20 * 60
+    import inspect
+    import gui
+    src = inspect.getsource(gui.MarketAdvisorGUI._bg_buy_batch)
+    assert "rotate_backoff_" in src
+    assert "left working" in src
+
+
 def test_rotate_would_trip_loss_guard():
     assert ac.rotate_would_trip_loss_guard(-0.0137, 2, 3)
     assert not ac.rotate_would_trip_loss_guard(-0.0137, 1, 3)

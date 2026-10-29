@@ -190,6 +190,12 @@ def sell_fail_ttl_for_status(status, *, default_ttl=1800) -> int:
     low = str(status or "").lower()
     if "hold not released" in low:
         return 2 * 60
+    # A working sell already reserved the shares (AMC 10/28: pending, then
+    # "not enough shares" every minute for ~21h).
+    if "not enough shares" in low:
+        return max(int(default_ttl or 1800), 2 * 3600)
+    if "pending/" in low or "left working" in low or "pending fill" in low:
+        return max(int(default_ttl or 1800), 20 * 60)
     if "empty response" in low or "returned empty" in low:
         # Exits must retry: BONK 9/27 slid −4%→−7% across 2h empty-response parks.
         return 15 * 60
