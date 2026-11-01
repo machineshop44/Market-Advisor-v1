@@ -5,6 +5,11 @@ alwaysApply: true
 
 # Publish & GitHub sync (Andrew)
 
+Source repos live on the Desktop (`C:\Users\machi\Desktop\<project>`), same as Market Advisor v1. GitHub is the remote copy. Google Drive keeps installers only.
+
+- Do not create, copy, or sync project source into `G:\My Drive\Python Scripts`. Andrew deleted that folder and `sync-projects-to-drive.ps1`.
+- Drive destinations that stay: `G:\My Drive\exe\` (Windows installers) and `G:\My Drive\apks\` (Android APKs).
+
 When shipping a coherent version bump or meaningful feature/fix batch on any Andrew project:
 
 ## Windows EXE / installer

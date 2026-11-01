@@ -71,14 +71,14 @@ Moving to another PC (home machine)
 The Desktop "Market Advisor.lnk" icon is THIS-PC only (it points at a fixed path).
 Do NOT rely on copying the .lnk file by itself.
 
-What IS portable (backed up on Google Drive):
-  G:\My Drive\Python Scripts\Market Advisor v1
-  including settings.json, Start Market Advisor.vbs, Create-Desktop-Shortcut.ps1
+What IS portable:
+  Installer: G:\My Drive\exe\MarketAdvisor-<ver>-x64.exe
+  Source: GitHub (machineshop44/Market-Advisor-v1), then put the folder on the Desktop
 
 At home:
-  1. Copy that whole folder from Google Drive to the PC
-  2. Run steps 1 and 3 above (Python + pip install)
-  3. From inside the copied folder, run:
+  1. Install the EXE from G:\My Drive\exe\, or clone the repo onto the Desktop
+  2. A cloned copy still needs Python + pip install (steps 1 and 3 above)
+  3. From inside the Desktop folder, run:
        powershell -ExecutionPolicy Bypass -File "Create-Desktop-Shortcut.ps1"
      That builds a NEW Desktop icon for that machine.
   4. Or just double-click Start Market Advisor.vbs in the folder
