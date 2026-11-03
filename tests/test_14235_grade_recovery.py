@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Src"))
 if ROOT not in sys.path:
@@ -69,11 +71,12 @@ class TestPdtEntryGuard(unittest.TestCase):
 
     def test_blocks_when_slots_exhausted(self):
         settings = {"pdt_guard_enabled": True, "pdt_max_day_trades": 3, "pdt_equity_threshold": 25000}
+        day = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
         for i in range(3):
             pdt._day_trades.append({
                 "broker": "Robinhood",
                 "ticker": f"T{i}",
-                "day": "2026-10-23",
+                "day": day,
                 "ts": 1.0,
             })
         ok, why = pdt.may_open_equity_buy(

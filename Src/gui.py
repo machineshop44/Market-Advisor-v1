@@ -3135,7 +3135,9 @@ class MarketAdvisorGUI(QMainWindow):
                 quote_price=price, fill_price=price, offset_pct=offset_pct,
                 **self._journal_kwargs(),
             )
-            self._attach_protective_stop(broker_name, ticker, asset_type, price, trade_dollars)
+            self._attach_protective_stop(
+                broker_name, ticker, asset_type, price, trade_dollars, settle_retry=True,
+            )
             try:
                 import pdt_guard as pdt
                 is_c = (
@@ -3259,7 +3261,9 @@ class MarketAdvisorGUI(QMainWindow):
             and "Filled" in str(status)
         )
         if filled_ok:
-            self._attach_protective_stop(broker_name, ticker, asset_type, price, spent)
+            self._attach_protective_stop(
+                broker_name, ticker, asset_type, price, spent, settle_retry=True,
+            )
             try:
                 import pdt_guard as pdt
                 is_c = "crypto" in str(asset_type or "").lower() or str(ticker).upper() in KNOWN_CRYPTOS
@@ -3655,7 +3659,7 @@ class MarketAdvisorGUI(QMainWindow):
                 if rem > 1e-6 and price and float(price) > 0:
                     self._attach_protective_stop(
                         broker_name, ticker, asset_type, float(price),
-                        float(rem) * float(price),
+                        float(rem) * float(price), settle_retry=True,
                     )
             except Exception:
                 pass
@@ -18276,8 +18280,12 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 pass
 
-    def _attach_protective_stop(self, broker_name, ticker, asset_type, price, spent):
-        """After a successful buy: broker stop if live; virtual stop in paper. Software TTP remains backup."""
+    def _attach_protective_stop(self, broker_name, ticker, asset_type, price, spent, *, settle_retry=False):
+        """After a successful buy: broker stop if live; virtual stop in paper. Software TTP remains backup.
+
+        settle_retry: the lot just filled. Robinhood often answers "not enough shares"
+        until the fill is sellable. Retry briefly, then leave a repair gap.
+        """
         if not bool(self.settings.get("attach_protective_stops", True)):
             return
         from scoring import (
@@ -18368,9 +18376,23 @@ class MarketAdvisorGUI(QMainWindow):
                 # spent/price ignores the CB fee taken in base — BCH 10/1 stop asked 0.05222
                 # vs 0.0521621 held → INSUFFICIENT_FUND, 30m unprotected until repair.
                 qty = self._coinbase_stop_qty(broker, ticker, qty)
-            ok, oid, msg = broker.place_protective_stop(
-                ticker, asset_type, qty, price, stop_pct, trail_pct=trail_pct,
-            )
+            attempts = 3 if settle_retry else 1
+            ok, oid, msg = False, None, ""
+            for i in range(attempts):
+                ok, oid, msg = broker.place_protective_stop(
+                    ticker, asset_type, qty, price, stop_pct, trail_pct=trail_pct,
+                )
+                msg_low = str(msg or "").lower()
+                if ok and oid:
+                    break
+                if (
+                    settle_retry
+                    and i < attempts - 1
+                    and ("not enough shares" in msg_low or "insufficient" in msg_low)
+                ):
+                    time.sleep(1.0)
+                    continue
+                break
             if ok and oid:
                 set_protective_order(broker_id, ticker, {
                     "order_id": oid,
@@ -18384,14 +18406,35 @@ class MarketAdvisorGUI(QMainWindow):
             else:
                 clear_protective_order(broker_id, ticker)
                 msg_s = str(msg or "")
-                # Position already gone / shares locked by in-flight sell — not a repairable gap
+                # "Not enough shares" right after a fill means the lot is not sellable yet
+                # (AMC 11/2: 5 whole shares, stop rejected, gap cleared, no retry for 107m).
+                # A gone position or a working sell still clears the gap so repair does not hammer.
                 if "not enough shares" in msg_s.lower() or "insufficient" in msg_s.lower():
-                    self._clear_protective_gap(broker_name, ticker)
-                    self._suppress_stop_repair(broker_name, ticker, sec=1800)
-                    self.log_event(
-                        f"[{broker_name}] Skip stop attach [{ticker}]: {msg_s} "
-                        f"(no shares — not a repair gap)"
-                    )
+                    held_qty = 0.0
+                    if not settle_retry:
+                        try:
+                            held = self._find_holding_for_stop_repair(broker_name, ticker)
+                            held_qty = float(held[0] or 0) if held else 0.0
+                        except Exception:
+                            held_qty = 0.0
+                    if settle_retry or held_qty >= 1.0:
+                        # Detail must not contain the broker phrase — _note_protective_gap
+                        # treats "not enough shares" as not repairable.
+                        self._note_protective_gap(
+                            broker_name, ticker, "fresh fill waiting on sellable shares",
+                        )
+                        self._suppress_stop_repair(broker_name, ticker, sec=120)
+                        self.log_event(
+                            f"[{broker_name}] Stop waiting on shares [{ticker}]: {msg_s} "
+                            f"(just filled — retry after settle)"
+                        )
+                    else:
+                        self._clear_protective_gap(broker_name, ticker)
+                        self._suppress_stop_repair(broker_name, ticker, sec=1800)
+                        self.log_event(
+                            f"[{broker_name}] Skip stop attach [{ticker}]: {msg_s} "
+                            f"(no shares — not a repair gap)"
+                        )
                 else:
                     self.log_event(
                         f"[{broker_name}] Could not attach broker stop [{ticker}]: {msg_s} — software TTP remains"

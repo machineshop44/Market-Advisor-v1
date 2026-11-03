@@ -30,8 +30,8 @@ class TestPdtGuard(unittest.TestCase):
     def test_blocks_fourth_day_trade_under_25k(self):
         pdt = self.pdt
         settings = {"pdt_guard_enabled": True, "pdt_max_day_trades": 3, "pdt_equity_threshold": 25000}
-        # A Saturday stamp is outside the business-day window, so pin a Friday.
-        ts = datetime(2026, 10, 23, 15, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+        # Stamp the round trips at now so they stay inside the rolling 5-business-day window.
+        ts = datetime.now(ZoneInfo("America/New_York")).timestamp()
         for i in range(3):
             t = f"T{i}"
             pdt.record_buy("E*TRADE", t, qty=1, ts=ts)
