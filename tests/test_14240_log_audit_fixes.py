@@ -104,6 +104,8 @@ def test_not_enough_shares_parks_the_rotate_sell():
     src = inspect.getsource(gui.MarketAdvisorGUI._bg_buy_batch)
     assert "rotate_backoff_" in src
     assert "left working" in src
+    assert "rotate_pdt_last_slot" in src
+    assert "last PDT slot" in src
 
 
 def test_rotate_would_trip_loss_guard():

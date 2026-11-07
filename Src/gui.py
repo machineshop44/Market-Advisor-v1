@@ -11306,7 +11306,8 @@ class MarketAdvisorGUI(QMainWindow):
             bool(self.settings.get("advisor_ai_local_when_clear", True))
         )
         self.advisor_ai_local_clear_chk.setToolTip(
-            "Obvious skips (weak score) and strong approves use local only — saves free quota."
+            "Obvious skips (weak score) and strong equity approves (≥90) on books ≥$500 "
+            "use local only — saves free quota. Crypto and small books still go to cloud."
         )
         ai_cloud_lay.addWidget(self.advisor_ai_local_clear_chk)
 
@@ -19913,6 +19914,33 @@ class MarketAdvisorGUI(QMainWindow):
                 return False
             if rotated_once or not opportunity_swap_enabled(posture):
                 return False
+            # Keep the last PDT day-trade slot for a hard stop / flatten, not a rotate.
+            if not candidate_is_crypto:
+                try:
+                    import pdt_guard as pdt
+
+                    try:
+                        eq_r, _, _ = self.get_effective_balances(
+                            broker_name, prefer_cache=True,
+                        )
+                    except Exception:
+                        eq_r = 0.0
+                    snap = pdt.snapshot(
+                        broker_name, equity=eq_r, settings=self.settings,
+                    )
+                    if snap.get("applies"):
+                        used = int(snap.get("day_trades") or 0)
+                        cap = int(snap.get("max") or 0)
+                        if cap > 0 and used >= cap - 1:
+                            self._throttled_buy_skip_note(
+                                notes, broker_name, "rotate_pdt_last_slot",
+                                f"[{broker_name}] [ROTATE] skipped — last PDT slot "
+                                f"reserved ({used}/{cap})",
+                                cooldown_sec=1800,
+                            )
+                            return False
+                except Exception:
+                    pass
             try:
                 need_d = float(need_dollars) if need_dollars is not None else None
             except (TypeError, ValueError):

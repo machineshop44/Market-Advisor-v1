@@ -591,3 +591,73 @@ def test_connection_reports_every_keyed_provider(monkeypatch):
     assert "1/2" in res["message"]
     assert "[OK] gemini" in res["message"]
     assert "[FAIL] openai" in res["message"]
+
+
+def _equity_clear_approve_prop():
+    return {
+        "ticker": "JOBY",
+        "broker": "E*TRADE",
+        "dollars": 21.0,
+        "price": 5.2,
+        "score": 108.0,
+        "engine": "PENNY",
+        "asset_type": "stock",
+    }
+
+
+def test_small_book_sends_clear_equity_approve_to_cloud(monkeypatch):
+    """Local ≥90 equity on a small book must not skip cloud (Oct–Nov scratches)."""
+    called = {"n": 0}
+
+    def gemini(*_a, **_k):
+        called["n"] += 1
+        return (
+            '{"verdict":"approve","brief":"Gemini likes the equity setup here",'
+            '"detail":"cloud"}'
+        )
+
+    monkeypatch.setattr(dai, "_call_gemini", gemini)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key": "fake-key",
+        "advisor_ai_local_when_clear": True,
+        "advisor_ai_second_opinion": False,
+    }
+    ctx = {
+        "buying_power": 100.0,
+        "equity": 180.0,
+        "small_book": True,
+        "posture": "growth",
+        "max_affordable_share_price": 90.0,
+    }
+    out = dai.analyze_proposal(_equity_clear_approve_prop(), ctx, settings)
+    assert called["n"] == 1
+    assert out["verdict"] == "approve"
+    assert "small book" in str(out.get("detail") or "").lower() or out["source"] == "gemini"
+
+
+def test_large_book_still_skips_cloud_on_clear_equity_approve(monkeypatch):
+    called = {"n": 0}
+
+    def boom(*_a, **_k):
+        called["n"] += 1
+        raise AssertionError("cloud should not be called on a large-book clear approve")
+
+    monkeypatch.setattr(dai, "_call_gemini", boom)
+    settings = {
+        "advisor_ai_source": "gemini",
+        "advisor_ai_api_key": "fake-key",
+        "advisor_ai_local_when_clear": True,
+    }
+    ctx = {
+        "buying_power": 2000.0,
+        "equity": 2500.0,
+        "small_book": False,
+        "posture": "balanced",
+        "max_affordable_share_price": 1800.0,
+    }
+    out = dai.analyze_proposal(_equity_clear_approve_prop(), ctx, settings)
+    assert called["n"] == 0
+    assert out["source"] == "local"
+    assert out["verdict"] == "approve"
+    assert "clear local approve" in str(out.get("detail") or "")

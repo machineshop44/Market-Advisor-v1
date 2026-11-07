@@ -14,11 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.74"
+__version__ = "1.42.75"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Retry the loss-stop when a fresh Robinhood fill is not yet sellable"
+    "On a small book, send local ≥90 equity through cloud and hold "
+    "the last PDT slot off rotate sells to cut loss scratches"
 )
 
 

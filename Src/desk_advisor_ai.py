@@ -1504,16 +1504,32 @@ def analyze_proposal(
             return local
         # Crypto never takes the shortcut: 65 local crypto approves (9/30–10/14) averaged
         # −0.01% at 4h with a ~1.1% best high — under RT fees. Let the cloud judge them.
+        # Small books (<$500) also skip the shortcut: Oct–Nov local ≥90 equity
+        # (AMC/OKLO/SOUN, ACHR) scratched after fees. Cloud + second opinion holds weaker ones.
         if (
             local.get("verdict") == VERDICT_APPROVE
             and score >= 90
             and not bool(proposal.get("regime_caution"))
             and not _is_crypto_proposal(proposal)
         ):
+            small = bool((context or {}).get("small_book"))
+            if not small:
+                try:
+                    from scoring import is_small_book
+
+                    small = is_small_book((context or {}).get("equity"))
+                except Exception:
+                    small = False
+            if not small:
+                local["detail"] = (
+                    str(local.get("detail") or "")
+                    + " · cloud skipped (clear local approve)"
+                ).strip(" ·")[:500]
+                return local
             local["detail"] = (
-                str(local.get("detail") or "") + " · cloud skipped (clear local approve)"
+                str(local.get("detail") or "")
+                + " · small book — cloud will judge ≥90 equity"
             ).strip(" ·")[:500]
-            return local
 
     research = build_research_pack(proposal, context)
     chain = cloud_provider_chain(settings)
