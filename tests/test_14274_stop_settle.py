@@ -79,7 +79,7 @@ def test_gone_position_still_clears_the_gap(monkeypatch):
     assert "Robinhood:AMC" not in s._protective_gaps
     until = s._stop_repair_suppress_until["Robinhood:AMC"]
     assert until - time.time() > 600
-    assert any("no shares" in line for line in s.logs)
+    assert any("no sellable whole shares" in line for line in s.logs)
 
 
 def test_held_whole_shares_stay_repairable(monkeypatch):
@@ -92,7 +92,39 @@ def test_held_whole_shares_stay_repairable(monkeypatch):
     )
     assert "Robinhood:AMC" in s._protective_gaps
     until = s._stop_repair_suppress_until["Robinhood:AMC"]
-    assert until - time.time() < 180
+    assert until - time.time() < 400
+    assert any("repair will retry" in line for line in s.logs)
+    assert not any("just filled" in line for line in s.logs)
+
+
+def test_dollar_frac_near_one_share_is_stop_na(monkeypatch):
+    """F 11/9: spent/price invented qty=1.0; live lot was fractional — stop N/A, no settle gap."""
+    _patch(monkeypatch)
+    fail = (False, None, "{'detail': 'Not enough shares to sell.'}")
+    broker = _Broker([fail])
+    broker._live_sellable_qty = lambda *_a, **_k: 0.9968
+    s = _desk(broker, holding=(1.0, 12.56, "stock"))
+    gui_mod.MarketAdvisorGUI._attach_protective_stop(
+        s, "Robinhood", "F", "stock", 12.56, 12.52, settle_retry=False,
+    )
+    assert broker.calls == 0  # live fractional short-circuits before place
+    assert "Robinhood:F" not in s._protective_gaps
+    assert any("Fractional qty" in line and "F" in line for line in s.logs)
+
+
+def test_day_old_repair_does_not_say_just_filled(monkeypatch):
+    _patch(monkeypatch)
+    fail = (False, None, "{'detail': 'Not enough shares to sell.'}")
+    broker = _Broker([fail])
+    broker._live_sellable_qty = lambda *_a, **_k: 1.0
+    s = _desk(broker, holding=(1.0, 12.56, "stock"))
+    # Force whole-share path: live says 1.0 but RH rejects (reserved/held).
+    gui_mod.MarketAdvisorGUI._attach_protective_stop(
+        s, "Robinhood", "F", "stock", 12.56, 12.56, settle_retry=False,
+    )
+    assert "Robinhood:F" in s._protective_gaps
+    assert any("repair will retry" in line for line in s.logs)
+    assert not any("just filled" in line for line in s.logs)
 
 
 def test_second_try_attaches_once_shares_release(monkeypatch):

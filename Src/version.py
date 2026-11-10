@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.75"
+__version__ = "1.42.76"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "On a small book, send local ≥90 equity through cloud and hold "
-    "the last PDT slot off rotate sells to cut loss scratches"
+    "Sell RH dollar-fractional lots from live available qty so near-1-share "
+    "fills like F stop inventing qty=1.0 and failing Not enough shares"
 )
 
 

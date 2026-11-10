@@ -1326,6 +1326,77 @@ class RobinhoodAdapter(BaseBroker):
             return f"RH {what} returned no detail"
         return s
 
+    def _rh_equity_qty_pair(self, ticker):
+        """
+        (total, available) for an RH equity lot from open positions.
+
+        build_holdings only exposes total quantity. Dollar-fractional fills near 1 share
+        (F Mon 11/9: ~$12.52 → spent/price invented qty=1.0) and shares held for sells
+        need available = quantity − held, or sells/stops ask for 1 and RH says not enough.
+        """
+        clean = str(ticker).replace("-USD", "").upper().strip()
+        if not clean:
+            return None, None
+        try:
+            positions = r.get_open_stock_positions() or []
+        except Exception:
+            try:
+                positions = r.account.get_open_stock_positions() or []
+            except Exception:
+                positions = []
+        iid = None
+        try:
+            from robin_stocks.robinhood.stocks import id_for_stock
+            iid = id_for_stock(clean)
+        except Exception:
+            iid = None
+        iid_s = str(iid or "")
+        for pos in positions or []:
+            if not isinstance(pos, dict):
+                continue
+            total = _rh_parse_qty(pos.get("quantity") or pos.get("shares"))
+            if total <= 0:
+                continue
+            inst = str(pos.get("instrument") or pos.get("instrument_url") or "")
+            match = bool(iid_s) and iid_s in inst
+            if not match and not iid_s:
+                # Last resort: resolve symbol (rare path when id_for_stock fails).
+                try:
+                    from robin_stocks.robinhood.helper import request_get
+                    info = request_get(inst, "regular") if inst else None
+                    sym = str((info or {}).get("symbol") or "").upper().strip()
+                    match = sym == clean
+                except Exception:
+                    match = False
+            if not match:
+                continue
+            held = 0.0
+            for key in (
+                "shares_held_for_sells",
+                "shares_held_for_buys",
+                "shares_held_for_options_collateral",
+                "shares_pending_from_options_events",
+            ):
+                held += _rh_parse_qty(pos.get(key))
+            avail = max(0.0, float(total) - float(held))
+            for key in ("shares_available_for_closes", "quantity_available"):
+                a = _rh_parse_qty(pos.get(key))
+                if a > 0:
+                    avail = min(avail, a) if avail > 0 else a
+            return float(total), float(avail)
+        # Fallback: build_holdings total only (available unknown).
+        try:
+            holdings = r.build_holdings()
+            if isinstance(holdings, dict):
+                data = holdings.get(clean) or holdings.get(ticker)
+                if isinstance(data, dict):
+                    qty = _rh_parse_qty(data.get("quantity"))
+                    if qty > 0:
+                        return float(qty), float(qty)
+        except Exception:
+            pass
+        return None, None
+
     def _live_sellable_qty(self, ticker, is_crypto):
         """Fresh broker position qty for full exits (avoids stale UI / truncated sells)."""
         clean = str(ticker).replace("-USD", "").upper()
@@ -1341,13 +1412,11 @@ class RobinhoodAdapter(BaseBroker):
                     if qty > 0:
                         return qty
                 return None
-            holdings = r.build_holdings()
-            if isinstance(holdings, dict):
-                data = holdings.get(clean) or holdings.get(ticker)
-                if isinstance(data, dict):
-                    qty = float(data.get("quantity", 0) or 0)
-                    if qty > 0:
-                        return qty
+            _total, avail = self._rh_equity_qty_pair(clean)
+            if avail is not None and avail > 0:
+                return float(avail)
+            if _total is not None and _total > 0:
+                return float(_total)
         except Exception:
             pass
         return None
@@ -1473,12 +1542,43 @@ class RobinhoodAdapter(BaseBroker):
                     return _peel_tag(f"{all_tag} market{suffix} {tag} ({qty_to_sell})"), oid
                 return None, res_m
 
+            def _not_enough(err) -> bool:
+                return "not enough shares" in str(err or "").lower()
+
+            def _retry_fractional_from_live(fail_detail):
+                """spent/price or rounded holdings can invent qty=1.0 on a sub-1 lot."""
+                live = self._live_sellable_qty(ticker, False)
+                if live is None or live <= 0:
+                    return None
+                if self._qty_is_whole_shares(live) and int(Decimal(str(live)).to_integral_value()) >= qty_to_sell:
+                    return None
+                if not allow_fractional:
+                    return (
+                        "Skipped: Overnight/late session — RH blocks fractional equity sells "
+                        "(OK again in extended ~7am ET or regular hours; after-hours "
+                        "fractionals end ~7:30pm ET).",
+                        None,
+                    )
+                # Fall through to fractional path below with corrected qty.
+                return ("__FRAC__", float(live), fail_detail)
+
+            force_frac = False
             if float(offset_pct or 0) <= 0:
                 try:
                     out, raw = _rh_market_sell()
                     if out:
                         return out
-                    return f"Fail: {raw}", None
+                    if _not_enough(raw):
+                        retry = _retry_fractional_from_live(raw)
+                        if retry and retry[0] == "__FRAC__":
+                            shares_val = retry[1]
+                            force_frac = True
+                        elif retry:
+                            return retry
+                        else:
+                            return f"Fail: {raw}", None
+                    else:
+                        return f"Fail: {raw}", None
                 except Exception as e:
                     if _is_instrument_miss(e):
                         return (
@@ -1486,76 +1586,109 @@ class RobinhoodAdapter(BaseBroker):
                             "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
                             None,
                         )
+                    if _not_enough(e):
+                        retry = _retry_fractional_from_live(e)
+                        if retry and retry[0] == "__FRAC__":
+                            shares_val = retry[1]
+                            force_frac = True
+                        elif retry:
+                            return retry
+                        else:
+                            return f"Fail: {e}", None
                     return f"Fail: {e}", None
 
-            limit_price = round(price * (1.0 - float(offset_pct)), 4 if price < 1.0 else 2)
-            try:
-                res = r.order_sell_limit(
-                    symbol=ticker, quantity=qty_to_sell, limitPrice=limit_price,
-                    timeInForce="gfd", extendedHours=use_ext_hours,
-                )
-                if isinstance(res, dict) and ("id" in res or "state" in res):
-                    oid = res.get("id")
-                    conf, state = self.confirm_order(
-                        oid, is_crypto=False, timeout_sec=45,
-                    ) if oid else (False, "unknown")
-                    if conf:
-                        return _peel_tag(f"{all_tag} Filled ({qty_to_sell})"), oid
-                    # Unfilled / timed out — cancel and market so disaster/exit rails don't stall
-                    if oid:
-                        try:
-                            self.cancel_order(oid, is_crypto=False)
-                        except Exception:
-                            pass
-                    try:
-                        out, raw = _rh_market_sell("after limit timeout")
-                        if out:
-                            return out
-                        return f"Fail: limit {state}; market {raw}", None
-                    except Exception as e2:
-                        if _is_instrument_miss(e2):
-                            return (
-                                f"Skipped: RH cannot trade {str(ticker).upper()} via API "
-                                "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
-                                None,
-                            )
-                        return f"Fail: limit {state}; market {e2}", None
-                # Limit rejected / empty — try market once (OTC leftovers sometimes need it)
+            if not force_frac:
+                limit_price = round(price * (1.0 - float(offset_pct)), 4 if price < 1.0 else 2)
                 try:
-                    out, raw = _rh_market_sell()
-                    if out:
-                        return out
-                    return f"Fail: {raw or res}", None
-                except Exception as e2:
-                    if _is_instrument_miss(e2):
+                    res = r.order_sell_limit(
+                        symbol=ticker, quantity=qty_to_sell, limitPrice=limit_price,
+                        timeInForce="gfd", extendedHours=use_ext_hours,
+                    )
+                    if isinstance(res, dict) and ("id" in res or "state" in res):
+                        oid = res.get("id")
+                        conf, state = self.confirm_order(
+                            oid, is_crypto=False, timeout_sec=45,
+                        ) if oid else (False, "unknown")
+                        if conf:
+                            return _peel_tag(f"{all_tag} Filled ({qty_to_sell})"), oid
+                        # Unfilled / timed out — cancel and market so disaster/exit rails don't stall
+                        if oid:
+                            try:
+                                self.cancel_order(oid, is_crypto=False)
+                            except Exception:
+                                pass
+                        try:
+                            out, raw = _rh_market_sell("after limit timeout")
+                            if out:
+                                return out
+                            if _not_enough(raw):
+                                retry = _retry_fractional_from_live(raw)
+                                if retry and retry[0] == "__FRAC__":
+                                    shares_val = retry[1]
+                                    force_frac = True
+                                elif retry:
+                                    return retry
+                                else:
+                                    return f"Fail: limit {state}; market {raw}", None
+                            return f"Fail: limit {state}; market {raw}", None
+                        except Exception as e2:
+                            if _is_instrument_miss(e2):
+                                return (
+                                    f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                                    "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                                    None,
+                                )
+                            return f"Fail: limit {state}; market {e2}", None
+                    # Limit rejected / empty — try market once (OTC leftovers sometimes need it)
+                    if not force_frac:
+                        try:
+                            out, raw = _rh_market_sell()
+                            if out:
+                                return out
+                            if _not_enough(raw):
+                                retry = _retry_fractional_from_live(raw)
+                                if retry and retry[0] == "__FRAC__":
+                                    shares_val = retry[1]
+                                    force_frac = True
+                                elif retry:
+                                    return retry
+                            if not force_frac:
+                                return f"Fail: {raw or res}", None
+                        except Exception as e2:
+                            if _is_instrument_miss(e2):
+                                return (
+                                    f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                                    "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                                    None,
+                                )
+                            return f"Fail: {e2}", None
+                except Exception as e:
+                    err = str(e)
+                    if _is_instrument_miss(err):
+                        # Market fallback before giving up
+                        try:
+                            out, raw = _rh_market_sell()
+                            if out:
+                                return out
+                        except Exception as e2:
+                            if _is_instrument_miss(e2) or _is_instrument_miss(err):
+                                return (
+                                    f"Skipped: RH cannot trade {str(ticker).upper()} via API "
+                                    "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
+                                    None,
+                                )
+                            return f"Fail: {e2}", None
                         return (
                             f"Skipped: RH cannot trade {str(ticker).upper()} via API "
                             "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
                             None,
                         )
-                    return f"Fail: {e2}", None
-            except Exception as e:
-                err = str(e)
-                if _is_instrument_miss(err):
-                    # Market fallback before giving up
-                    try:
-                        out, raw = _rh_market_sell()
-                        if out:
-                            return out
-                    except Exception as e2:
-                        if _is_instrument_miss(e2) or _is_instrument_miss(err):
-                            return (
-                                f"Skipped: RH cannot trade {str(ticker).upper()} via API "
-                                "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
-                                None,
-                            )
-                        return f"Fail: {e2}", None
-                    return (
-                        f"Skipped: RH cannot trade {str(ticker).upper()} via API "
-                        "(OTC/delisted). Sell in the Robinhood app if the position still shows.",
-                        None,
-                    )
-                return f"Fail: {e}", None
+                    return f"Fail: {e}", None
+
+            if force_frac:
+                pass  # fall through to fractional path with corrected shares_val
+            elif self._qty_is_whole_shares(shares_val):
+                return f"Fail: whole-share sell exhausted", None
 
         # Fractional remainder / mixed integer+fractional / sub-1 share — sell exact qty
         if (shares_val * price) < 1.00:

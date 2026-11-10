@@ -18348,6 +18348,16 @@ class MarketAdvisorGUI(QMainWindow):
                     f"[{broker_name}] Skip broker stop [{ticker}]: crypto — software TTP only"
                 )
                 return
+            # Prefer live available qty over spent/price. Dollar-fractional fills near $1/share
+            # invent qty=1.0 (F 11/9) and RH rejects the whole-share stop forever.
+            if broker_name == "Robinhood" and hasattr(broker, "_live_sellable_qty"):
+                try:
+                    live_q = broker._live_sellable_qty(ticker, False)
+                except Exception:
+                    live_q = None
+                if live_q is not None and float(live_q) > 0:
+                    qty = float(live_q)
+                    spent = qty * float(price)
             # RH rejects stops on fractional qty — mark N/A once, never treat as retryable gap
             # Coinbase crypto can use fractional base size; E*TRADE floors to whole shares.
             if broker_name not in ("Coinbase", "E*TRADE"):
@@ -18391,6 +18401,35 @@ class MarketAdvisorGUI(QMainWindow):
                     and i < attempts - 1
                     and ("not enough shares" in msg_low or "insufficient" in msg_low)
                 ):
+                    # Re-read live qty between settle retries — lot may appear as fractional.
+                    if broker_name == "Robinhood" and hasattr(broker, "_live_sellable_qty"):
+                        try:
+                            live_q = broker._live_sellable_qty(ticker, False)
+                        except Exception:
+                            live_q = None
+                        if live_q is not None and float(live_q) > 0:
+                            try:
+                                from scoring import _qty_is_whole_shares
+                                if not _qty_is_whole_shares(float(live_q)):
+                                    qty = float(live_q)
+                                    na_key = f"{broker_name}:{str(ticker).upper()}"
+                                    logged = getattr(self, "_frac_stop_na_logged", None)
+                                    if logged is None:
+                                        self._frac_stop_na_logged = set()
+                                        logged = self._frac_stop_na_logged
+                                    if na_key not in logged:
+                                        logged.add(na_key)
+                                        self.log_event(
+                                            f"[{broker_name}] Fractional qty {qty:.4f} [{ticker}] — "
+                                            f"broker stop N/A, TTP only (will not retry attach)"
+                                        )
+                                    gaps = getattr(self, "_protective_gaps", None)
+                                    if gaps is not None:
+                                        gaps.pop(na_key, None)
+                                    return
+                                qty = float(live_q)
+                            except Exception:
+                                pass
                     time.sleep(1.0)
                     continue
                 break
@@ -18410,15 +18449,45 @@ class MarketAdvisorGUI(QMainWindow):
                 # "Not enough shares" right after a fill means the lot is not sellable yet
                 # (AMC 11/2: 5 whole shares, stop rejected, gap cleared, no retry for 107m).
                 # A gone position or a working sell still clears the gap so repair does not hammer.
+                # Repair (settle_retry=False) must NOT keep a "just filled" gap forever when
+                # snapshot qty looks like 1.0 on a fractional lot (F 11/9–11/10).
                 if "not enough shares" in msg_s.lower() or "insufficient" in msg_s.lower():
-                    held_qty = 0.0
-                    if not settle_retry:
+                    live_qty = None
+                    if broker_name == "Robinhood" and hasattr(broker, "_live_sellable_qty"):
+                        try:
+                            live_qty = broker._live_sellable_qty(ticker, False)
+                        except Exception:
+                            live_qty = None
+                    if live_qty is None and not settle_retry:
                         try:
                             held = self._find_holding_for_stop_repair(broker_name, ticker)
-                            held_qty = float(held[0] or 0) if held else 0.0
+                            live_qty = float(held[0] or 0) if held else 0.0
                         except Exception:
-                            held_qty = 0.0
-                    if settle_retry or held_qty >= 1.0:
+                            live_qty = 0.0
+                    try:
+                        from scoring import _qty_is_whole_shares
+                        live_whole = (
+                            live_qty is not None
+                            and float(live_qty) > 0
+                            and _qty_is_whole_shares(float(live_qty))
+                        )
+                    except Exception:
+                        live_whole = bool(live_qty and float(live_qty) >= 1.0)
+                    if live_qty is not None and float(live_qty) > 0 and not live_whole:
+                        # Invented whole qty from spent/price on a fractional lot (F 11/9).
+                        na_key = f"{broker_name}:{str(ticker).upper()}"
+                        logged = getattr(self, "_frac_stop_na_logged", None)
+                        if logged is None:
+                            self._frac_stop_na_logged = set()
+                            logged = self._frac_stop_na_logged
+                        if na_key not in logged:
+                            logged.add(na_key)
+                            self.log_event(
+                                f"[{broker_name}] Fractional qty {float(live_qty):.4f} [{ticker}] — "
+                                f"broker stop N/A, TTP only (will not retry attach)"
+                            )
+                        self._clear_protective_gap(broker_name, ticker)
+                    elif settle_retry:
                         # Detail must not contain the broker phrase — _note_protective_gap
                         # treats "not enough shares" as not repairable.
                         self._note_protective_gap(
@@ -18429,12 +18498,23 @@ class MarketAdvisorGUI(QMainWindow):
                             f"[{broker_name}] Stop waiting on shares [{ticker}]: {msg_s} "
                             f"(just filled — retry after settle)"
                         )
+                    elif live_whole:
+                        # True whole-share lot still settling — keep repairable, no "just filled".
+                        self._note_protective_gap(
+                            broker_name, ticker, "shares not sellable yet",
+                        )
+                        self._suppress_stop_repair(broker_name, ticker, sec=300)
+                        self.log_event(
+                            f"[{broker_name}] Stop waiting on shares [{ticker}]: {msg_s} "
+                            f"(repair will retry)"
+                        )
                     else:
+                        # Gone / zero available — clear gap, long suppress — TTP covers.
                         self._clear_protective_gap(broker_name, ticker)
                         self._suppress_stop_repair(broker_name, ticker, sec=1800)
                         self.log_event(
                             f"[{broker_name}] Skip stop attach [{ticker}]: {msg_s} "
-                            f"(no shares — not a repair gap)"
+                            f"(no sellable whole shares — not a repair gap)"
                         )
                 else:
                     self.log_event(
