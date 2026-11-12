@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.76"
+__version__ = "1.42.77"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Sell RH dollar-fractional lots from live available qty so near-1-share "
-    "fills like F stop inventing qty=1.0 and failing Not enough shares"
+    "When RH prints qty=1.0 but rejects the sell, peel under 1 share and "
+    "stop retrying a broker stop on that near-1 invented lot"
 )
 
 

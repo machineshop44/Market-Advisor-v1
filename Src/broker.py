@@ -1546,11 +1546,32 @@ class RobinhoodAdapter(BaseBroker):
                 return "not enough shares" in str(err or "").lower()
 
             def _retry_fractional_from_live(fail_detail):
-                """spent/price or rounded holdings can invent qty=1.0 on a sub-1 lot."""
+                """
+                RH often prints quantity as 1.0000 on a dollar-fractional lot (F 11/9–11/11)
+                then rejects order_sell_market(1) with not enough shares. Peel under the
+                integer (or use a sub-1 live qty) and retry fractional.
+                """
                 live = self._live_sellable_qty(ticker, False)
-                if live is None or live <= 0:
-                    return None
-                if self._qty_is_whole_shares(live) and int(Decimal(str(live)).to_integral_value()) >= qty_to_sell:
+                peel = None
+                if live is not None and float(live) > 0 and not self._qty_is_whole_shares(live):
+                    peel = float(live)
+                else:
+                    # Live looks whole (or missing) but int sell just failed — haircut 1e-6.
+                    raw = None
+                    try:
+                        _tot, _av = self._rh_equity_qty_pair(ticker)
+                        raw = _av if (_av is not None and _av > 0) else _tot
+                    except Exception:
+                        raw = live
+                    if raw is not None and float(raw) > 0:
+                        d = Decimal(str(raw)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+                        if d >= Decimal(str(qty_to_sell)):
+                            d = Decimal(str(qty_to_sell)) - Decimal("0.000001")
+                        peel = float(d) if d > 0 else None
+                    if peel is None or peel <= 0:
+                        d = Decimal(str(qty_to_sell)) - Decimal("0.000001")
+                        peel = float(d) if d > 0 else None
+                if peel is None or peel <= 0:
                     return None
                 if not allow_fractional:
                     return (
@@ -1559,8 +1580,7 @@ class RobinhoodAdapter(BaseBroker):
                         "fractionals end ~7:30pm ET).",
                         None,
                     )
-                # Fall through to fractional path below with corrected qty.
-                return ("__FRAC__", float(live), fail_detail)
+                return ("__FRAC__", float(peel), fail_detail)
 
             force_frac = False
             if float(offset_pct or 0) <= 0:

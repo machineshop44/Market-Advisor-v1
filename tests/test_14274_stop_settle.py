@@ -118,13 +118,26 @@ def test_day_old_repair_does_not_say_just_filled(monkeypatch):
     broker = _Broker([fail])
     broker._live_sellable_qty = lambda *_a, **_k: 1.0
     s = _desk(broker, holding=(1.0, 12.56, "stock"))
-    # Force whole-share path: live says 1.0 but RH rejects (reserved/held).
+    # Near-1 invented whole share that RH rejects → stop N/A, not endless repair.
     gui_mod.MarketAdvisorGUI._attach_protective_stop(
         s, "Robinhood", "F", "stock", 12.56, 12.56, settle_retry=False,
     )
-    assert "Robinhood:F" in s._protective_gaps
-    assert any("repair will retry" in line for line in s.logs)
+    assert "Robinhood:F" not in s._protective_gaps
+    assert any("N/A after not-enough" in line or "Fractional/near-1" in line for line in s.logs)
     assert not any("just filled" in line for line in s.logs)
+
+
+def test_multi_share_not_enough_still_repairs(monkeypatch):
+    _patch(monkeypatch)
+    fail = (False, None, "{'detail': 'Not enough shares to sell.'}")
+    broker = _Broker([fail])
+    broker._live_sellable_qty = lambda *_a, **_k: 5.0
+    s = _desk(broker, holding=(5.0, 3.19, "stock"))
+    gui_mod.MarketAdvisorGUI._attach_protective_stop(
+        s, "Robinhood", "AMC", "stock", 3.19, 15.95, settle_retry=False,
+    )
+    assert "Robinhood:AMC" in s._protective_gaps
+    assert any("repair will retry" in line for line in s.logs)
 
 
 def test_second_try_attaches_once_shares_release(monkeypatch):

@@ -18498,8 +18498,8 @@ class MarketAdvisorGUI(QMainWindow):
                             f"[{broker_name}] Stop waiting on shares [{ticker}]: {msg_s} "
                             f"(just filled — retry after settle)"
                         )
-                    elif live_whole:
-                        # True whole-share lot still settling — keep repairable, no "just filled".
+                    elif live_whole and float(live_qty or qty or 0) >= 2.0:
+                        # Multi-share lot still settling — keep repairable, no "just filled".
                         self._note_protective_gap(
                             broker_name, ticker, "shares not sellable yet",
                         )
@@ -18508,6 +18508,22 @@ class MarketAdvisorGUI(QMainWindow):
                             f"[{broker_name}] Stop waiting on shares [{ticker}]: {msg_s} "
                             f"(repair will retry)"
                         )
+                    elif live_whole:
+                        # qty≈1.0 that RH rejects is almost always an invented whole share on a
+                        # dollar-fractional lot (F 11/11 on 1.42.76). Broker stop N/A — TTP only.
+                        na_key = f"{broker_name}:{str(ticker).upper()}"
+                        logged = getattr(self, "_frac_stop_na_logged", None)
+                        if logged is None:
+                            self._frac_stop_na_logged = set()
+                            logged = self._frac_stop_na_logged
+                        if na_key not in logged:
+                            logged.add(na_key)
+                            self.log_event(
+                                f"[{broker_name}] Fractional/near-1 qty {float(live_qty or qty):.4f} "
+                                f"[{ticker}] — broker stop N/A after not-enough, TTP only"
+                            )
+                        self._clear_protective_gap(broker_name, ticker)
+                        self._suppress_stop_repair(broker_name, ticker, sec=3600)
                     else:
                         # Gone / zero available — clear gap, long suppress — TTP covers.
                         self._clear_protective_gap(broker_name, ticker)
