@@ -1495,8 +1495,13 @@ def analyze_proposal(
         ).strip(" ·")[:500]
         return local
 
+    # News-catalyst mega lane always needs cloud + live research (NVDA-class dumps).
+    news_cat = bool(proposal.get("news_catalyst")) or str(
+        proposal.get("engine") or ""
+    ).upper() == "NEWS_CATALYST" or str(proposal.get("reason") or "") == "news_catalyst"
+
     # Clear local cases skip the cloud call (saves free-tier quota)
-    if bool((settings or {}).get("advisor_ai_local_when_clear", True)):
+    if bool((settings or {}).get("advisor_ai_local_when_clear", True)) and not news_cat:
         if local.get("verdict") == VERDICT_SKIP and score < 55:
             local["detail"] = (
                 str(local.get("detail") or "") + " · cloud skipped (clear local skip)"

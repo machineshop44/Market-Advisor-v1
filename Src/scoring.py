@@ -4172,10 +4172,12 @@ def buy_candidate_affordable(
     settings=None,
     scale_in=False,
     prefer_whole_shares=False,
+    allow_fractional=False,
 ) -> tuple[bool, str]:
     """
     Pre-rank gate: skip promoting names the book cannot fund at min ticket / whole share.
     Lightweight vs full risk_sizing_breakdown — avoids ranking ETH(70) when BP is $4.
+    allow_fractional=True (news_catalyst lane): min ticket only — skip whole-share gate.
     """
     settings = settings or {}
     try:
@@ -4203,6 +4205,7 @@ def buy_candidate_affordable(
         not is_crypto
         and not scale_in
         and prefer_whole_shares
+        and not allow_fractional
         and px > 0
         and int(deployable / px) < 1
     ):

@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.77"
+__version__ = "1.42.78"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "When RH prints qty=1.0 but rejects the sell, peel under 1 share and "
-    "stop retrying a broker stop on that near-1 invented lot"
+    "News catalyst mega dumps (CEO/scandal) → cloud advisor first, "
+    "RH fractional only for that tagged ticket"
 )
 
 

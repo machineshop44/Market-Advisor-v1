@@ -275,6 +275,8 @@ def load_settings():
         "news_shadow_tag": True,
         "news_radar_enabled": True,
         "news_radar_max": 5,
+        "news_catalyst_advisor_enabled": True,
+        "news_catalyst_max_per_day": 2,
         "advisor_working_repropose_sec": 1800,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
@@ -14235,6 +14237,10 @@ class MarketAdvisorGUI(QMainWindow):
             "_advisor_dollars": need,
             "_restore_cycle_broker": prior_cycle,
             "_advisor_force_broker": broker,
+            "news_catalyst": bool(prop.get("news_catalyst"))
+            or str(prop.get("engine") or "").upper() == "NEWS_CATALYST",
+            "allow_fractional": bool(prop.get("allow_fractional"))
+            or bool(prop.get("news_catalyst")),
         }
         self.set_working_state(True, f"Advisor BUY {prop.get('ticker')}…")
         try:
@@ -20510,13 +20516,23 @@ class MarketAdvisorGUI(QMainWindow):
             except (TypeError, ValueError):
                 micro_book = False
             if tu not in held and ((not is_crypto) or micro_book):
-                ok_fe, why_fe = new_entry_clears_fees_ok(
-                    broker_id, ticker, cand_score,
-                    is_crypto=is_crypto,
-                    asset_type=asset_type or ("cryptocurrency" if is_crypto else "stock"),
-                    equity=equity,
-                    settings=self.settings,
+                # Advisor already judged news_catalyst mega dumps (score≠breakout edge).
+                catalyst_approved = bool(
+                    c.get("_advisor_approved")
+                    and (
+                        c.get("news_catalyst")
+                        or str(c.get("engine") or "").upper() == "NEWS_CATALYST"
+                    )
                 )
+                ok_fe, why_fe = (True, "")
+                if not catalyst_approved:
+                    ok_fe, why_fe = new_entry_clears_fees_ok(
+                        broker_id, ticker, cand_score,
+                        is_crypto=is_crypto,
+                        asset_type=asset_type or ("cryptocurrency" if is_crypto else "stock"),
+                        equity=equity,
+                        settings=self.settings,
+                    )
                 if not ok_fe:
                     self._throttled_buy_skip_note(
                         notes, broker_name, f"fee_{tu}",
@@ -20646,7 +20662,13 @@ class MarketAdvisorGUI(QMainWindow):
                             )
                     except Exception:
                         pass
-                # Fractional risk policy (RH equity): prefer whole shares for broker stops
+                # Fractional risk policy (RH equity): prefer whole shares for broker stops.
+                # news_catalyst mega lane explicitly allows RH fractional (stops N/A / TTP).
+                news_cat = bool(
+                    c.get("news_catalyst")
+                    or c.get("allow_fractional")
+                    or str(c.get("engine") or "").upper() == "NEWS_CATALYST"
+                )
                 if (
                     broker_name == "Robinhood"
                     and (not is_crypto)
@@ -20658,8 +20680,12 @@ class MarketAdvisorGUI(QMainWindow):
                         pol = _an.apply_fractional_share_policy(
                             row_dollars,
                             price,
-                            prefer_whole_shares=bool(
-                                self.settings.get("prefer_whole_shares_for_stops", True)
+                            prefer_whole_shares=(
+                                False
+                                if news_cat
+                                else bool(
+                                    self.settings.get("prefer_whole_shares_for_stops", True)
+                                )
                             ),
                             allow_fractional_ttp_only=bool(
                                 self.settings.get("allow_fractional_ttp_only", True)
@@ -20966,6 +20992,12 @@ class MarketAdvisorGUI(QMainWindow):
                         reason="scale_in" if scale_in else "entry",
                         regime_caution=bool(c.get("regime_caution")),
                         overnight=c.get("overnight"),
+                        news_catalyst=bool(c.get("news_catalyst")),
+                        allow_fractional=bool(
+                            c.get("news_catalyst") or c.get("allow_fractional")
+                        ),
+                        catalyst_tag=str(c.get("catalyst_tag") or ""),
+                        catalyst_title=str(c.get("catalyst_title") or ""),
                     )
                     if prop:
                         is_refresh = bool(prop.get("_refreshed"))
@@ -22347,6 +22379,11 @@ class MarketAdvisorGUI(QMainWindow):
         else:
             self.set_working_state(False)
             self.cycle_finished()
+        # After breakouts: advisor-first mega news catalysts (NVDA-class), not CORE unpark.
+        try:
+            QTimer.singleShot(0, self._maybe_propose_news_catalysts)
+        except Exception:
+            pass
 
     def run_core_cycle(self):
         broker = self.cycle_broker_name
@@ -22455,6 +22492,212 @@ class MarketAdvisorGUI(QMainWindow):
                 cooldown_sec=3600,
             )
         return syms
+
+    def _news_catalyst_day_key(self) -> str:
+        try:
+            return self._now_et().strftime("%Y-%m-%d")
+        except Exception:
+            return time.strftime("%Y-%m-%d")
+
+    def _news_catalyst_day_count(self) -> int:
+        key = self._news_catalyst_day_key()
+        store = getattr(self, "_news_catalyst_day", None)
+        if not isinstance(store, dict) or store.get("day") != key:
+            return 0
+        try:
+            return int(store.get("n") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _news_catalyst_day_bump(self, n: int = 1) -> None:
+        key = self._news_catalyst_day_key()
+        store = getattr(self, "_news_catalyst_day", None)
+        if not isinstance(store, dict) or store.get("day") != key:
+            store = {"day": key, "n": 0}
+        store["n"] = int(store.get("n") or 0) + int(n or 0)
+        self._news_catalyst_day = store
+
+    def _maybe_propose_news_catalysts(self):
+        """
+        Advisor-first mega-cap news dumps (CEO exit / scandal). Does not unpark CORE.
+        RH fractional allowed for this ticket only after cloud advisor approve.
+        """
+        if not bool(self.settings.get("news_catalyst_advisor_enabled", True)):
+            return
+        if not bool(self.settings.get("advisor_ask_before_apply", True)):
+            return
+        broker_name = "Robinhood"
+        if not self._is_broker_auto_trading(broker_name):
+            return
+        try:
+            from scoring import is_small_book
+            equity, bp, _ = self.get_effective_balances(broker_name, prefer_cache=True)
+            if not is_small_book(equity):
+                return
+        except Exception:
+            return
+        try:
+            max_day = int(self.settings.get("news_catalyst_max_per_day", 2) or 2)
+        except (TypeError, ValueError):
+            max_day = 2
+        if self._news_catalyst_day_count() >= max_day:
+            return
+        # Throttle discovery+propose (discovery cache is 15m; don't hammer UI thread).
+        now = time.time()
+        last = float(getattr(self, "_news_catalyst_last_run", 0.0) or 0.0)
+        if now - last < 900:
+            return
+        self._news_catalyst_last_run = now
+
+        session = self.get_equity_session_info()
+        _flags = _auto_cycle.order_session_flags(broker_name, session)
+        if not bool(_flags.get("allow_fractional")):
+            self._throttled_log(
+                "news_catalyst:session",
+                "[NEWS CATALYST] Skip — RH session blocks fractional equity buys "
+                "(wait REGULAR / extended fractional window).",
+                cooldown_sec=3600,
+            )
+            return
+
+        try:
+            import news_guard as ng
+            rows = ng.discover_catalyst_megacaps(max_n=4)
+        except Exception as e:
+            self._throttled_log(
+                "news_catalyst:discover_err",
+                f"[NEWS CATALYST] Discovery error: {e}",
+                cooldown_sec=1800,
+            )
+            return
+        if not rows:
+            return
+
+        try:
+            from scoring import posture_knobs_for_broker, posture_for_broker
+            knobs = posture_knobs_for_broker(broker_name, self.settings)
+            max_positions = int(knobs.get("max_open_positions", 8) or 8)
+        except Exception:
+            max_positions = 4
+        try:
+            holdings = self.get_broker_holdings(broker_name) or []
+            held = {
+                str(a.get("ticker") or "").upper()
+                for a in holdings if a.get("ticker")
+            }
+            open_count = len(held)
+        except Exception:
+            held, open_count = set(), 0
+        if max_positions > 0 and open_count >= max_positions:
+            self._throttled_log(
+                "news_catalyst:full",
+                f"[NEWS CATALYST] Skip — book full at {max_positions} "
+                f"(free a slot / install F-sell fix).",
+                cooldown_sec=1800,
+            )
+            return
+
+        import advisor_queue as aq
+        broker = self.brokers.get(broker_name)
+        proposed = 0
+        for row in rows:
+            if self._news_catalyst_day_count() + proposed >= max_day:
+                break
+            sym = str((row or {}).get("symbol") or "").upper()
+            if not sym or sym in held:
+                continue
+            blocked, why_cd = aq.repropose_blocked(broker_name, sym)
+            if blocked:
+                continue
+            try:
+                px = float(broker.get_live_price(sym) if broker else 0) or 0.0
+            except Exception:
+                px = 0.0
+            if px <= 0:
+                continue
+            try:
+                from scoring import buy_candidate_affordable
+                ok_af, why_af = buy_candidate_affordable(
+                    buying_power=bp,
+                    price=px,
+                    is_crypto=False,
+                    broker_id="ROBINHOOD",
+                    equity=equity,
+                    settings=self.settings,
+                    prefer_whole_shares=True,
+                    allow_fractional=True,
+                )
+            except Exception:
+                ok_af, why_af = False, "afford check failed"
+            if not ok_af:
+                self._throttled_log(
+                    f"news_catalyst:unafford_{sym}",
+                    f"[NEWS CATALYST] Skip {sym} — {why_af}",
+                    cooldown_sec=1800,
+                )
+                continue
+            try:
+                dollars = float(
+                    self.calculate_order_sizing(
+                        bp, "stock", entry_price=px, equity=equity, open_count=open_count,
+                    ) or 0
+                )
+            except Exception:
+                dollars = 0.0
+            if dollars <= 0:
+                continue
+            tag = str((row or {}).get("tag") or "")
+            title = str((row or {}).get("title") or "")
+            prop = aq.propose(
+                broker=broker_name,
+                ticker=sym,
+                asset_type="stock",
+                price=px,
+                dollars=dollars,
+                score=95.0,
+                engine="NEWS_CATALYST",
+                reason="news_catalyst",
+                news_catalyst=True,
+                allow_fractional=True,
+                catalyst_tag=tag,
+                catalyst_title=title,
+            )
+            if not prop or prop.get("_refreshed"):
+                continue
+            proposed += 1
+            self._news_catalyst_day_bump(1)
+            self.log_event(
+                f"[NEWS CATALYST] Proposed {sym} ~${dollars:.2f} ({tag or 'catalyst'}) "
+                f"— {title[:80] or 'headline'} — cloud advisor must approve"
+            )
+            try:
+                aq.record_decision(
+                    proposal_id=str(prop.get("id") or ""),
+                    broker=broker_name,
+                    ticker=sym,
+                    verdict="",
+                    action="propose",
+                    source="news_catalyst",
+                    brief=f"News catalyst ({tag}): {title[:100]}",
+                    dollars=dollars,
+                    score=95.0,
+                    engine="NEWS_CATALYST",
+                    status="pending",
+                )
+            except Exception:
+                pass
+            pid = str(prop.get("id") or "").strip()
+            if pid:
+                try:
+                    self._schedule_advisor_ai_analysis(pid, broker_name)
+                except Exception as e:
+                    self.log_event(f"[Advisor AI] news catalyst schedule failed: {e}")
+        if proposed:
+            try:
+                self._refresh_advisor_card()
+                self.publish_monitor_status()
+            except Exception:
+                pass
 
     def _bg_scan_penny(self):
         finviz_syms, rh_syms, yahoo_syms = [], [], []

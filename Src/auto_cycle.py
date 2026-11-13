@@ -799,6 +799,11 @@ def filter_affordable_buy_candidates(
             settings=settings,
             scale_in=bool(c.get("scale_in")),
             prefer_whole_shares=prefer_whole_shares,
+            allow_fractional=bool(
+                c.get("news_catalyst")
+                or c.get("allow_fractional")
+                or c.get("allow_fractional_override")
+            ),
         )
         if ok:
             affordable.append(c)

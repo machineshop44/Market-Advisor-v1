@@ -1,10 +1,10 @@
 """
 Equity news: entry veto (headlines / earnings), shadow catalyst tag, and News Radar discovery.
 
-News never triggers a buy by itself: the desk's penny names (SMCI, AMC, ACHR, SNAP, NIO)
-gap on offerings / halts / going-concern headlines, and TV picks (Mad Money) revert after
-the open pop. Discovery only widens the Breakouts scan — names still pass scoring, fee,
-spread and PDT gates. Lookups fail open — an unreachable feed never blocks a buy.
+Breakouts radar only widens the micro scan — names still pass scoring, fee, spread and PDT.
+High-impact mega-cap dumps (CEO exit / scandal) are a separate advisor-first lane:
+discover_catalyst_megacaps() — never auto-buys; GUI proposes for cloud advisor approve.
+Lookups fail open — an unreachable feed never blocks a buy.
 """
 from __future__ import annotations
 
@@ -32,10 +32,38 @@ VETO_PATTERNS = (
 )
 _VETO_RE = [(re.compile(p, re.I), tag) for p, tag in VETO_PATTERNS]
 
+# Evaluate (advisor lane) — not the same as entry veto. CEO/scandal dumps can be buys.
+CATALYST_EVAL_PATTERNS = (
+    (
+        r"\b(ceo|chief executive)\b.{0,60}\b(resign|resigns|resigned|steps? down|stepping down|"
+        r"ousted|leaves?|leaving|exit|exits|fired)\b",
+        "ceo_exit",
+    ),
+    (
+        r"\b(resign|resigns|resigned|steps? down|stepping down|ousted)\b.{0,60}\b"
+        r"(ceo|chief executive)\b",
+        "ceo_exit",
+    ),
+    (r"\b(interim ceo|named? (?:an )?interim ceo|appoints? (?:a )?new ceo)\b", "ceo_change"),
+    (r"\b(scandal|affair|unfaithful|misconduct)\b", "scandal"),
+    (r"\b(plunges?|tumbles?|dives?|crashes?|sell-?off)\b.{0,40}\b(after|amid|on)\b", "headline_plunge"),
+)
+_CATALYST_EVAL_RE = [(re.compile(p, re.I), tag) for p, tag in CATALYST_EVAL_PATTERNS]
+
+# CORE mega names — parked on small books; catalyst lane may still propose RH fractional.
+MEGA_CAP_SYMBOLS = frozenset({
+    "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META", "AMZN", "GOOGL", "GOOG",
+    "NFLX", "AVGO", "ORCL", "CRM", "INTC", "QCOM", "MU", "AMAT", "COST", "JPM",
+})
+
 RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={sym}&region=US&lang=en-US"
 TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US?count=25"
 DISCOVERY_QUERIES = ("stocks to watch", "premarket movers", "stock market today")
+CATALYST_DISCOVERY_QUERIES = (
+    "CEO resigns", "CEO steps down", "stock plunges after", "stock market today",
+)
 CACHE_TTL_SEC = 30 * 60
+CATALYST_CACHE_TTL_SEC = 15 * 60
 _cache: dict[str, tuple[float, Optional[list[dict]]]] = {}
 _cache_lock = threading.Lock()
 
@@ -113,42 +141,145 @@ def merge_discovery(trending, related_lists, *, exclude=(), max_n: int = 8) -> l
 
 
 _discovery_cache: dict[str, Any] = {"at": 0.0, "syms": []}
+_catalyst_cache: dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def _yahoo_trending_and_related(
+    queries, *, timeout: float = 8.0, exclude=(), max_n: int = 24,
+) -> list[str]:
+    """Shared Yahoo trending + Search relatedTickers pool (fail → [])."""
+    import requests
+    import yfinance as yf
+
+    trending = []
+    try:
+        r = requests.get(TRENDING_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+        res = (r.json().get("finance") or {}).get("result") or []
+        trending = [q.get("symbol") for q in (res[0].get("quotes") if res else []) or []]
+    except Exception:
+        trending = []
+    related = []
+    for q in queries or ():
+        try:
+            for n in yf.Search(q, news_count=12).news or []:
+                related.append(n.get("relatedTickers") or [])
+        except Exception:
+            continue
+    return merge_discovery(trending, related, exclude=exclude, max_n=max_n)
 
 
 def discover_tickers(*, max_n: int = 8, timeout: float = 8.0, exclude=()) -> list[str]:
-    """News-driven names to add to the Breakouts scan (cached 30m; [] on failure)."""
+    """News-driven micro names to add to the Breakouts scan (cached 30m; [] on failure)."""
     now = time.time()
     if now - float(_discovery_cache["at"] or 0) < CACHE_TTL_SEC:
         return list(_discovery_cache["syms"])
 
-    def _lookup():
-        import requests
-        import yfinance as yf
-        trending = []
-        try:
-            r = requests.get(TRENDING_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
-            res = (r.json().get("finance") or {}).get("result") or []
-            trending = [q.get("symbol") for q in (res[0].get("quotes") if res else []) or []]
-        except Exception:
-            trending = []
-        related = []
-        for q in DISCOVERY_QUERIES:
-            try:
-                for n in yf.Search(q, news_count=12).news or []:
-                    related.append(n.get("relatedTickers") or [])
-            except Exception:
-                continue
-        return merge_discovery(trending, related, exclude=exclude, max_n=max_n * 3)
-
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        syms = ex.submit(_lookup).result(timeout=timeout * 3)
+        syms = ex.submit(
+            _yahoo_trending_and_related,
+            DISCOVERY_QUERIES,
+            timeout=timeout,
+            exclude=exclude,
+            max_n=max_n * 3,
+        ).result(timeout=timeout * 3)
     except Exception:
         syms = []
     finally:
         ex.shutdown(wait=False)
     _discovery_cache.update(at=now, syms=list(syms))
     return list(syms)
+
+
+def headline_catalyst_eval(
+    items, *, now: Optional[float] = None, hours: float = 48.0, aliases=None,
+) -> tuple[bool, str, str]:
+    """(matched, tag, title) for high-impact headlines the advisor lane may evaluate."""
+    now = float(now if now is not None else time.time())
+    for it in _recent(items, now, hours, aliases):
+        title = str(it.get("title") or "")
+        for rx, tag in _CATALYST_EVAL_RE:
+            if rx.search(title):
+                return True, tag, title[:120]
+    return False, "", ""
+
+
+def discover_catalyst_megacaps(
+    *,
+    max_n: int = 4,
+    timeout: float = 8.0,
+    exclude=(),
+    mega_symbols=None,
+    hours: float = 48.0,
+    now: Optional[float] = None,
+    fetch: Callable[..., Optional[list[dict]]] = None,
+    name_fn: Optional[Callable[[str], str]] = None,
+    pool: Optional[list[str]] = None,
+    use_cache: bool = True,
+) -> list[dict]:
+    """
+    Mega-cap names in the news pool with a fresh CEO/scandal/plunge headline.
+    Returns [{symbol, tag, title}, ...] — empty on failure. Does not auto-buy.
+    """
+    ts_now = float(now if now is not None else time.time())
+    if use_cache and pool is None and fetch is None:
+        if ts_now - float(_catalyst_cache["at"] or 0) < CATALYST_CACHE_TTL_SEC:
+            return [dict(r) for r in (_catalyst_cache.get("rows") or [])]
+
+    mega = frozenset(mega_symbols or MEGA_CAP_SYMBOLS)
+    fetch_fn = fetch or fetch_news
+    name_f = name_fn if name_fn is not None else company_name
+
+    if pool is not None:
+        candidates = [s for s in pool if _us_symbol(s) and _us_symbol(s) in mega]
+    else:
+        try:
+            raw_pool = _yahoo_trending_and_related(
+                tuple(DISCOVERY_QUERIES) + tuple(CATALYST_DISCOVERY_QUERIES),
+                timeout=timeout,
+                exclude=exclude,
+                max_n=max(24, max_n * 8),
+            )
+        except Exception:
+            raw_pool = []
+        # Prefer megas present in the pool; also keep any mega that trending returned.
+        candidates = []
+        for s in raw_pool:
+            u = _us_symbol(s)
+            if u and u in mega and u not in candidates:
+                candidates.append(u)
+
+    rows: list[dict] = []
+    skip = {str(x).upper() for x in exclude or ()}
+    for sym in candidates:
+        if sym in skip:
+            continue
+        try:
+            items = fetch_fn(sym)
+        except Exception:
+            items = None
+        if not items:
+            continue
+        try:
+            aliases = name_aliases(sym, name_f(sym) if name_f else "")
+        except Exception:
+            aliases = name_aliases(sym, "")
+        ok, tag, title = headline_catalyst_eval(
+            items, now=ts_now, hours=hours, aliases=aliases,
+        )
+        if not ok:
+            continue
+        # Dilution / halt / bankruptcy still never become catalyst buys.
+        veto, _why = headline_veto(items, now=ts_now, hours=hours, aliases=aliases)
+        if veto:
+            continue
+        rows.append({"symbol": sym, "tag": tag, "title": title})
+        if len(rows) >= max_n:
+            break
+
+    if use_cache and pool is None and fetch is None:
+        _catalyst_cache.update(at=ts_now, rows=[dict(r) for r in rows])
+    return rows
 
 
 _NAME_SUFFIX = re.compile(

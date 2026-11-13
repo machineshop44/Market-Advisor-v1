@@ -341,6 +341,10 @@ def propose(
     regime_caution: bool = False,
     honor_cooldown: bool = True,
     overnight: dict | None = None,
+    news_catalyst: bool = False,
+    allow_fractional: bool = False,
+    catalyst_tag: str = "",
+    catalyst_title: str = "",
 ) -> dict | None:
     """Create or refresh a pending proposal for broker+ticker.
 
@@ -374,6 +378,12 @@ def propose(
                     p["engine"] = str(engine or "")
                     p["reason"] = str(reason or "entry")
                     p["regime_caution"] = bool(regime_caution)
+                    p["news_catalyst"] = bool(news_catalyst) or bool(p.get("news_catalyst"))
+                    p["allow_fractional"] = bool(allow_fractional) or bool(p.get("allow_fractional"))
+                    if catalyst_tag:
+                        p["catalyst_tag"] = str(catalyst_tag)[:60]
+                    if catalyst_title:
+                        p["catalyst_title"] = str(catalyst_title)[:160]
                     if overnight:
                         p["overnight"] = dict(overnight)
                     else:
@@ -403,6 +413,8 @@ def propose(
             "engine": str(engine or ""),
             "reason": str(reason or "entry"),
             "regime_caution": bool(regime_caution),
+            "news_catalyst": bool(news_catalyst),
+            "allow_fractional": bool(allow_fractional),
             "status": "pending",
             "created_at": now,
             "updated_at": now,
@@ -413,6 +425,10 @@ def propose(
             "ai_source": "",
             "ai_at": 0.0,
         }
+        if catalyst_tag:
+            prop["catalyst_tag"] = str(catalyst_tag)[:60]
+        if catalyst_title:
+            prop["catalyst_title"] = str(catalyst_title)[:160]
         if overnight:
             prop["overnight"] = dict(overnight)
         proposals.append(prop)
