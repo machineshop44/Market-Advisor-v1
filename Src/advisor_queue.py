@@ -345,6 +345,11 @@ def propose(
     allow_fractional: bool = False,
     catalyst_tag: str = "",
     catalyst_title: str = "",
+    rotate_from: str = "",
+    funder_roi: float = 0.0,
+    swap_hurdle_ok: bool = False,
+    swap_edge_pct: float = 0.0,
+    swap_need_pct: float = 0.0,
 ) -> dict | None:
     """Create or refresh a pending proposal for broker+ticker.
 
@@ -384,6 +389,12 @@ def propose(
                         p["catalyst_tag"] = str(catalyst_tag)[:60]
                     if catalyst_title:
                         p["catalyst_title"] = str(catalyst_title)[:160]
+                    if rotate_from:
+                        p["rotate_from"] = str(rotate_from).upper()[:12]
+                        p["funder_roi"] = float(funder_roi or 0.0)
+                        p["swap_hurdle_ok"] = bool(swap_hurdle_ok)
+                        p["swap_edge_pct"] = float(swap_edge_pct or 0.0)
+                        p["swap_need_pct"] = float(swap_need_pct or 0.0)
                     if overnight:
                         p["overnight"] = dict(overnight)
                     else:
@@ -429,6 +440,12 @@ def propose(
             prop["catalyst_tag"] = str(catalyst_tag)[:60]
         if catalyst_title:
             prop["catalyst_title"] = str(catalyst_title)[:160]
+        if rotate_from:
+            prop["rotate_from"] = str(rotate_from).upper()[:12]
+            prop["funder_roi"] = float(funder_roi or 0.0)
+            prop["swap_hurdle_ok"] = bool(swap_hurdle_ok)
+            prop["swap_edge_pct"] = float(swap_edge_pct or 0.0)
+            prop["swap_need_pct"] = float(swap_need_pct or 0.0)
         if overnight:
             prop["overnight"] = dict(overnight)
         proposals.append(prop)

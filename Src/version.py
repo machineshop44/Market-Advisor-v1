@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.42.78"
+__version__ = "1.43.0"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "News catalyst mega dumps (CEO/scandal) → cloud advisor first, "
-    "RH fractional only for that tagged ticket"
+    "Full book proposes a swap only when the edge covers two round trips "
+    "plus the funder's open loss; dust does not hold the slot"
 )
 
 

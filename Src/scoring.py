@@ -3967,6 +3967,28 @@ def estimate_round_trip_fee_pct(broker_id, ticker=None, asset_type=""):
     return one * 2.0
 
 
+def swap_cost_covered(score_delta, funder_roi, round_trip_fee_pct, *, edge_per_pt=0.0012):
+    """
+    A recycle has to pay two round trips (sell the funder and buy the new name)
+    plus the funder's open loss. The single-name ~1.2% entry bar is not that cost.
+    Returns (ok, edge_pct, need_pct).
+    """
+    try:
+        edge = float(score_delta or 0.0) * float(edge_per_pt or 0.0)
+    except (TypeError, ValueError):
+        edge = 0.0
+    try:
+        loss = max(0.0, -float(funder_roi or 0.0))
+    except (TypeError, ValueError):
+        loss = 0.0
+    try:
+        two_rt = 2.0 * max(0.0, float(round_trip_fee_pct or 0.0))
+    except (TypeError, ValueError):
+        two_rt = 0.0
+    need = two_rt + loss
+    return (edge + 1e-12 >= need), edge, need
+
+
 def estimate_fee_dollars(notional, broker_id, ticker=None, asset_type="", *, round_trip=True):
     """Estimated fee $ for one-way or round-trip on notional."""
     try:
@@ -4242,6 +4264,9 @@ def pick_rotation_funding(
     skip_regime_check=False,
     need_dollars=None,
     current_bp=None,
+    require_swap_hurdle=True,
+    skip_tickers=None,
+    only_ticker=None,
 ):
     """
     Choose one held name to fully exit so we can fund candidate_ticker.
@@ -4276,6 +4301,9 @@ def pick_rotation_funding(
     cand = str(candidate_ticker or "").replace("-USD", "").upper()
     if not cand:
         return None
+    skip = {str(x or "").replace("-USD", "").upper() for x in (skip_tickers or ()) if x}
+    only = str(only_ticker or "").replace("-USD", "").upper()
+    hurdle_blocked = 0
     try:
         cand_score = float(candidate_score or 0.0)
     except (TypeError, ValueError):
@@ -4314,7 +4342,9 @@ def pick_rotation_funding(
         if not isinstance(h, dict):
             continue
         t = str(h.get("ticker") or "").replace("-USD", "").upper()
-        if not t or t == cand:
+        if not t or t == cand or t in skip:
+            continue
+        if only and t != only:
             continue
         is_c = bool(h.get("is_crypto")) or t in CRYPTO_TICKERS
         try:
@@ -4384,6 +4414,16 @@ def pick_rotation_funding(
         if edge_pct < recycle_fee + fee_buf:
             continue
 
+        hurdle_ok, _h_edge, _h_need = swap_cost_covered(
+            score_delta,
+            roi,
+            max(rt_fee, rt_cand),
+            edge_per_pt=edge_per_pt,
+        )
+        if require_swap_hurdle and not hurdle_ok:
+            hurdle_blocked += 1
+            continue
+
         net_edge_pct = edge_pct - recycle_fee
         same_sleeve = (bool(candidate_is_crypto) == bool(is_c))
         clears_shortfall = True if shortfall <= 0 else (val + 1e-9 >= shortfall)
@@ -4402,6 +4442,9 @@ def pick_rotation_funding(
             "edge_pct": edge_pct,
             "net_edge_pct": net_edge_pct,
             "recycle_fee_pct": recycle_fee,
+            "swap_hurdle_ok": bool(hurdle_ok),
+            "swap_edge_pct": float(_h_edge),
+            "swap_need_pct": float(_h_need),
             "fee_est": estimate_fee_dollars(val, broker_id, t, asset_type, round_trip=True),
             "reason": (
                 f"score gap {score_delta:.0f} "
@@ -4411,7 +4454,12 @@ def pick_rotation_funding(
         })
 
     if not candidates:
-        _last_rotate_reject = "no eligible funding name (ROI/TTP/hold/fees/gap)"
+        if hurdle_blocked:
+            _last_rotate_reject = (
+                "swap edge does not cover two round trips plus the funder's open loss"
+            )
+        else:
+            _last_rotate_reject = "no eligible funding name (ROI/TTP/hold/fees/gap)"
         return None
 
     if shortfall > 0:

@@ -405,9 +405,10 @@ def record_sell_fail_backoff(store, broker, ticker, status, *, now=None, ttl_sec
         store.pop(key, None)
         prev = None
     if prev and prev.get("reason") == reason:
+        prev["hits"] = int(prev.get("hits") or 1) + 1
         return True, None
     ts_now = float(now if now is not None else time.time())
-    store[key] = {"reason": reason, "ts": ts_now, "ttl_sec": int(use_ttl)}
+    store[key] = {"reason": reason, "ts": ts_now, "ttl_sec": int(use_ttl), "hits": 1}
     note = (
         f"[{broker}] Sell FAIL [{ticker}]: {reason} — backing off retries "
         f"(~{int(use_ttl) // 60}m TTL or until reason changes)"
