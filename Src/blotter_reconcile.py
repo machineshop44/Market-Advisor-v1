@@ -94,6 +94,26 @@ def ghost_local_tickers(held: set[str], local_tickers: Iterable[str] | None) -> 
     return sorted(set(ghosts))
 
 
+def confirm_ghost_drops(
+    missing_now,
+    prior_missing=None,
+    *,
+    book_is_live: bool = True,
+) -> tuple[list[str], set[str]]:
+    """
+    A name missing from one live holdings read stays on the book.
+    It is dropped only when the next live read misses it too.
+    A dark or empty broker read is not proof the shares are gone.
+    """
+    prior = {_norm_ticker(t) for t in (prior_missing or ()) if _norm_ticker(t)}
+    if not book_is_live:
+        return [], prior
+    missing = {_norm_ticker(t) for t in (missing_now or ()) if _norm_ticker(t)}
+    drop = sorted(missing & prior)
+    pending = missing - set(drop)
+    return drop, pending
+
+
 def missing_basis_tickers(
     holdings: Iterable[dict] | None,
     *,

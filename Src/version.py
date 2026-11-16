@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.43.1"
+__version__ = "1.43.2"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Phillips 66 and the dividend and tech ETFs on the income list are holds. "
-    "The desk will not auto-buy them or sell them for a stop, stale exit, or swap"
+    "A name missing from one holdings read stays in the slot. "
+    "It is dropped only when the next live read misses it too"
 )
 
 

@@ -17600,6 +17600,26 @@ class MarketAdvisorGUI(QMainWindow):
             broker_obj = (getattr(self, "brokers", {}) or {}).get(broker_name)
             book_is_live = bool(broker_obj and getattr(broker_obj, "is_connected", False))
             view_covers = self.view_mode == "All" or self.view_mode == broker_name
+            # One miss is not a close. F was deleted on the boot read after a
+            # sell that never filled. Drop only on the second live miss.
+            pending_store = getattr(self, "_ghost_pending", None)
+            if not isinstance(pending_store, dict):
+                pending_store = self._ghost_pending = {}
+            drop, pending = br.confirm_ghost_drops(
+                ghosts,
+                pending_store.get(broker_name),
+                book_is_live=bool(book_is_live and view_covers),
+            )
+            if book_is_live and view_covers:
+                pending_store[broker_name] = pending
+            for t in sorted(pending):
+                self._throttled_log(
+                    f"ghost_hold:{broker_name}:{t}",
+                    f"[{broker_name}] Holding {t} — first holdings read missed it. "
+                    "Not dropped until a second live read also shows zero.",
+                    cooldown_sec=1800,
+                )
+            ghosts = drop
             try:
                 import working_orders as _wo
                 implied = (
@@ -17635,6 +17655,19 @@ class MarketAdvisorGUI(QMainWindow):
                     pass
             bid = bid_map.get(broker_name, broker_name.upper())
             stale = br.protective_stale_tickers(held, prot, broker_id=bid)
+            # Same second-read rule for a live stop. Cancelling it on the first
+            # miss can orphan a share the broker still has.
+            stop_drop, stop_pending = br.confirm_ghost_drops(
+                stale,
+                (getattr(self, "_stop_ghost_pending", None) or {}).get(broker_name),
+                book_is_live=bool(book_is_live and view_covers),
+            )
+            if book_is_live and view_covers:
+                stop_store = getattr(self, "_stop_ghost_pending", None)
+                if not isinstance(stop_store, dict):
+                    stop_store = self._stop_ghost_pending = {}
+                stop_store[broker_name] = stop_pending
+            stale = stop_drop
             for t in stale:
                 try:
                     # Cancel at the broker first — forgetting a live stop orphans its hold.
