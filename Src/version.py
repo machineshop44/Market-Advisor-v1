@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.43.0"
+__version__ = "1.43.1"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "Full book proposes a swap only when the edge covers two round trips "
-    "plus the funder's open loss; dust does not hold the slot"
+    "Phillips 66 and the dividend and tech ETFs on the income list are holds. "
+    "The desk will not auto-buy them or sell them for a stop, stale exit, or swap"
 )
 
 

@@ -277,6 +277,8 @@ def load_settings():
         "news_radar_max": 5,
         "news_catalyst_advisor_enabled": True,
         "news_catalyst_max_per_day": 2,
+        "income_holds_enabled": True,
+        "income_hold_symbols": "PSX,SCHD,VYM,DGRO,VIG,VGT,XLK,QQQ,SMH",
         "advisor_working_repropose_sec": 1800,
         "daily_loss_flatten": True,
         "panic_halt_flatten": True,
@@ -11619,6 +11621,32 @@ class MarketAdvisorGUI(QMainWindow):
         frac_box.addStretch()
         form_layout.addLayout(frac_box)
 
+        self.income_hold_chk = QCheckBox(
+            "Hold dividend and tech-ETF names (do not auto-sell)"
+        )
+        self.income_hold_chk.setChecked(bool(self.settings.get("income_holds_enabled", True)))
+        self.income_hold_chk.setToolTip(
+            "Phillips 66, dividend ETFs, and the tech ETFs in the box are a hold, "
+            "not a trade. The desk will not stale-sell, trail, rotate, flatten, or "
+            "stop them. It also will not auto-buy them with the trading cash. "
+            "Buy the shares yourself when you want the payout."
+        )
+        form_layout.addWidget(self.income_hold_chk)
+        income_row = QHBoxLayout()
+        income_row.addWidget(QLabel("Income holds:"))
+        self.income_hold_edit = QLineEdit(
+            str(self.settings.get(
+                "income_hold_symbols",
+                "PSX,SCHD,VYM,DGRO,VIG,VGT,XLK,QQQ,SMH",
+            ) or "")
+        )
+        self.income_hold_edit.setToolTip(
+            "Comma-separated tickers. PSX is Phillips 66. SCHD, VYM, DGRO, and VIG "
+            "are dividend ETFs. VGT, XLK, QQQ, and SMH are the tech ETF bunch."
+        )
+        income_row.addWidget(self.income_hold_edit)
+        form_layout.addLayout(income_row)
+
         shadow_box = QHBoxLayout()
         self.shadow_guard_chk = QCheckBox("Paper↔live shadow guardrail (tighten size on adverse fills)")
         self.shadow_guard_chk.setChecked(bool(self.settings.get("shadow_guardrail_enabled", True)))
@@ -14246,6 +14274,7 @@ class MarketAdvisorGUI(QMainWindow):
             "funder_roi": float(prop.get("funder_roi") or 0.0),
         }
         self.set_working_state(True, f"Advisor BUY {prop.get('ticker')}…")
+        self._buy_batch_manual = False
         try:
             self.run_thread(
                 self._bg_buy_batch,
@@ -18298,6 +18327,9 @@ class MarketAdvisorGUI(QMainWindow):
         """
         if not bool(self.settings.get("attach_protective_stops", True)):
             return
+        from scoring import is_income_hold
+        if is_income_hold(ticker, self.settings):
+            return
         from scoring import (
             get_stop_distance_pct, get_trail_pct, get_protective_order,
             set_protective_order, clear_protective_order,
@@ -18815,6 +18847,10 @@ class MarketAdvisorGUI(QMainWindow):
         out = []
         for r in et_equity_rows:
             t = r["ticker"]
+            from scoring import is_income_hold
+            if is_income_hold(t, self.settings):
+                self.log_event(f"[EOD] [{t}] HOLD overnight — income hold")
+                continue
             info = get_protective_order("ETRADE", t) or {}
             has_stop = bool(info.get("order_id")) and not info.get("paper")
             cost = float(r.get("avg_cost") or 0)
@@ -19026,6 +19062,9 @@ class MarketAdvisorGUI(QMainWindow):
             is_crypto = "crypto" in asset_type.lower() or ticker in KNOWN_CRYPTOS
             if is_crypto:
                 continue
+            from scoring import is_income_hold
+            if is_income_hold(ticker, self.settings):
+                continue
             try:
                 shares = float(h.get("shares") or 0)
             except (TypeError, ValueError):
@@ -19138,6 +19177,9 @@ class MarketAdvisorGUI(QMainWindow):
             bid = item.get("broker_id") or item.get("broker") or ""
             ticker = str(item.get("ticker") or "").replace("-USD", "").upper()
             if not ticker:
+                continue
+            from scoring import is_income_hold
+            if is_income_hold(ticker, self.settings):
                 continue
             broker_name = item.get("broker") or self._broker_display_from_id(bid)
             if broker_name not in BROKER_NAMES:
@@ -19568,6 +19610,7 @@ class MarketAdvisorGUI(QMainWindow):
                 return
 
         self.set_working_state(True, "Executing buys…")
+        self._buy_batch_manual = not bool(auto_mode)
         runner = self.run_cycle_thread if auto_mode else self.run_thread
         rank = bool(buy_candidates is None and auto_mode)
         advisor_gate = auto_mode and bool(self.settings.get("advisor_ask_before_apply", True))
@@ -20109,6 +20152,7 @@ class MarketAdvisorGUI(QMainWindow):
                     current_bp=float(bp),
                     skip_tickers=self._sell_backoff_tickers(broker_name),
                     only_ticker=only_ticker,
+                    settings=self.settings,
                 )
             if not fund:
                 why = last_rotation_reject_reason() or "no eligible funding name"
@@ -20277,6 +20321,21 @@ class MarketAdvisorGUI(QMainWindow):
             price = float(c.get("price") or 0.0)
             is_crypto = "crypto" in str(asset_type).lower() or ticker.upper() in KNOWN_CRYPTOS
             tu = ticker.upper()
+            if (
+                (not is_crypto)
+                and tu not in held
+                and not getattr(self, "_buy_batch_manual", False)
+            ):
+                from scoring import is_income_hold
+                if is_income_hold(tu, self.settings):
+                    self._throttled_buy_skip_note(
+                        notes, broker_name, f"income_{tu}",
+                        f"[{broker_name}] {ticker} is an income hold — not auto-bought. "
+                        "Buy it manually if you want the dividend.",
+                        cooldown_sec=3600,
+                    )
+                    execute_skips.append(f"{ticker}: income hold")
+                    continue
             if is_crypto and not self._broker_supports(broker_name, "supports_crypto"):
                 self._throttled_buy_skip_note(
                     notes, broker_name, f"no_crypto_{tu}",
@@ -21756,6 +21815,7 @@ class MarketAdvisorGUI(QMainWindow):
                     allow_flat_time_banks=allow_flat_banks,
                     equity=float(equity_by.get(broker_name) or 0.0),
                     quantity=shares,
+                    settings=self.settings,
                 )
                 results.append((row, price, action, asset_type, None))
         flush_state()
@@ -22781,6 +22841,7 @@ class MarketAdvisorGUI(QMainWindow):
             need_dollars=need_dollars,
             current_bp=float(bp or 0),
             skip_tickers=skip,
+            settings=self.settings,
         )
         fund = pick_rotation_funding(
             ticker, score, is_crypto, holdings_rows,
@@ -23657,6 +23718,10 @@ class MarketAdvisorGUI(QMainWindow):
             )
         if hasattr(self, "allow_frac_ttp_chk"):
             self.settings["allow_fractional_ttp_only"] = bool(self.allow_frac_ttp_chk.isChecked())
+        if hasattr(self, "income_hold_chk"):
+            self.settings["income_holds_enabled"] = bool(self.income_hold_chk.isChecked())
+        if hasattr(self, "income_hold_edit"):
+            self.settings["income_hold_symbols"] = str(self.income_hold_edit.text() or "").strip()
         if hasattr(self, "shadow_guard_chk"):
             self.settings["shadow_guardrail_enabled"] = bool(self.shadow_guard_chk.isChecked())
         self.settings["target_bp_utilization_pct"] = self.bp_util_spin.value()

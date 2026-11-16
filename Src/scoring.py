@@ -782,6 +782,35 @@ def net_roi_after_fees(gross_roi, broker_id, ticker=None, asset_type=""):
 
 CRYPTO_EDGE_PER_PT = 0.0004
 
+# Held for the payout, not for a flip. The desk does not auto-buy these and does not
+# stale-sell, trail, rotate, or flatten them. Edit the list in Settings.
+INCOME_HOLD_DEFAULT = (
+    "PSX", "SCHD", "VYM", "DGRO", "VIG", "VGT", "XLK", "QQQ", "SMH",
+)
+
+
+def income_hold_symbols(settings=None) -> frozenset:
+    s = settings if isinstance(settings, dict) else {}
+    if not bool(s.get("income_holds_enabled", True)):
+        return frozenset()
+    raw = s.get("income_hold_symbols", None)
+    if raw is None or raw == "":
+        parts = list(INCOME_HOLD_DEFAULT)
+    elif isinstance(raw, str):
+        parts = [p.strip().upper() for p in raw.replace(";", ",").split(",")]
+    else:
+        parts = [str(p).strip().upper() for p in raw]
+    out = []
+    for p in parts:
+        if p.isalpha() and 1 <= len(p) <= 5 and p not in out:
+            out.append(p)
+    return frozenset(out)
+
+
+def is_income_hold(ticker, settings=None) -> bool:
+    t = str(ticker or "").replace("-USD", "").upper().strip()
+    return bool(t) and t in income_hold_symbols(settings)
+
 
 def estimated_signal_edge_pct(score, *, is_crypto=False, settings=None):
     """
@@ -4267,6 +4296,7 @@ def pick_rotation_funding(
     require_swap_hurdle=True,
     skip_tickers=None,
     only_ticker=None,
+    settings=None,
 ):
     """
     Choose one held name to fully exit so we can fund candidate_ticker.
@@ -4343,6 +4373,8 @@ def pick_rotation_funding(
             continue
         t = str(h.get("ticker") or "").replace("-USD", "").upper()
         if not t or t == cand or t in skip:
+            continue
+        if is_income_hold(t, settings):
             continue
         if only and t != only:
             continue
@@ -4530,7 +4562,7 @@ def equity_session_minutes_between(t0, t1) -> float:
 def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", live_price=None,
                      exit_roi_scale=1.0, exit_time_scale=1.0, ttp_arm_scale=1.0,
                      allow_flat_time_banks=False, equity=None, holding_value=None,
-                     quantity=None):
+                     quantity=None, settings=None):
     """
     Trailing take-profit / hard stop / time-stop.
     Fee thresholds change by broker so CB doesn't take thin RH-style exits.
@@ -4541,11 +4573,11 @@ def evaluate_holding(ticker, avg_cost, broker_id="ROBINHOOD", asset_type="", liv
     When enabled (Aggressive), they only fire after a local turn — never while still
     riding near the position high / short-term EMA up. Hard stop + stale (red) stay on.
 
-    Unknown / dust cost basis: TTP and flat green exits stay gated (honesty). Hard stop
-    and stale use a live-price reference so bags are not unmanaged forever.
-
-    Small-ticket crypto on micro books: slightly earlier TTP arm / time exits (fee floor still applies).
+    Income holds (Phillips 66, dividend ETFs, tech ETFs on the settings list) are
+    never sold here. The payout is the point of the hold.
     """
+    if is_income_hold(ticker, settings):
+        return "HOLD (Income hold — dividend/ETF, not sold)"
     broker_id = _normalize_broker_id(broker_id)
     current_price = float(live_price) if live_price and live_price > 0 else fetch_current_price(ticker)
     if current_price <= 0: return "HOLD (Awaiting Price)"
