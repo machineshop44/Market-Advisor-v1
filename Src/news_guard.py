@@ -2,8 +2,10 @@
 Equity news: entry veto (headlines / earnings), shadow catalyst tag, and News Radar discovery.
 
 Breakouts radar only widens the micro scan — names still pass scoring, fee, spread and PDT.
-High-impact mega-cap dumps (CEO exit / scandal) are a separate advisor-first lane:
-discover_catalyst_megacaps() — never auto-buys; GUI proposes for cloud advisor approve.
+High-impact headlines (CEO exit / scandal / plunge / a sized contract) are a
+separate advisor-first lane: discover_catalyst_megacaps() — never auto-buys;
+GUI proposes for cloud advisor approve. The lane can watch any US name the
+news search returns, not only the mega-cap list.
 Lookups fail open — an unreachable feed never blocks a buy.
 """
 from __future__ import annotations
@@ -61,6 +63,23 @@ TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US?count=25
 DISCOVERY_QUERIES = ("stocks to watch", "premarket movers", "stock market today")
 CATALYST_DISCOVERY_QUERIES = (
     "CEO resigns", "CEO steps down", "stock plunges after", "stock market today",
+    "signs long-term agreement", "power purchase agreement", "supply agreement",
+)
+_CONTRACT_ACT_RE = re.compile(
+    r"\b(sign(?:s|ed)?|enter(?:s|ed)?(?: into)?|secures?|awarded)\b",
+    re.I,
+)
+_CONTRACT_KIND_RE = re.compile(
+    r"\b(agreement|contract|offtake|power purchase)\b",
+    re.I,
+)
+_CONTRACT_SIZE_RE = re.compile(
+    r"\b(long-term|multi-year|\d+-year|billion|megawatt|megawatts|MW|supply)\b",
+    re.I,
+)
+_CONTRACT_REJECT_RE = re.compile(
+    r"\b(shares|offering|registered direct|at-the-market|dilut)\b",
+    re.I,
 )
 CACHE_TTL_SEC = 30 * 60
 CATALYST_CACHE_TTL_SEC = 15 * 60
@@ -191,6 +210,18 @@ def discover_tickers(*, max_n: int = 8, timeout: float = 8.0, exclude=()) -> lis
     return list(syms)
 
 
+def is_major_contract_headline(title: str) -> bool:
+    """Sized commercial contract. Share sales and offerings are not contracts."""
+    text = str(title or "")
+    if _CONTRACT_REJECT_RE.search(text):
+        return False
+    if not (_CONTRACT_ACT_RE.search(text) and _CONTRACT_KIND_RE.search(text)):
+        return False
+    if _CONTRACT_SIZE_RE.search(text):
+        return True
+    return bool(re.search(r"power purchase|offtake", text, re.I))
+
+
 def headline_catalyst_eval(
     items, *, now: Optional[float] = None, hours: float = 48.0, aliases=None,
 ) -> tuple[bool, str, str]:
@@ -198,6 +229,8 @@ def headline_catalyst_eval(
     now = float(now if now is not None else time.time())
     for it in _recent(items, now, hours, aliases):
         title = str(it.get("title") or "")
+        if is_major_contract_headline(title):
+            return True, "major_contract", title[:120]
         for rx, tag in _CATALYST_EVAL_RE:
             if rx.search(title):
                 return True, tag, title[:120]
@@ -216,9 +249,12 @@ def discover_catalyst_megacaps(
     name_fn: Optional[Callable[[str], str]] = None,
     pool: Optional[list[str]] = None,
     use_cache: bool = True,
+    mega_only: bool = True,
 ) -> list[dict]:
     """
-    Mega-cap names in the news pool with a fresh CEO/scandal/plunge headline.
+    Names in the news pool with a fresh CEO, scandal, plunge, or sized-contract
+    headline. mega_only=True keeps the legacy mega-cap list. mega_only=False
+    watches any US ticker the search returned.
     Returns [{symbol, tag, title}, ...] — empty on failure. Does not auto-buy.
     """
     ts_now = float(now if now is not None else time.time())
@@ -230,8 +266,17 @@ def discover_catalyst_megacaps(
     fetch_fn = fetch or fetch_news
     name_f = name_fn if name_fn is not None else company_name
 
+    def _in_lane(sym: str) -> bool:
+        if mega_only and sym not in mega:
+            return False
+        return True
+
     if pool is not None:
-        candidates = [s for s in pool if _us_symbol(s) and _us_symbol(s) in mega]
+        candidates = []
+        for s in pool:
+            u = _us_symbol(s)
+            if u and _in_lane(u) and u not in candidates:
+                candidates.append(u)
     else:
         try:
             raw_pool = _yahoo_trending_and_related(
@@ -246,7 +291,7 @@ def discover_catalyst_megacaps(
         candidates = []
         for s in raw_pool:
             u = _us_symbol(s)
-            if u and u in mega and u not in candidates:
+            if u and _in_lane(u) and u not in candidates:
                 candidates.append(u)
 
     rows: list[dict] = []

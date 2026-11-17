@@ -131,6 +131,188 @@ def latest_signal_alert(items: list[dict] | None = None) -> dict[str, Any] | Non
     }
 
 
+def _board_symbol(raw) -> str | None:
+    """US ticker the breakout board will accept. Same shape rules as the merger."""
+    sym = str(raw or "").upper().strip()
+    if not sym or not sym.isalpha() or not (1 <= len(sym) <= 5):
+        return None
+    if sym.startswith("AA") and len(sym) == 5:
+        return None
+    return sym
+
+
+def parse_yahoo_screener_quotes(payload) -> list[dict]:
+    """Yahoo predefined-screener JSON → [{symbol, price}]. Equities only."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    try:
+        screens = ((payload or {}).get("finance") or {}).get("result") or []
+    except Exception:
+        return out
+    if isinstance(screens, dict):
+        screens = [screens]
+    for screen in screens or []:
+        if not isinstance(screen, dict):
+            continue
+        for quote in screen.get("quotes") or []:
+            if not isinstance(quote, dict):
+                continue
+            kind = str(quote.get("quoteType") or "EQUITY").upper()
+            if kind not in ("EQUITY", "ETF"):
+                continue
+            sym = _board_symbol(quote.get("symbol"))
+            if not sym or sym in seen:
+                continue
+            try:
+                px = float(
+                    quote.get("regularMarketPrice")
+                    or quote.get("regularMarketPreviousClose")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                px = 0.0
+            seen.add(sym)
+            out.append({"symbol": sym, "price": px})
+    return out
+
+
+def _tape_tag(source: str) -> str:
+    text = str(source or "").lower()
+    if "news" in text:
+        return "News Mover"
+    if "finviz" in text:
+        return "Finviz Mover"
+    if "extended" in text:
+        return "Extended Mover"
+    if "rh" in text or "robin" in text:
+        return "RH Top Mover"
+    return "Tape Mover"
+
+
+def assemble_market_board(
+    rows: list | None = None,
+    *,
+    news: list[str] | None = None,
+    extended_micro: list[str] | None = None,
+    max_share: float = 0.0,
+    max_total: int = 30,
+    max_above: int = 8,
+    max_news: int = 8,
+    ceiling_mult: float = 1.15,
+) -> list[dict]:
+    """
+    Live-tape board. Any US name a scanner returned can appear — the list is
+    whoever is active, up, or down, not a stored watchlist.
+
+    Names one whole share fits fill the board. A short slice is kept for names
+    above that price so the tape is still visible. Buys are decided later.
+    """
+    try:
+        ceiling = float(max_share or 0.0) * float(ceiling_mult or 1.15)
+    except (TypeError, ValueError):
+        ceiling = 0.0
+    if ceiling < 0:
+        ceiling = 0.0
+    try:
+        cap = max(1, int(max_total))
+    except (TypeError, ValueError):
+        cap = 30
+    try:
+        above_cap = max(0, int(max_above))
+    except (TypeError, ValueError):
+        above_cap = 8
+    if ceiling <= 0:
+        above_cap = cap
+    try:
+        news_cap = max(0, int(max_news))
+    except (TypeError, ValueError):
+        news_cap = 8
+
+    price_of: dict[str, float] = {}
+
+    def _remember(sym: str, price) -> None:
+        try:
+            px = float(price or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0 and price_of.get(sym, 0.0) <= 0:
+            price_of[sym] = px
+
+    def _above(sym: str) -> bool:
+        if ceiling <= 0:
+            return False
+        px = price_of.get(sym) or 0.0
+        return px > ceiling
+
+    sequenced: list[tuple[str, str]] = []
+    seen_rows: set[str] = set()
+    for row in rows or []:
+        if isinstance(row, str):
+            sym = _board_symbol(row)
+            price = 0.0
+            source = ""
+        elif isinstance(row, dict):
+            sym = _board_symbol(row.get("symbol"))
+            price = row.get("price")
+            source = str(row.get("source") or "")
+        else:
+            continue
+        if not sym or sym in seen_rows:
+            continue
+        _remember(sym, price)
+        seen_rows.add(sym)
+        sequenced.append((sym, _tape_tag(source)))
+
+    news_rows: list[tuple[str, str]] = []
+    seen_news: set[str] = set()
+    for raw in news or []:
+        sym = _board_symbol(raw)
+        if not sym or sym in seen_news:
+            continue
+        seen_news.add(sym)
+        news_rows.append((sym, "News Mover"))
+        if len(news_rows) >= news_cap:
+            break
+
+    news_set = {sym for sym, _tag in news_rows}
+    main: list[tuple[str, str]] = []
+    above: list[tuple[str, str]] = []
+    for sym, tag in sequenced:
+        if sym in news_set:
+            continue
+        if _above(sym):
+            above.append((sym, tag))
+        else:
+            main.append((sym, tag))
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    above_n = 0
+
+    def _push(sym: str, tag: str) -> None:
+        nonlocal above_n
+        if sym in seen or len(out) >= cap:
+            return
+        if _above(sym):
+            if above_n >= above_cap:
+                return
+            above_n += 1
+        seen.add(sym)
+        out.append({"symbol": sym, "type": tag})
+
+    for sym, tag in news_rows:
+        _push(sym, tag)
+    for sym, tag in above:
+        _push(sym, tag)
+    for sym, tag in main:
+        _push(sym, tag)
+    for raw in extended_micro or []:
+        sym = _board_symbol(raw)
+        if sym:
+            _push(sym, "Extended Mover")
+    return out
+
+
 def merge_breakout_universe(
     finviz: list[str] | None = None,
     rh_movers: list[str] | None = None,

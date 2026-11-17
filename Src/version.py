@@ -14,12 +14,12 @@ APP_NAME_COMPACT = "MarketAdvisor"
 APP_TAGLINE = "Multi-Broker Quantitative Platform"
 
 # Current release
-__version__ = "1.43.2"
+__version__ = "1.43.3"
 
 # Optional human note (shown in About / logs — keep short)
 VERSION_NOTE = (
-    "A name missing from one holdings read stays in the slot. "
-    "It is dropped only when the next live read misses it too"
+    "Breakouts watch the live tape — actives, gainers, losers, and headlines — "
+    "so any US name in play can be scored. The fee and the advisor still decide the buy"
 )
 
 

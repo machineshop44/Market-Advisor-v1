@@ -105,9 +105,10 @@ except Exception:
     pass
 BROKER_NAMES = ("Robinhood", "Coinbase", "E*TRADE")
 
-# Soft cache for Yahoo gainer probe in breakout discovery (avoids 10× history each scan)
-_yahoo_gainer_cache = {"at": 0.0, "syms": []}
+# Soft cache for the live-tape screeners (gainers, losers, most actives).
+_yahoo_gainer_cache = {"at": 0.0, "syms": [], "rows": []}
 _YAHOO_GAINER_TTL_SEC = 900.0
+_YAHOO_TAPE_SCREENS = ("most_actives", "day_gainers", "day_losers")
 
 
 def _tail_activity_log_file(path=None, max_lines=ACTIVITY_LOG_DISK_TAIL_LINES):
@@ -22654,15 +22655,17 @@ class MarketAdvisorGUI(QMainWindow):
         return universe
 
     def _news_radar_symbols(self, max_sh=0.0):
-        """Trending / headline-tagged tickers for Breakouts; afford-filtered on small books."""
+        """Trending / headline names. A high price does not drop the name off the tape."""
+        del max_sh  # kept so callers can pass the afford ceiling; the tape no longer uses it
         if not bool(self.settings.get("news_radar_enabled", True)):
-            return []
+            return [], []
         try:
             import news_guard as ng
             syms = ng.discover_tickers(max_n=int(self.settings.get("news_radar_max", 5) or 5))
         except Exception:
-            return []
-        if syms and max_sh > 0:
+            return [], []
+        priced = []
+        if syms:
             try:
                 import yfinance as yf
                 from scoring import _trend_lock
@@ -22671,26 +22674,25 @@ class MarketAdvisorGUI(QMainWindow):
                         syms, period="5d", interval="1d", progress=False,
                         auto_adjust=False, threads=False,
                     )
-                closes = df["Close"] if "Close" in df else None
-                keep = []
-                for s in syms:
-                    try:
-                        col = closes[s] if hasattr(closes, "columns") else closes
-                        px = float(col.dropna().iloc[-1])
-                    except Exception:
-                        continue
-                    if 0 < px <= max_sh * 1.15:
-                        keep.append(s)
-                syms = keep
+                closes = df["Close"] if df is not None and "Close" in getattr(df, "columns", []) else None
+                if closes is not None:
+                    for s in syms:
+                        try:
+                            col = closes[s] if hasattr(closes, "columns") else closes
+                            px = float(col.dropna().iloc[-1])
+                        except Exception:
+                            px = 0.0
+                        if px > 0:
+                            priced.append({"symbol": s, "price": px, "source": "news"})
             except Exception:
-                syms = []
+                priced = []
         if syms:
             self._throttled_log(
                 f"news_radar:{','.join(sorted(syms[:5]))}",
                 f"[NEWS RADAR] Breakouts scan adds: {', '.join(syms[:5])}",
                 cooldown_sec=3600,
             )
-        return syms
+        return list(syms), priced
 
     def _sell_backoff_tickers(self, broker_name):
         out = []
@@ -23011,7 +23013,8 @@ class MarketAdvisorGUI(QMainWindow):
 
     def _maybe_propose_news_catalysts(self):
         """
-        Advisor-first mega-cap news dumps (CEO exit / scandal). Does not unpark CORE.
+        Advisor-first headlines on any US name the news search returns
+        (CEO exit, scandal, plunge, or a sized contract). Does not unpark CORE.
         RH fractional allowed for this ticket only after cloud advisor approve.
         """
         if not bool(self.settings.get("news_catalyst_advisor_enabled", True)):
@@ -23054,7 +23057,7 @@ class MarketAdvisorGUI(QMainWindow):
 
         try:
             import news_guard as ng
-            rows = ng.discover_catalyst_megacaps(max_n=4)
+            rows = ng.discover_catalyst_megacaps(max_n=4, mega_only=False)
         except Exception as e:
             self._throttled_log(
                 "news_catalyst:discover_err",
@@ -23254,8 +23257,56 @@ class MarketAdvisorGUI(QMainWindow):
             except Exception:
                 pass
 
+    def _yahoo_tape_rows(self):
+        """Most actives, day gainers, and day losers. Any listed name can show up."""
+        now = time.time()
+        cached = _yahoo_gainer_cache
+        if float(cached.get("at") or 0) > 0 and (now - float(cached["at"])) < _YAHOO_GAINER_TTL_SEC:
+            return [dict(r) for r in (cached.get("rows") or [])]
+        import desk_radar
+        import requests
+        rows = []
+        seen = set()
+        for scr in _YAHOO_TAPE_SCREENS:
+            try:
+                resp = requests.get(
+                    "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved",
+                    params={"scrIds": scr, "count": 25},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=6,
+                )
+                parsed = desk_radar.parse_yahoo_screener_quotes(resp.json())
+            except Exception:
+                parsed = []
+            for row in parsed:
+                sym = str(row.get("symbol") or "")
+                if not sym or sym in seen:
+                    continue
+                seen.add(sym)
+                rows.append({"symbol": sym, "price": row.get("price") or 0.0, "source": "yahoo"})
+        _yahoo_gainer_cache["at"] = now
+        _yahoo_gainer_cache["rows"] = [dict(r) for r in rows]
+        _yahoo_gainer_cache["syms"] = [r["symbol"] for r in rows]
+        return rows
+
     def _bg_scan_penny(self):
-        finviz_syms, rh_syms, yahoo_syms = [], [], []
+        """
+        Live tape for Breakouts. Scanners cover the market (actives, gainers,
+        losers, Robinhood movers, headlines). A stored watchlist does not.
+        """
+        import desk_radar
+        import desk_orchestration as do
+
+        max_sh = 0.0
+        try:
+            from scoring import is_small_book, max_affordable_share_price
+            equity, bp, _ = self.get_effective_balances(self.cycle_broker_name)
+            if is_small_book(equity):
+                max_sh = float(max_affordable_share_price(bp) or 0.0)
+        except Exception:
+            max_sh = 0.0
+
+        finviz_rows = []
         Overview = _get_overview_class()
         if Overview is not None:
             def _finviz():
@@ -23267,77 +23318,47 @@ class MarketAdvisorGUI(QMainWindow):
             try:
                 df = pool.submit(_finviz).result(timeout=12)
                 if df is not None and not df.empty and 'Ticker' in df.columns:
-                    for t in df['Ticker'].head(10).tolist():
-                        finviz_syms.append(str(t).upper().strip())
+                    for t in df['Ticker'].head(8).tolist():
+                        finviz_rows.append({
+                            "symbol": str(t).upper().strip(),
+                            "price": 0.0,
+                            "source": "finviz",
+                        })
             except Exception:
                 pass
             finally:
                 pool.shutdown(wait=False)
-        # Micro-book afford ceiling — skip mega-cap RH movers when BP can't buy 1 share
-        max_sh = 0.0
-        try:
-            from scoring import is_small_book, max_affordable_share_price
-            equity, bp, _ = self.get_effective_balances(self.cycle_broker_name)
-            if is_small_book(equity):
-                max_sh = float(max_affordable_share_price(bp) or 0.0)
-        except Exception:
-            max_sh = 0.0
+
+        rh_rows = []
         if self.brokers["Robinhood"].is_connected:
             try:
                 import robin_stocks.robinhood as rh
-                for item in rh.markets.get_top_100()[:12]:
+                for item in rh.markets.get_top_100() or []:
                     sym = item.get('symbol') or item.get('ticker')
                     if not sym:
                         continue
-                    sym_u = str(sym).upper().strip()
-                    if max_sh > 0:
-                        try:
-                            px = float(
-                                item.get("last_trade_price")
-                                or item.get("price")
-                                or item.get("last_price")
-                                or 0
-                            )
-                        except (TypeError, ValueError):
-                            px = 0.0
-                        if px > 0 and px > max_sh * 1.15:
-                            continue
-                    rh_syms.append(sym_u)
+                    try:
+                        px = float(
+                            item.get("last_trade_price")
+                            or item.get("price")
+                            or item.get("last_price")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        px = 0.0
+                    rh_rows.append({
+                        "symbol": str(sym).upper().strip(),
+                        "price": px,
+                        "source": "rh",
+                    })
             except Exception:
                 pass
-        # Yahoo day gainers (equities) — soft third source; prefer names under afford ceiling
-        # Cache ~15m so breakout scans don't burn 10 Yahoo history calls every cycle
-        yahoo_syms = []
+
         try:
-            now = time.time()
-            cached = _yahoo_gainer_cache
-            # Key off timestamp only — empty [] is a valid "no gainers" result
-            if float(cached.get("at") or 0) > 0 and (now - float(cached["at"])) < _YAHOO_GAINER_TTL_SEC:
-                yahoo_syms = list(cached.get("syms") or [])
-            else:
-                import yfinance as yf
-                probe = ["SOUN", "PLUG", "RKLB", "SMCI", "IONQ", "OKLO", "ACHR", "JOBY", "SNDL", "NIO"]
-                found = []
-                for sym in probe:
-                    try:
-                        h = yf.Ticker(sym).history(period="5d", interval="1d")
-                        if h is None or h.empty or len(h) < 2:
-                            continue
-                        last = float(h["Close"].iloc[-1])
-                        chg = last / float(h["Close"].iloc[-2]) - 1.0
-                        if max_sh > 0 and last > max_sh * 1.15:
-                            continue
-                        if chg >= 0.03:
-                            found.append(sym)
-                    except Exception:
-                        continue
-                _yahoo_gainer_cache["at"] = now
-                _yahoo_gainer_cache["syms"] = list(found)
-                yahoo_syms = found
+            yahoo_rows = self._yahoo_tape_rows()
         except Exception:
-            yahoo_syms = []
-        import desk_radar
-        import desk_orchestration as do
+            yahoo_rows = []
+
         extended_micro: list[str] = []
         sess_lbl = str(self.get_equity_session_info().get("label") or "")
         if max_sh > 0 and "EXTENDED" in sess_lbl.upper():
@@ -23345,20 +23366,26 @@ class MarketAdvisorGUI(QMainWindow):
                 list(do.EXTENDED_MICRO_BREAKOUTS),
                 max_share_price=max_sh,
             )
-        news_syms = self._news_radar_symbols(max_sh)
-        discovered = desk_radar.merge_breakout_universe(
-            finviz_syms, rh_syms, yahoo_syms,
-            extended_micro=extended_micro,
+        news_syms, news_rows = self._news_radar_symbols(max_sh)
+        try:
+            news_cap = int(self.settings.get("news_radar_max", 8) or 8)
+        except (TypeError, ValueError):
+            news_cap = 8
+        discovered = desk_radar.assemble_market_board(
+            list(yahoo_rows or []) + list(rh_rows or []) + list(finviz_rows or []) + list(news_rows or []),
             news=news_syms,
-            max_news=int(self.settings.get("news_radar_max", 5) or 0),
-            max_total=20,
+            extended_micro=extended_micro,
+            max_share=max_sh,
+            max_total=30,
+            max_above=8,
+            max_news=news_cap,
         )
         if not discovered:
             fallback = ["SNDL", "SOUN", "PLUG", "NIO", "ACHR"] if max_sh > 0 else [
                 "SNDL", "SOUN", "PLUG", "TSLA", "AMD",
             ]
             for s in fallback:
-                discovered.append({'symbol': s, 'type': 'Penny Stock'})
+                discovered.append({'symbol': s, 'type': 'Tape Mover'})
         return discovered
 
     def _bg_scan_core(self):
