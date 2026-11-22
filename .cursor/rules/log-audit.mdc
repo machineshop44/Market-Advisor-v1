@@ -24,3 +24,7 @@ without being asked. Never stop at "the trades that happened".
 8. Per-broker verdicts in the report, with evidence from the market data.
 9. Fix everything found (no matter how small) → tests → bump `Src/version.py` → publish →
    commit/push → report Drive paths + SHA256 (see publish-and-sync rule).
+
+After every audit, including the nightly handoff, tell Andrew in chat that it was processed.
+Say the window and whether it produced a code change. If it was not run, say that plainly.
+Do not leave him to infer that a finished handoff file means the audit was reviewed.
